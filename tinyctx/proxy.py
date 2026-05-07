@@ -121,12 +121,16 @@ def root() -> dict[str, Any]:
 
 @APP.get("/v1/models")
 def list_models() -> dict[str, Any]:
+    ctx = CFG.default_context_window
     return {
         "object": "list",
         "data": [
-            {"id": "tinyctx-auto", "object": "model", "owned_by": "tinyctx"},
-            {"id": "tinyctx-local", "object": "model", "owned_by": "tinyctx"},
-            {"id": "tinyctx-frontier", "object": "model", "owned_by": "tinyctx"},
+            {"id": "tinyctx-auto", "object": "model", "owned_by": "tinyctx",
+             "context_window": ctx},
+            {"id": "tinyctx-local", "object": "model", "owned_by": "tinyctx",
+             "context_window": ctx},
+            {"id": "tinyctx-frontier", "object": "model", "owned_by": "tinyctx",
+             "context_window": ctx},
         ],
     }
 

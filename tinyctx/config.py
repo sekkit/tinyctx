@@ -139,7 +139,7 @@ class Config:
     failed_input_after_turns: int = 4
     mutation_ttl_s: float = 300.0      # default = Anthropic 5-min cache TTL
     mutation_threshold: float = 0.65   # context usage trigger (0..1)
-    default_context_window: int = 400_000  # used when request doesn't say
+    default_context_window: int = 1_000_000  # used when request doesn't say
 
     # If set, force every request through one of {"local", "frontier", "auto"}.
     # Useful for debugging.
