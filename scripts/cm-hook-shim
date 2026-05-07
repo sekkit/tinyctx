@@ -1,0 +1,56 @@
+#!/bin/bash
+# cm-hook-shim — codex 0.125 hook protocol adapter for mksglu/context-mode.
+#
+# Why: codex 0.125 requires hook stdout to be a single valid JSON object.
+# context-mode (current build) reads stdin, writes to its session DB, then
+# exits 137 with empty stdout — which codex correctly classifies as
+# "Failed", flooding the UI with hook: ... Failed messages.
+#
+# This shim:
+#   1. Tees stdin to context-mode in the BACKGROUND (so codex doesn't wait
+#      for it; codex's hook timeout never trips).
+#   2. Emits a minimal valid {} on stdout — the hook protocol's "no
+#      additional context, do nothing special" sentinel.
+#   3. Exits 0.
+#
+# Argv: $1 is the hook kind: pretooluse | posttooluse | sessionstart |
+#       precompact | userpromptsubmit | stop
+#
+# Usage in ~/.codex/hooks.json:
+#   { "type": "command", "command": "cm-hook-shim sessionstart" }
+#
+# To bypass entirely (no context-mode): set CM_HOOK_DISABLE=1 in env.
+set -u
+
+KIND="${1:-unknown}"
+CM_BIN="${CM_BIN:-/Users/sekkit/.local/node/bin/context-mode}"
+
+# Drain stdin into a temp file (codex sends a JSON event); pass to context-mode
+# in the background. Keep the temp file path stable per-process so we can
+# clean up.
+PAYLOAD_FILE="$(mktemp -t cmhook.XXXXXX)" || PAYLOAD_FILE=""
+if [ -n "$PAYLOAD_FILE" ]; then
+  # Read stdin (max ~1 MB; codex events are small)
+  head -c 1048576 > "$PAYLOAD_FILE" 2>/dev/null
+fi
+
+if [ "${CM_HOOK_DISABLE:-0}" != "1" ] && [ -x "$CM_BIN" ] && [ -n "$PAYLOAD_FILE" ]; then
+  # Background invocation. nohup + setsid-equivalent so it survives our exit
+  # and codex won't reap it. Capture its (likely empty) stdout/stderr
+  # to a rotating log so debugging is possible.
+  LOG_DIR="$HOME/.codex/cm-hook-logs"
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  LOG_FILE="$LOG_DIR/$(date +%Y%m%d).log"
+  (
+    # Detach from controlling terminal, ignore SIGHUP from parent.
+    nohup "$CM_BIN" hook codex "$KIND" \
+      < "$PAYLOAD_FILE" \
+      >> "$LOG_FILE" 2>&1
+    rm -f "$PAYLOAD_FILE"
+  ) &>/dev/null &
+  disown 2>/dev/null || true
+fi
+
+# Always tell codex the hook completed cleanly with no additional context.
+echo '{}'
+exit 0

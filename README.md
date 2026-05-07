@@ -79,6 +79,55 @@ codex --profile tinyctx   # uses the proxy as model_provider
 
 See [docs/install.md](docs/install.md) for the long version and [docs/test.md](docs/test.md) for the test plan.
 
+## Troubleshooting: `hook: ... Failed` in codex output
+
+If you're seeing lines like
+
+```
+hook: SessionStart
+hook: SessionStart Failed
+hook: PreToolUse Failed
+```
+
+even though codex produces correct output, the cause is **codex 0.125's
+hook protocol expects stdout to be a single valid JSON object**, and your
+hook command emits an empty stdout (or non-JSON).
+
+This commonly happens when migrating from older harnesses where
+[`mksglu/context-mode`](https://github.com/mksglu/context-mode) is wired
+into `~/.codex/hooks.json` — context-mode writes its session DB and exits
+silently (sometimes via SIGKILL with no output at all), which codex
+correctly classifies as `Failed`.
+
+**Fix**: replace the raw `context-mode hook codex …` commands with the
+bundled `scripts/cm-hook-shim`, which backgrounds context-mode (so codex
+doesn't wait for it) and emits a minimal `{}` to stdout (codex's "no
+additional context" sentinel).
+
+```bash
+# 1. Symlink the shim onto PATH:
+ln -sf "$(pwd)/scripts/cm-hook-shim" ~/.local/bin/cm-hook-shim
+
+# 2. Patch ~/.codex/hooks.json to call the shim:
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home() / ".codex" / "hooks.json"
+data = json.loads(p.read_text()) if p.exists() else {"hooks": {}}
+data["hooks"] = {
+  "PreToolUse":  [{"hooks": [{"type":"command","command":"cm-hook-shim pretooluse"}]}],
+  "PostToolUse": [{"hooks": [{"type":"command","command":"cm-hook-shim posttooluse"}]}],
+  "SessionStart":[{"hooks": [{"type":"command","command":"cm-hook-shim sessionstart"}]}],
+}
+p.write_text(json.dumps(data, indent=2))
+PY
+
+# 3. Verify on next codex run — you'll see "hook: ... Completed" instead.
+```
+
+To bypass context-mode entirely (no DB writes), set
+`CM_HOOK_DISABLE=1` in your environment — the shim still emits `{}` and
+returns 0 so codex stays happy.
+
 ## Picking a local backend
 
 The `[local]` section of `~/.tinyctx/config.toml` decides where the cheap
