@@ -33,3 +33,6 @@ Thumbs.db
 secrets/
 *.env
 .env
+
+# Explicitly allow committed templates (overrides *.env / secrets/)
+!examples/secrets.env.example

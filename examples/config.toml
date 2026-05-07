@@ -21,15 +21,55 @@ escalate_on_error_streak = 2
 # "auto" | "local" | "frontier" — debugging override.
 force_route = "auto"
 
+
+# ─────────────────────────── [local] backend ────────────────────────────
+# Pick exactly ONE of the four blocks below. Comment out the others.
+
+# ── (A) LMStudio with /v1/responses native (recommended for local GPU) ──
+# Pros: free (your hardware); supports Responses API natively;
+#       no chat→responses translation needed.
+# Cons: slow on consumer Macs (qwen3.6-27b ~3 min/turn at xhigh reasoning).
 [local]
-# Default points at LMStudio's OpenAI-compatible Responses endpoint.
-# Switch base_url to your vLLM/SGLang/Ollama address as needed.
-# If your local backend ONLY speaks chat-completions, set wire_api = "chat".
 base_url = "http://127.0.0.1:1234/v1"
 wire_api = "responses"
-model = "qwen3.6-27b"
-api_key_env = "TINYCTX_LOCAL_API_KEY"   # optional; LMStudio ignores
+model = "qwen3.6-27b-crack"
+api_key_env = "TINYCTX_LOCAL_API_KEY"   # LMStudio ignores; set anyway for portability
 timeout_s = 180
+
+# ── (B) DeepSeek API (chat-completions only — proxy translates) ──
+# Pros: ~5–7 s/turn vs ~3 min local; reasoning_content preserved through
+#       roundtrip; deepseek-v4-flash is very cheap.
+# Cons: $$ (small); requires API key in ~/.tinyctx/secrets.env.
+# To use:
+#   1. Copy examples/secrets.env.example → ~/.tinyctx/secrets.env
+#   2. chmod 600 ~/.tinyctx/secrets.env
+#   3. Replace the placeholder with your DeepSeek API key
+#   4. Switch to this [local] block (comment out the LMStudio one above)
+#   5. tinyctx-up restart
+#
+# [local]
+# base_url = "https://api.deepseek.com/v1"
+# wire_api = "chat"                       # DeepSeek is chat-completions only
+# model = "deepseek-v4-flash"             # or deepseek-v4-pro
+# api_key_env = "TINYCTX_LOCAL_API_KEY"   # value lives in secrets.env
+# timeout_s = 180
+
+# ── (C) Ollama (chat-completions, no reasoning_content) ──
+# [local]
+# base_url = "http://127.0.0.1:11434/v1"
+# wire_api = "chat"
+# model = "qwen2.5-coder:32b"
+# api_key_env = "TINYCTX_LOCAL_API_KEY"   # Ollama ignores
+# timeout_s = 180
+
+# ── (D) vLLM / SGLang serving Responses API ──
+# [local]
+# base_url = "http://127.0.0.1:8000/v1"
+# wire_api = "responses"
+# model = "Qwen/Qwen2.5-Coder-32B-Instruct"
+# api_key_env = "TINYCTX_LOCAL_API_KEY"
+# timeout_s = 180
+
 
 [frontier]
 # Default = the codex backend itself. Codex's auth header is forwarded

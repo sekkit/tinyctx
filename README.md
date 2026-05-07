@@ -71,13 +71,55 @@ If something isn't pulling its weight, replace it. The only piece tinyctx assume
 ## Quick start
 
 ```bash
-cd /Users/sekkit/dev/tinyctx
+cd ~/dev/tinyctx
 ./scripts/install.sh      # installs python deps, graphify, serena, configures codex
 ./scripts/start.sh        # starts the proxy on 127.0.0.1:4141
 codex --profile tinyctx   # uses the proxy as model_provider
 ```
 
 See [docs/install.md](docs/install.md) for the long version and [docs/test.md](docs/test.md) for the test plan.
+
+## Picking a local backend
+
+The `[local]` section of `~/.tinyctx/config.toml` decides where the cheap
+path lands. Four supported shapes — pick one in `examples/config.toml`,
+copy the chosen block into `~/.tinyctx/config.toml`, then `tinyctx-up
+restart`:
+
+| Backend | wire_api | Pros | Cons |
+|---|---|---|---|
+| **LMStudio** + qwen3.6-27b on local GPU | `responses` | free, native Responses API, `reasoning_content` round-trips cleanly | slow on consumer Macs (~3 min/turn at xhigh reasoning); needs the chat template that emits qwen-pythonic XML |
+| **DeepSeek API** (`deepseek-v4-flash`/`-pro`) | `chat` | ~5–7 s/turn, very cheap, `reasoning_content` preserved through proxy | costs $$ per turn (small); needs API key |
+| **Ollama** | `chat` | free, easy install | no `reasoning_content` for non-reasoning models |
+| **vLLM / SGLang** | `responses` | self-hosted at scale | infra overhead |
+
+### Using a paid API backend (DeepSeek, OpenAI, OpenRouter, …)
+
+Keys never go into committed config. They live in `~/.tinyctx/secrets.env`,
+chmod 600. `scripts/start.sh` sources the file at proxy launch (and the
+launchd plist runs `start.sh`, so secrets survive a reboot):
+
+```bash
+cp examples/secrets.env.example ~/.tinyctx/secrets.env
+chmod 600 ~/.tinyctx/secrets.env
+$EDITOR ~/.tinyctx/secrets.env       # paste the real key
+
+# Then in ~/.tinyctx/config.toml, swap to the DeepSeek (or OpenRouter, etc.)
+# block under [local]. The api_key_env line tells the proxy which env var
+# to look up; secrets.env has set it for the launchd-spawned process.
+
+tinyctx-up restart
+```
+
+Verify the key landed in the right place:
+
+```bash
+tinyctx-trace --watch &      # in one shell
+codex --profile tinyctx exec "say hi" </dev/null    # in another
+```
+
+The `request_trace` event will show `target_url=https://api.deepseek.com/v1/...`
+and `translated=True` (chat→responses round-trip).
 
 ## Compression-biased context ranking
 
