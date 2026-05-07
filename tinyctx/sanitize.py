@@ -207,6 +207,7 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
 
     # Two-pass: first linearize into (role, payload) tuples, then merge.
     raw_msgs: list[dict[str, Any]] = []
+    pending_reasoning: str = ""
     for it in src:
         if not isinstance(it, dict):
             continue
@@ -217,6 +218,16 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
             role = "system"
 
         if t in _REASONING_ITEM_TYPES:
+            # Extract reasoning text so it can be passed back as
+            # reasoning_content on the next assistant message (required by
+            # DeepSeek thinking mode).
+            summary = it.get("summary")
+            if isinstance(summary, list):
+                for s in summary:
+                    if isinstance(s, dict):
+                        pending_reasoning += s.get("text", "")
+            elif isinstance(content, str):
+                pending_reasoning += content
             continue
         if role and content is not None:
             if isinstance(content, list):
@@ -224,14 +235,22 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
                               if isinstance(c, dict) and c.get("type") in ("text", "input_text", "output_text")]
                 text = "\n".join(p for p in text_parts if p)
                 if text:
-                    raw_msgs.append({"role": role, "content": text})
+                    msg: dict[str, Any] = {"role": role, "content": text}
+                    if role == "assistant" and pending_reasoning:
+                        msg["reasoning_content"] = pending_reasoning
+                        pending_reasoning = ""
+                    raw_msgs.append(msg)
             else:
-                raw_msgs.append({"role": role, "content": content})
+                msg = {"role": role, "content": content}
+                if role == "assistant" and pending_reasoning:
+                    msg["reasoning_content"] = pending_reasoning
+                    pending_reasoning = ""
+                raw_msgs.append(msg)
         elif t == "function_call":
             cid = it.get("call_id") or it.get("id") or "call"
             if cid not in output_ids:
                 continue
-            raw_msgs.append({
+            tc_msg: dict[str, Any] = {
                 "_tc": True,
                 "role": "assistant",
                 "tool_calls": [{
@@ -242,7 +261,11 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
                         "arguments": it.get("arguments") or "",
                     },
                 }],
-            })
+            }
+            if pending_reasoning:
+                tc_msg["reasoning_content"] = pending_reasoning
+                pending_reasoning = ""
+            raw_msgs.append(tc_msg)
         elif t == "function_call_output":
             raw_msgs.append({
                 "role": "tool",
@@ -252,16 +275,23 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
 
     # Merge pass: consecutive assistant text + tool_calls → one message;
     # consecutive tool_calls → one message with multiple tool_calls.
+    # reasoning_content is preserved on the merged message.
     merged: list[dict[str, Any]] = []
     for msg in raw_msgs:
         is_tc = msg.pop("_tc", False)
+        rc = msg.pop("reasoning_content", None)
         if is_tc and merged and merged[-1].get("role") == "assistant":
             prev = merged[-1]
             if "tool_calls" in prev:
                 prev["tool_calls"].extend(msg["tool_calls"])
             else:
                 prev["tool_calls"] = msg["tool_calls"]
+            # Attach reasoning_content to the merged assistant message
+            if rc and "reasoning_content" not in prev:
+                prev["reasoning_content"] = rc
         else:
+            if rc:
+                msg["reasoning_content"] = rc
             merged.append(msg)
 
     out["messages"].extend(merged)

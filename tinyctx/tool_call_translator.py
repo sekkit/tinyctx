@@ -415,17 +415,23 @@ def _split_around_tool_calls(buf: str) -> tuple[str, str, str]:
 @dataclass
 class ChatToResponsesTranslator:
     """Translates a chat-completions SSE stream into Responses API SSE that
-    codex CLI expects. Handles text content, tool_calls, and finish events."""
+    codex CLI expects. Handles text content, tool_calls, reasoning_content,
+    and finish events."""
 
     _partial: str = ""
     _started: bool = False
     _seq: int = 0
     _text_buf: str = ""
+    _reasoning_buf: str = ""
     _resp_id: str = ""
     _model: str = ""
     _item_id: str = field(default_factory=lambda: "msg_" + uuid.uuid4().hex[:24])
+    _reasoning_id: str = field(default_factory=lambda: "rs_" + uuid.uuid4().hex[:24])
     _tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
     _emitted_calls: int = 0
+    _reasoning_item_emitted: bool = False
+    _reasoning_done: bool = False
+    _message_item_emitted: bool = False
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         self._partial += chunk.decode("utf-8", errors="replace")
@@ -460,6 +466,11 @@ class ChatToResponsesTranslator:
                 continue
             yield from self._handle_chunk(data)
 
+    @property
+    def _msg_output_index(self) -> int:
+        """Message output_index: 1 when reasoning present, else 0."""
+        return 1 if self._reasoning_buf else 0
+
     def _handle_chunk(self, data: dict[str, Any]) -> Iterator[bytes]:
         if not self._resp_id:
             self._resp_id = data.get("id") or "resp_" + uuid.uuid4().hex[:12]
@@ -477,18 +488,41 @@ class ChatToResponsesTranslator:
         delta = choice.get("delta") or {}
         finish = choice.get("finish_reason")
 
+        # ── reasoning_content (DeepSeek thinking mode) ──
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            self._reasoning_buf += reasoning
+            if not self._reasoning_item_emitted:
+                self._reasoning_item_emitted = True
+                yield self._sse("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"id": self._reasoning_id, "type": "reasoning",
+                             "summary": []},
+                    "sequence_number": self._next_seq(),
+                })
+
+        # ── text content ──
         content = delta.get("content")
         if content:
+            # Close reasoning item on first content delta
+            if self._reasoning_item_emitted and not self._reasoning_done:
+                yield from self._close_reasoning_item()
+            # Open message item on first content delta
+            if not self._message_item_emitted:
+                self._message_item_emitted = True
+                yield from self._emit_message_item_start()
             self._text_buf += content
             yield self._sse("response.output_text.delta", {
                 "type": "response.output_text.delta",
                 "item_id": self._item_id,
-                "output_index": 0,
+                "output_index": self._msg_output_index,
                 "content_index": 0,
                 "delta": content,
                 "sequence_number": self._next_seq(),
             })
 
+        # ── tool_calls ──
         tc_list = delta.get("tool_calls")
         if tc_list:
             for tc in tc_list:
@@ -528,9 +562,12 @@ class ChatToResponsesTranslator:
             "response": {"id": self._resp_id, "status": "in_progress"},
             "sequence_number": self._next_seq(),
         })
+
+    def _emit_message_item_start(self) -> Iterator[bytes]:
+        oi = self._msg_output_index
         yield self._sse("response.output_item.added", {
             "type": "response.output_item.added",
-            "output_index": 0,
+            "output_index": oi,
             "item": {
                 "id": self._item_id,
                 "type": "message",
@@ -543,19 +580,44 @@ class ChatToResponsesTranslator:
         yield self._sse("response.content_part.added", {
             "type": "response.content_part.added",
             "item_id": self._item_id,
-            "output_index": 0,
+            "output_index": oi,
             "content_index": 0,
             "part": {"type": "output_text", "text": ""},
+            "sequence_number": self._next_seq(),
+        })
+
+    def _close_reasoning_item(self) -> Iterator[bytes]:
+        self._reasoning_done = True
+        yield self._sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": self._reasoning_id,
+                "type": "reasoning",
+                "summary": [{"type": "summary_text",
+                              "text": self._reasoning_buf}],
+            },
             "sequence_number": self._next_seq(),
         })
 
     def _finish(self) -> Iterator[bytes]:
         if not self._started:
             return
+        oi = self._msg_output_index
+
+        # Close reasoning item if still open
+        if self._reasoning_item_emitted and not self._reasoning_done:
+            yield from self._close_reasoning_item()
+
+        # Ensure message item is opened (even if no content was received)
+        if not self._message_item_emitted:
+            self._message_item_emitted = True
+            yield from self._emit_message_item_start()
+
         yield self._sse("response.output_text.done", {
             "type": "response.output_text.done",
             "item_id": self._item_id,
-            "output_index": 0,
+            "output_index": oi,
             "content_index": 0,
             "text": self._text_buf,
             "sequence_number": self._next_seq(),
@@ -563,14 +625,14 @@ class ChatToResponsesTranslator:
         yield self._sse("response.content_part.done", {
             "type": "response.content_part.done",
             "item_id": self._item_id,
-            "output_index": 0,
+            "output_index": oi,
             "content_index": 0,
             "part": {"type": "output_text", "text": self._text_buf},
             "sequence_number": self._next_seq(),
         })
         yield self._sse("response.output_item.done", {
             "type": "response.output_item.done",
-            "output_index": 0,
+            "output_index": oi,
             "item": {
                 "id": self._item_id,
                 "type": "message",
@@ -580,10 +642,12 @@ class ChatToResponsesTranslator:
             },
             "sequence_number": self._next_seq(),
         })
+        # tool_calls start after the message item
+        tc_base = oi + 1
         for idx in sorted(self._tool_calls):
             entry = self._tool_calls[idx]
             self._emitted_calls += 1
-            oidx = self._emitted_calls
+            oidx = tc_base + self._emitted_calls - 1
             cid = entry["id"] or "fc_" + uuid.uuid4().hex[:24]
             yield self._sse("response.output_item.added", {
                 "type": "response.output_item.added",
@@ -607,11 +671,20 @@ class ChatToResponsesTranslator:
                          "arguments": entry["arguments"], "call_id": cid},
                 "sequence_number": self._next_seq(),
             })
-        output_items = [{
+
+        # Build final output list for response.completed
+        output_items: list[dict[str, Any]] = []
+        if self._reasoning_buf:
+            output_items.append({
+                "id": self._reasoning_id, "type": "reasoning",
+                "summary": [{"type": "summary_text",
+                              "text": self._reasoning_buf}],
+            })
+        output_items.append({
             "id": self._item_id, "type": "message", "role": "assistant",
             "status": "completed",
             "content": [{"type": "output_text", "text": self._text_buf}],
-        }]
+        })
         for idx in sorted(self._tool_calls):
             e = self._tool_calls[idx]
             cid = e["id"] or "fc_" + uuid.uuid4().hex[:24]
