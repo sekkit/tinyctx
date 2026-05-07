@@ -221,6 +221,79 @@ def test_scrub_unsupported_tools_no_op_when_no_tools():
     assert out == body
 
 
+def test_inject_advisor_hint_appends_to_instructions():
+    """inject_advisor_hint must append the advisor usage guidance to
+    body.instructions so the executor model sees it on every turn (this
+    is the workaround for AGENTS.md not reaching mid-thread requests)."""
+    from tinyctx.sanitize import inject_advisor_hint
+    body = {
+        "model": "gpt-5.5",
+        "instructions": "You are codex. Be helpful.",
+        "input": [{"role": "user", "content": "hi"}],
+    }
+    out = inject_advisor_hint(body)
+    assert out is not body, "must return a new body, not mutate input"
+    assert out["instructions"].startswith("You are codex. Be helpful.")
+    assert 'spawn_agent(role="advisor"' in out["instructions"]
+    # Original body untouched
+    assert "spawn_agent" not in body["instructions"]
+
+
+def test_inject_advisor_hint_skips_advisor_sub_thread():
+    """The advisor sub-thread itself uses model=tinyctx-frontier; injecting
+    advisor guidance into its prompt would loop and waste budget. Skip."""
+    from tinyctx.sanitize import inject_advisor_hint
+    body = {
+        "model": "tinyctx-frontier",
+        "instructions": "You are an expert advisor...",
+        "input": [{"role": "user", "content": "Q: ..."}],
+    }
+    out = inject_advisor_hint(body)
+    assert out is body, "must return original body unchanged for advisor sub-thread"
+    assert "spawn_agent(role=\"advisor\"" not in out["instructions"]
+
+
+def test_inject_advisor_hint_idempotent():
+    """If instructions already contain the advisor hint (e.g. AGENTS.md
+    loaded it on a fresh thread), don't double-add."""
+    from tinyctx.sanitize import inject_advisor_hint, _ADVISOR_HINT, _ADVISOR_HINT_MARKER
+    body = {
+        "model": "gpt-5.5",
+        "instructions": "Codex base...\n\n" + _ADVISOR_HINT,
+        "input": [{"role": "user", "content": "go"}],
+    }
+    out = inject_advisor_hint(body)
+    # Should be unchanged (not appended again) — the original-instructions
+    # marker count is preserved.
+    expected = body["instructions"].count(_ADVISOR_HINT_MARKER)
+    assert out["instructions"].count(_ADVISOR_HINT_MARKER) == expected
+    assert out is body  # no copy when nothing to do
+
+
+def test_inject_advisor_hint_disabled_via_env():
+    import os as _os
+    from tinyctx.sanitize import inject_advisor_hint
+    saved = _os.environ.get("TINYCTX_INJECT_ADVISOR_HINT")
+    _os.environ["TINYCTX_INJECT_ADVISOR_HINT"] = "0"
+    try:
+        body = {"model": "gpt-5.5", "instructions": "x", "input": []}
+        out = inject_advisor_hint(body)
+        assert out is body
+        assert "spawn_agent" not in out["instructions"]
+    finally:
+        if saved is None:
+            _os.environ.pop("TINYCTX_INJECT_ADVISOR_HINT", None)
+        else:
+            _os.environ["TINYCTX_INJECT_ADVISOR_HINT"] = saved
+
+
+def test_inject_advisor_hint_skips_when_no_instructions():
+    from tinyctx.sanitize import inject_advisor_hint
+    body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}]}
+    out = inject_advisor_hint(body)
+    assert out is body  # nothing to append to
+
+
 def test_normalize_for_chat_stubs_assistant_reasoning_content():
     """codex 0.128+ ships empty `type=reasoning` items (real thinking text
     is server-only), so we can't reconstruct reasoning_content. DeepSeek's

@@ -52,6 +52,7 @@ from .sanitize import (
     purge_failed_tool_inputs,
     rewrite_model,
     expand_mcp_namespaces,
+    inject_advisor_hint,
     scrub_unsupported_tools,
     strip_encrypted_content,
     strip_unsupported_responses_fields,
@@ -238,6 +239,12 @@ async def responses(request: Request) -> Any:
             )
         except Exception as e:  # noqa: BLE001
             _log("historian_spawn_failed", session=sid, error=str(e))
+
+    # Inject the advisor sub-agent usage hint into instructions BEFORE
+    # rewrite_model — the inject function reads body.model to skip the
+    # advisor's own sub-thread (model="tinyctx-frontier"). After this
+    # call, rewrite_model overwrites body.model with the backend's id.
+    body = inject_advisor_hint(body)
 
     if backend.model:
         body = rewrite_model(body, backend.model)

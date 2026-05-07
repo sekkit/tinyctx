@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -84,6 +85,65 @@ _DEFAULT_SUPPORTED_TOOL_TYPES = {"function"}
 # that some backends will accept but others reject. We drop the known-rejected
 # ones by default; everything else passes through.
 _DEFAULT_STRIP_FIELDS = ("client_metadata", "prompt_cache_key")
+
+
+# ── advisor hint injection ──────────────────────────────────────────────
+# When a thread can't be restarted (so updated AGENTS.md never reaches
+# its base instructions), the executor never learns about the advisor
+# sub-agent and therefore never spawns it. The proxy injects this hint
+# into `instructions` for every main-thread request, so the executor
+# sees it on every turn even mid-thread. Idempotent — won't double-add.
+_ADVISOR_HINT = """
+
+## advisor sub-agent (proactive use encouraged)
+
+You have a `spawn_agent(role="advisor", task="...")` sub-agent backed by a frontier-class model (gpt-5.5 / Opus-class). Use it proactively whenever you face:
+
+- 2+ valid architectural approaches with real trade-offs (data model, API contract, retry semantics, concurrency, lock ordering)
+- a non-trivial security or correctness decision (auth flow, schema migration, transaction boundary)
+- you've tried and failed twice on the same problem and need a fresh angle
+- the user's intent is ambiguous and the wrong interpretation will waste significant work
+
+Don't wait until you're "stuck" — call advisor early when the choice has consequences. Skip it for routine edits, syntax lookups, scanning, or padding.
+
+Pattern:
+  spawn_agent(role="advisor", task=<concrete question + context + what you're leaning toward>)
+  wait_agent(<the agent id>)
+  # Then act on the advice
+
+Each call costs ~5-10K frontier tokens. Budget ~3 advisor calls per task. The advisor sees ONLY the `task` field, not your conversation — pack the context tight.
+"""
+
+# Marker the injector looks for to avoid double-injection.
+_ADVISOR_HINT_MARKER = 'spawn_agent(role="advisor"'
+
+
+def inject_advisor_hint(body: dict[str, Any]) -> dict[str, Any]:
+    """Append the advisor sub-agent usage hint to `body["instructions"]`.
+
+    Skips:
+      - the advisor sub-thread itself (model == "tinyctx-frontier") so we
+        don't recursively prompt the advisor to spawn another advisor;
+      - bodies that already contain the hint (e.g. AGENTS.md was loaded);
+      - bodies where instructions is missing or non-string.
+
+    Disabled with `TINYCTX_INJECT_ADVISOR_HINT=0`.
+
+    Returns a new body when injecting, the original body otherwise."""
+    if os.environ.get("TINYCTX_INJECT_ADVISOR_HINT", "1") == "0":
+        return body
+    model = (body.get("model") or "").lower()
+    if model == "tinyctx-frontier":
+        # the advisor itself; injecting would loop / waste prompt budget
+        return body
+    inst = body.get("instructions")
+    if not isinstance(inst, str) or not inst:
+        return body
+    if _ADVISOR_HINT_MARKER in inst:
+        return body
+    out = deepcopy(body)
+    out["instructions"] = inst + _ADVISOR_HINT
+    return out
 
 
 def expand_mcp_namespaces(body: dict[str, Any], *,
