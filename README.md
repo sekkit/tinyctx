@@ -376,9 +376,51 @@ A separate analysis of [magic-context](https://github.com/cortexkit/magic-contex
 
 What we deliberately did NOT borrow: temporal markers (niche for code), cross-harness SQLite pool (we run only on codex), smart notes with conditional surfacing (too workflow-specific).
 
+## Advisor Strategy (executor-driven frontier consultation)
+
+After the v0.5 routing fixes (per-backend `context_window` + `escalate_turn_count = 9999`), frontier hit rate dropped to ~0% on real sessions — DeepSeek-v4-flash with 1M context absorbed everything. Cheap, but the frontier got no use even on prompts that genuinely benefit from `gpt-5.5`'s reasoning.
+
+The Advisor Strategy ([Anthropic blog](https://claude.com/blog/the-advisor-strategy)) threads a third path: the executor decides per-turn whether to consult the frontier as a **tool**, instead of all-or-nothing per-request escalation.
+
+```
+99% of turns                     ←── executor (DeepSeek-v4-flash)
+when stuck on a decision         ──→ ask_advisor(question, context)
+                                       ↓
+                                   consult frontier (gpt-5.5)
+                                   return 200-500 word guidance
+                                       ↓
+executor resumes with advice     ←──
+```
+
+Implementation: `tinyctx/advisor.py` is a stdio MCP server. It exposes `ask_advisor(question, context, previous_attempts)` to the executor. Each call is routed back through the running tinyctx proxy with `model="tinyctx-frontier"` (client-forced route), so:
+
+- existing frontier auth/config is reused (no duplicate key plumbing)
+- every advisor call shows up in `tinyctx-trace --watch` with `forced_by_client_model=true`
+- swapping the frontier (e.g. to a different provider) requires zero advisor changes
+
+Wire it into `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.advisor]
+type = "stdio"
+command = "/path/to/tinyctx/.venv/bin/python"
+args = ["-m", "tinyctx.advisor"]
+
+[mcp_servers.advisor.env]
+TINYCTX_PROXY_URL = "http://127.0.0.1:4141/v1"
+TINYCTX_ADVISOR_MODEL = "tinyctx-frontier"
+TINYCTX_ADVISOR_TIMEOUT_S = "180"
+```
+
+Auth fallback: if `TINYCTX_ADVISOR_API_KEY` is unset, `advisor.py` reads `~/.codex/auth.json` and forwards the codex `access_token` as the Authorization bearer — same source codex itself uses, so the advisor inherits the user's existing chatgpt login automatically.
+
+**Codex 0.125 namespace note**: codex prefixes MCP tools as `mcp__<server>__<tool>`, so the executor sees this as `mcp__advisor__ask_advisor`. With codex's `tool_search` feature enabled (default), MCP tools are deferred — the executor must search for the tool first. Disable with `--disable tool_search` if you want the tool eagerly exposed.
+
+Anthropic's blog reports +2.7 SWE-bench points at -11.9% cost using this pattern (Sonnet+Opus pairing). The DeepSeek+gpt-5.5 pairing should see similar shape — the executor handles 99% of turns at deepseek pricing, and burns the frontier only on the 1-3 hard decisions per task that actually need it.
+
 ## Status
 
 - v0.5.0 — works end-to-end with fake backends and against real codex CLI 0.125.0.
-- **116 tests across 16 files, all passing**, plus a separate proxy+compactor integration test.
+- **137 tests across 17 files, all passing** (incl. 21 advisor tests covering MCP handshake + streaming + auth resolution + SSE error surfacing), plus a separate proxy+compactor integration test.
 - 6 OSS upstream dependencies wired (graphify, serena, caveman, mem0, LMStudio, magic-context-as-inspiration); 0 reinvented.
-- Total original code: ~4,000 LOC across 17 modules.
+- Total original code: ~4,300 LOC across 18 modules.
