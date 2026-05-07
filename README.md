@@ -392,15 +392,42 @@ when stuck on a decision         ──→ ask_advisor(question, context)
 executor resumes with advice     ←──
 ```
 
-Implementation: `tinyctx/advisor.py` is a stdio MCP server. It exposes `ask_advisor(question, context, previous_attempts)` to the executor. Each call is routed back through the running tinyctx proxy with `model="tinyctx-frontier"` (client-forced route), so:
+### Two implementations — pick one based on codex version
 
-- existing frontier auth/config is reused (no duplicate key plumbing)
-- every advisor call shows up in `tinyctx-trace --watch` with `forced_by_client_model=true`
-- swapping the frontier (e.g. to a different provider) requires zero advisor changes
+**Codex 0.128+ (recommended): codex agent route**
 
-Wire it into `~/.codex/config.toml`:
+Reverse-engineering Codex.app 0.128.0-alpha.1's binary revealed that codex's namespace MCP dispatcher returns `unsupported call` for any LLM-emitted `mcp__<server>__<tool>` invocation in alpha builds — the LLM sees the tool, calls it, and codex's `core/src/tools/router.rs` rejects the dispatch. Reverse engineering also showed codex has a **stable, fully-implemented `spawn_agent` system** (multi_agent feature, true by default) that's a perfect Advisor Strategy fit — the LLM forks a sub-thread bound to a config file with its own model + system prompt. So the supported route on 0.128+ is to register advisor as a codex agent, not as an MCP tool.
 
 ```toml
+# ~/.codex/config.toml
+[agents.advisor]
+description = "Consult a more capable advisor model (gpt-5.5 / Opus-class) for HARD decisions when stuck. Use when: (1) torn between architectural choices with real consequences, (2) tried 2+ failed approaches and need a fresh perspective, (3) about to make a non-trivial security/correctness decision, (4) user intent ambiguous and the wrong interpretation will waste significant work."
+config_file = "agents/advisor.toml"
+```
+
+```toml
+# ~/.codex/agents/advisor.toml
+model = "tinyctx-frontier"            # forced-route alias → tinyctx ships the call to gpt-5.5
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+web_search = "disabled"
+
+developer_instructions = """
+You are an expert advisor for a coding agent...
+[full system prompt — see examples/agent-advisor.toml]
+"""
+```
+
+The executor then calls `spawn_agent(role="advisor", task="<question>")` and awaits with `wait_agent`. codex starts a sub-thread, the sub-thread's `model="tinyctx-frontier"` makes tinyctx force-route to the frontier (every call shows up in `tinyctx-trace --watch` with `forced_by_client_model=true`), gpt-5.5 returns its 200-500 word guidance, the executor reads it, life continues.
+
+End-to-end verified on Codex.app 0.128.0-alpha.1: PING → advisor sub-thread → gpt-5.5 → PONG response in ~7s with `forced_by_client_model=true` confirmed in trace.
+
+**Codex 0.125 (fallback): MCP server route**
+
+For older codex builds, `tinyctx/advisor.py` is a stdio MCP server that exposes `ask_advisor(question, context, previous_attempts)`. Same wire shape as the agent route — the call goes through the tinyctx proxy with `model="tinyctx-frontier"` and the auth flow inherits codex's chatgpt token from `~/.codex/auth.json`.
+
+```toml
+# ~/.codex/config.toml (legacy, codex 0.125)
 [mcp_servers.advisor]
 type = "stdio"
 command = "/path/to/tinyctx/.venv/bin/python"
@@ -412,18 +439,24 @@ TINYCTX_ADVISOR_MODEL = "tinyctx-frontier"
 TINYCTX_ADVISOR_TIMEOUT_S = "180"
 ```
 
-Auth fallback: if `TINYCTX_ADVISOR_API_KEY` is unset, `advisor.py` reads `~/.codex/auth.json` and forwards the codex `access_token` as the Authorization bearer — same source codex itself uses, so the advisor inherits the user's existing chatgpt login automatically.
+The MCP server still works for direct CLI use (`echo '{"method":"tools/call",...}' | python -m tinyctx.advisor`). It just doesn't reach the executor on codex 0.128+.
 
-**Codex namespace handling** (added in this fix):
-- **Codex 0.128+** wraps MCP-server tools at the wire level inside `type: "namespace"` shells (`{"type": "namespace", "name": "mcp__advisor__", "tools": [{"type": "function", "name": "ask_advisor", ...}]}`). Without expansion, those wrappers get dropped by the function-only scrub and the executor never sees `ask_advisor`. The proxy now runs `expand_mcp_namespaces` before scrub: namespace shells become top-level `type=function` entries with names like `mcp__advisor__ask_advisor`, so DeepSeek (and any other chat-completions backend) can see and call them. Set `TINYCTX_MCP_NAME_NO_PREFIX=1` if a future codex build expects the bare inner tool name instead.
-- **Codex 0.128.0-alpha.1 known dispatcher limitation**: even after the executor model invokes the expanded tool, codex's internal `core/src/tools/router.rs` returns `unsupported call: <name>` for namespace-expanded MCP tools — both with and without the namespace prefix. The wire expansion is verified correct end-to-end (the executor genuinely emits the function call; the dispatch hop on codex's side is what fails). Watch the `code_mode` / `tool_search_always_defer_mcp_tools` features for codex's fix; tinyctx's expansion will work the moment codex's dispatcher accepts the call.
-- **Codex 0.125** doesn't expose MCP tools to the executor at all (everything goes through `tool_search` which isn't surfaced to the model in current builds). Upgrading to 0.128+ is required for advisor visibility, even though the dispatcher round-trip is still pending.
+### Bonus tinyctx fixes shipped along the way
+
+While debugging the advisor path on codex 0.128, three independent codex 0.128 ↔ DeepSeek wire incompatibilities surfaced and got fixed:
+
+- **`expand_mcp_namespaces`** (`tinyctx/sanitize.py`) — codex 0.128 wraps MCP tools in `type: "namespace"` shells. The proxy now expands them into top-level `type=function` entries (names like `mcp__advisor__ask_advisor`). Even though the codex dispatcher won't route these on 0.128-alpha, the executor model needs to *see* the tool list for context.
+- **`_flatten_tool_output`** — codex 0.128 returns rich tool outputs with `input_image` items mixed in (base64 PNGs from screenshots). DeepSeek's chat-completions API rejects these with HTTP 400. We now flatten to text + `[image attached]` placeholders.
+- **`reasoning_content` stub** — codex 0.128's `type=reasoning` items ship empty (real thinking text is server-only). DeepSeek's thinking-mode endpoint then 400s on the next turn unless every assistant message carries some `reasoning_content`. The proxy stubs an empty string so DeepSeek's strict check passes.
+
+Each one was triggered live during a real session (700+ turns) and identified via wire-body capture, codex.app binary reverse engineering, and DeepSeek error message inspection.
 
 Anthropic's blog reports +2.7 SWE-bench points at -11.9% cost using this pattern (Sonnet+Opus pairing). The DeepSeek+gpt-5.5 pairing should see similar shape — the executor handles 99% of turns at deepseek pricing, and burns the frontier only on the 1-3 hard decisions per task that actually need it.
 
 ## Status
 
 - v0.5.0 — works end-to-end with fake backends and against real codex CLI 0.125.0 / Codex.app 0.128.0-alpha.1.
-- **140 tests across 17 files, all passing** (incl. 21 advisor tests + 3 namespace expansion tests + the proxy+compactor integration test).
+- **141 tests across 17 files, all passing** (incl. 21 advisor tests + 3 namespace expansion tests + 4 codex 0.128 wire-compat tests).
+- Advisor Strategy verified live on Codex.app 0.128 via the agent route (PING/PONG round-trip, frontier hit confirmed in trace).
 - 6 OSS upstream dependencies wired (graphify, serena, caveman, mem0, LMStudio, magic-context-as-inspiration); 0 reinvented.
 - Total original code: ~4,400 LOC across 18 modules.
