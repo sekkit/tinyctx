@@ -55,7 +55,7 @@ from .sanitize import (
     strip_encrypted_content,
     strip_unsupported_responses_fields,
 )
-from .tool_call_translator import StreamTranslator, rebuild_response
+from .tool_call_translator import ChatToResponsesTranslator, StreamTranslator, rebuild_response
 from .trace import RequestTrace
 
 
@@ -303,6 +303,7 @@ async def responses(request: Request) -> Any:
     trace.is_stream = is_stream
     return await _forward(url, headers, forward_body, is_stream, sid, decision,
                           translate_tool_calls=backend.translate_tool_calls,
+                          chat_to_responses=(backend.wire_api != "responses"),
                           trace=trace)
 
 
@@ -354,12 +355,14 @@ def _forward_headers(request: Request, backend: BackendCfg) -> dict[str, str]:
 async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                    is_stream: bool, sid: str, decision: Decision,
                    *, translate_tool_calls: bool = False,
+                   chat_to_responses: bool = False,
                    trace: RequestTrace | None = None) -> Any:
     timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
     if is_stream:
         return StreamingResponse(
             _stream_proxy(url, headers, body, sid, decision, timeout,
                           translate_tool_calls=translate_tool_calls,
+                          chat_to_responses=chat_to_responses,
                           trace=trace),
             media_type="text/event-stream",
         )
@@ -408,11 +411,18 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         sid: str, decision: Decision,
                         timeout: httpx.Timeout,
                         *, translate_tool_calls: bool = False,
+                        chat_to_responses: bool = False,
                         trace: RequestTrace | None = None) -> AsyncIterator[bytes]:
     started = time.time()
     bytes_out = 0
     status = 200
-    translator = StreamTranslator() if translate_tool_calls else None
+    translator: StreamTranslator | ChatToResponsesTranslator | None
+    if chat_to_responses:
+        translator = ChatToResponsesTranslator()
+    elif translate_tool_calls:
+        translator = StreamTranslator()
+    else:
+        translator = None
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, headers=headers, json=body) as r:
@@ -420,6 +430,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 if r.status_code >= 400:
                     _SESSION_ERROR_STREAK[sid] += 1
                     text = (await r.aread()).decode("utf-8", "replace")
+                    _log("upstream_error", session=sid, status=r.status_code,
+                         url=url, body=text[:2000])
                     yield f"event: error\ndata: {json.dumps({'status': r.status_code, 'body': text[:2000]})}\n\n".encode()
                     return
                 _SESSION_ERROR_STREAK[sid] = 0

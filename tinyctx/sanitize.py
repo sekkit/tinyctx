@@ -166,49 +166,105 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
         "stream": body.get("stream", True),
     }
     # carry over a few common knobs if present
-    for k in ("temperature", "top_p", "max_tokens", "tools", "tool_choice",
-              "response_format", "stop"):
+    for k in ("temperature", "top_p", "max_tokens", "tool_choice", "stop"):
         if k in body:
             out[k] = body[k]
+    # Convert tools from Responses API format to chat-completions format.
+    # Responses: {"type": "function", "name": "x", "parameters": {...}, "description": "..."}
+    # Chat:      {"type": "function", "function": {"name": "x", "parameters": {...}, "description": "..."}}
+    if "tools" in body and isinstance(body["tools"], list):
+        chat_tools = []
+        for t in body["tools"]:
+            if not isinstance(t, dict):
+                continue
+            if t.get("type") == "function" and "function" not in t:
+                chat_tools.append({
+                    "type": "function",
+                    "function": {
+                        k: v for k, v in t.items()
+                        if k in ("name", "description", "parameters", "strict")
+                    },
+                })
+            else:
+                chat_tools.append(t)
+        if chat_tools:
+            out["tools"] = chat_tools
     # Build messages from instructions + input
     instr = body.get("instructions")
     if isinstance(instr, str) and instr.strip():
         out["messages"].append({"role": "system", "content": instr})
     src = body.get("input") or body.get("messages") or []
-    if isinstance(src, list):
-        for it in src:
-            if not isinstance(it, dict):
+    if not isinstance(src, list):
+        return out
+
+    # Collect call_ids that have a matching output so we only emit paired calls.
+    output_ids: set[str] = set()
+    for it in src:
+        if isinstance(it, dict) and it.get("type") == "function_call_output":
+            cid = it.get("call_id") or it.get("id") or ""
+            if cid:
+                output_ids.add(cid)
+
+    # Two-pass: first linearize into (role, payload) tuples, then merge.
+    raw_msgs: list[dict[str, Any]] = []
+    for it in src:
+        if not isinstance(it, dict):
+            continue
+        role = it.get("role")
+        t = it.get("type")
+        content = it.get("content")
+        if role == "developer":
+            role = "system"
+
+        if t in _REASONING_ITEM_TYPES:
+            continue
+        if role and content is not None:
+            if isinstance(content, list):
+                text_parts = [c.get("text", "") for c in content
+                              if isinstance(c, dict) and c.get("type") in ("text", "input_text", "output_text")]
+                text = "\n".join(p for p in text_parts if p)
+                if text:
+                    raw_msgs.append({"role": role, "content": text})
+            else:
+                raw_msgs.append({"role": role, "content": content})
+        elif t == "function_call":
+            cid = it.get("call_id") or it.get("id") or "call"
+            if cid not in output_ids:
                 continue
-            role = it.get("role")
-            t = it.get("type")
-            content = it.get("content")
-            if role and content is not None:
-                if isinstance(content, list):
-                    text_parts = [c.get("text", "") for c in content
-                                  if isinstance(c, dict) and c.get("type") in ("text", "input_text", "output_text")]
-                    out["messages"].append({"role": role, "content": "\n".join(p for p in text_parts if p)})
-                else:
-                    out["messages"].append({"role": role, "content": content})
-            elif t == "function_call":
-                # Surface as assistant tool_calls
-                out["messages"].append({
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": it.get("call_id") or it.get("id") or "call",
-                        "type": "function",
-                        "function": {
-                            "name": it.get("name") or "",
-                            "arguments": it.get("arguments") or "",
-                        },
-                    }],
-                })
-            elif t == "function_call_output":
-                out["messages"].append({
-                    "role": "tool",
-                    "tool_call_id": it.get("call_id") or it.get("id") or "call",
-                    "content": it.get("output") or "",
-                })
-            # reasoning items intentionally dropped
+            raw_msgs.append({
+                "_tc": True,
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": cid,
+                    "type": "function",
+                    "function": {
+                        "name": it.get("name") or "",
+                        "arguments": it.get("arguments") or "",
+                    },
+                }],
+            })
+        elif t == "function_call_output":
+            raw_msgs.append({
+                "role": "tool",
+                "tool_call_id": it.get("call_id") or it.get("id") or "call",
+                "content": it.get("output") or "",
+            })
+
+    # Merge pass: consecutive assistant text + tool_calls → one message;
+    # consecutive tool_calls → one message with multiple tool_calls.
+    merged: list[dict[str, Any]] = []
+    for msg in raw_msgs:
+        is_tc = msg.pop("_tc", False)
+        if is_tc and merged and merged[-1].get("role") == "assistant":
+            prev = merged[-1]
+            if "tool_calls" in prev:
+                prev["tool_calls"].extend(msg["tool_calls"])
+            else:
+                prev["tool_calls"] = msg["tool_calls"]
+        else:
+            merged.append(msg)
+
+    out["messages"].extend(merged)
     return out
 
 

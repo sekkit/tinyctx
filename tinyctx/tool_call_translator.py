@@ -407,3 +407,235 @@ def _split_around_tool_calls(buf: str) -> tuple[str, str, str]:
     end = last_close_match[-1].end()
     tail = buf[end:]
     return head, buf[first:end], tail
+
+
+# ─────────────── chat-completions SSE → Responses API SSE ───────────────
+
+
+@dataclass
+class ChatToResponsesTranslator:
+    """Translates a chat-completions SSE stream into Responses API SSE that
+    codex CLI expects. Handles text content, tool_calls, and finish events."""
+
+    _partial: str = ""
+    _started: bool = False
+    _seq: int = 0
+    _text_buf: str = ""
+    _resp_id: str = ""
+    _model: str = ""
+    _item_id: str = field(default_factory=lambda: "msg_" + uuid.uuid4().hex[:24])
+    _tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
+    _emitted_calls: int = 0
+
+    def feed(self, chunk: bytes) -> Iterator[bytes]:
+        self._partial += chunk.decode("utf-8", errors="replace")
+        while True:
+            sep = self._partial.find("\n\n")
+            if sep == -1:
+                break
+            raw = self._partial[:sep + 2]
+            self._partial = self._partial[sep + 2:]
+            yield from self._handle_raw(raw)
+
+    def flush(self) -> Iterator[bytes]:
+        if self._partial.strip():
+            yield from self._handle_raw(self._partial + "\n\n")
+            self._partial = ""
+        if self._started:
+            yield from self._finish()
+
+    def _handle_raw(self, raw: str) -> Iterator[bytes]:
+        for line in raw.strip().split("\n"):
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                yield from self._finish()
+                return
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if data.get("object") != "chat.completion.chunk":
+                continue
+            yield from self._handle_chunk(data)
+
+    def _handle_chunk(self, data: dict[str, Any]) -> Iterator[bytes]:
+        if not self._resp_id:
+            self._resp_id = data.get("id") or "resp_" + uuid.uuid4().hex[:12]
+        if not self._model:
+            self._model = data.get("model") or ""
+
+        if not self._started:
+            self._started = True
+            yield from self._emit_preamble()
+
+        choices = data.get("choices") or []
+        if not choices:
+            return
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        finish = choice.get("finish_reason")
+
+        content = delta.get("content")
+        if content:
+            self._text_buf += content
+            yield self._sse("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "item_id": self._item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": content,
+                "sequence_number": self._next_seq(),
+            })
+
+        tc_list = delta.get("tool_calls")
+        if tc_list:
+            for tc in tc_list:
+                idx = tc.get("index", 0)
+                if idx not in self._tool_calls:
+                    self._tool_calls[idx] = {
+                        "id": tc.get("id") or "",
+                        "name": "",
+                        "arguments": "",
+                    }
+                entry = self._tool_calls[idx]
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    entry["name"] = fn["name"]
+                if fn.get("arguments"):
+                    entry["arguments"] += fn["arguments"]
+
+        if finish:
+            yield from self._finish()
+
+    def _emit_preamble(self) -> Iterator[bytes]:
+        yield self._sse("response.created", {
+            "type": "response.created",
+            "response": {
+                "id": self._resp_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": self._model,
+                "output": [],
+            },
+            "sequence_number": self._next_seq(),
+        })
+        yield self._sse("response.in_progress", {
+            "type": "response.in_progress",
+            "response": {"id": self._resp_id, "status": "in_progress"},
+            "sequence_number": self._next_seq(),
+        })
+        yield self._sse("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": self._item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+            "sequence_number": self._next_seq(),
+        })
+        yield self._sse("response.content_part.added", {
+            "type": "response.content_part.added",
+            "item_id": self._item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""},
+            "sequence_number": self._next_seq(),
+        })
+
+    def _finish(self) -> Iterator[bytes]:
+        if not self._started:
+            return
+        yield self._sse("response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": self._item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": self._text_buf,
+            "sequence_number": self._next_seq(),
+        })
+        yield self._sse("response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": self._item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": self._text_buf},
+            "sequence_number": self._next_seq(),
+        })
+        yield self._sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": self._item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": self._text_buf}],
+            },
+            "sequence_number": self._next_seq(),
+        })
+        for idx in sorted(self._tool_calls):
+            entry = self._tool_calls[idx]
+            self._emitted_calls += 1
+            oidx = self._emitted_calls
+            cid = entry["id"] or "fc_" + uuid.uuid4().hex[:24]
+            yield self._sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": oidx,
+                "item": {"id": cid, "type": "function_call",
+                         "status": "in_progress", "name": entry["name"],
+                         "arguments": "", "call_id": cid},
+                "sequence_number": self._next_seq(),
+            })
+            yield self._sse("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": cid, "output_index": oidx,
+                "arguments": entry["arguments"],
+                "sequence_number": self._next_seq(),
+            })
+            yield self._sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": oidx,
+                "item": {"id": cid, "type": "function_call",
+                         "status": "completed", "name": entry["name"],
+                         "arguments": entry["arguments"], "call_id": cid},
+                "sequence_number": self._next_seq(),
+            })
+        output_items = [{
+            "id": self._item_id, "type": "message", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": self._text_buf}],
+        }]
+        for idx in sorted(self._tool_calls):
+            e = self._tool_calls[idx]
+            cid = e["id"] or "fc_" + uuid.uuid4().hex[:24]
+            output_items.append({
+                "id": cid, "type": "function_call", "status": "completed",
+                "name": e["name"], "arguments": e["arguments"], "call_id": cid,
+            })
+        yield self._sse("response.completed", {
+            "type": "response.completed",
+            "response": {
+                "id": self._resp_id,
+                "object": "response",
+                "status": "completed",
+                "model": self._model,
+                "output": output_items,
+            },
+            "sequence_number": self._next_seq(),
+        })
+        self._started = False
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    @staticmethod
+    def _sse(event: str, payload: dict[str, Any]) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")

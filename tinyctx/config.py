@@ -163,7 +163,7 @@ def load_config() -> Config:
     # Step 2 — file
     path = Path(_env("TINYCTX_CONFIG", str(Path.home() / ".tinyctx" / "config.toml")) or "")
     if path.is_file() and tomllib is not None:
-        data: dict[str, Any] = tomllib.loads(path.read_text())
+        data: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8"))
         for k, v in (data.get("server") or {}).items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
