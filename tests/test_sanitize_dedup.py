@@ -221,6 +221,29 @@ def test_scrub_unsupported_tools_no_op_when_no_tools():
     assert out == body
 
 
+def test_normalize_for_chat_stubs_assistant_reasoning_content():
+    """codex 0.128+ ships empty `type=reasoning` items (real thinking text
+    is server-only), so we can't reconstruct reasoning_content. DeepSeek's
+    thinking mode then 400s on the next turn unless every assistant
+    message carries some `reasoning_content` field. Stubbing it to "" is
+    the honest minimum — we forward nothing because we have nothing."""
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hello"}]},
+        ],
+    }
+    out = normalize_for_chat(body)
+    asst_msgs = [m for m in out["messages"] if m.get("role") == "assistant"]
+    assert asst_msgs, "expected at least one assistant message"
+    for m in asst_msgs:
+        assert "reasoning_content" in m, \
+            "every assistant message must carry reasoning_content (even if empty)"
+
+
 def test_flatten_tool_output_strips_input_image():
     """codex 0.128+ tool outputs are lists mixing text and base64 PNGs;
     DeepSeek's chat-completions API rejects `input_image` with HTTP 400.

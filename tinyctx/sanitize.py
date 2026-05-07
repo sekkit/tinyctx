@@ -404,6 +404,23 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
             merged.append(msg)
 
     out["messages"].extend(merged)
+
+    # ── DeepSeek thinking-mode reasoning_content compat ──
+    # codex 0.128+ ships `type=reasoning` items with empty content/summary/
+    # encrypted_content (the actual thinking text is server-only). With
+    # nothing to reconstruct, our normalize loop never attaches
+    # `reasoning_content` to assistant messages. DeepSeek's thinking-mode
+    # endpoints then 400 with:
+    #     The `reasoning_content` in the thinking mode must be passed back
+    #     to the API.
+    # Empty-string reasoning_content satisfies the strict check while
+    # signalling honestly that we have no thinking text to forward.
+    # Toggle off by setting TINYCTX_FORCE_REASONING_STUB=0.
+    import os as _os
+    if _os.environ.get("TINYCTX_FORCE_REASONING_STUB", "1") == "1":
+        for _m in out["messages"]:
+            if _m.get("role") == "assistant" and "reasoning_content" not in _m:
+                _m["reasoning_content"] = ""
     return out
 
 
