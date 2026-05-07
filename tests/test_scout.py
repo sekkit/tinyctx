@@ -76,7 +76,7 @@ def test_build_scout_writes_artifacts(tmp_path=None):
             "src/util.py": "def helper():\n    pass\n",
         })
         # redirect cache to td (avoid touching real ~/.tinyctx)
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             sp = scout.build_scout(graph, proj, top_k=10,
                                    model="qwen-test",
                                    base_url="http://localhost:9999/v1",
@@ -93,7 +93,7 @@ def test_build_scout_writes_artifacts(tmp_path=None):
             assert data["top_k"] == 10
             assert len(data["ranked"]) >= 1
             # file_hashes recorded for source files we found
-            assert any("src/auth.py" in k for k in data["file_hashes"])
+            assert any("auth.py" in k for k in data["file_hashes"])
 
 
 def test_is_stale_detects_changed_file():
@@ -103,7 +103,7 @@ def test_is_stale_detects_changed_file():
             "src/auth.py": "v1",
             "src/db.py": "v1",
         })
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             scout.build_scout(graph, proj, top_k=10, _llm_call=_fake_llm)
             stale, reason = scout.is_stale(proj)
             assert stale is False, reason
@@ -120,7 +120,7 @@ def test_is_stale_detects_missing_manifest():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             stale, reason = scout.is_stale(proj)
             assert stale is True
             assert reason == "no manifest"
@@ -130,7 +130,7 @@ def test_status_reports_state():
     with TemporaryDirectory() as td:
         td_p = Path(td)
         proj, graph = _write_graph(td_p, {"src/a.py": "x"})
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             assert scout.status(proj)["state"] == "absent"
             scout.build_scout(graph, proj, top_k=10, _llm_call=_fake_llm)
             s = scout.status(proj)

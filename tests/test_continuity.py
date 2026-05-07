@@ -16,7 +16,7 @@ def test_save_creates_per_session_file():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             p1 = continuity.save_compaction(proj, "sess-A", "first summary")
             p2 = continuity.save_compaction(proj, "sess-A", "second summary")
             assert p1.name == "compaction-1.md"
@@ -30,7 +30,7 @@ def test_save_writes_telemetry_in_header():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             p = continuity.save_compaction(
                 proj, "sess-A", "summary",
                 telemetry={"outcome": "judged", "timings": {"total_s": 12.4}},
@@ -45,7 +45,7 @@ def test_save_updates_latest_pointer():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             continuity.save_compaction(proj, "sess-A", "v1")
             time.sleep(0.01)
             p2 = continuity.save_compaction(proj, "sess-B", "v2")
@@ -60,7 +60,7 @@ def test_recall_returns_latest_session_only_by_default():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             continuity.save_compaction(proj, "sess-A", "alpha")
             time.sleep(0.05)
             continuity.save_compaction(proj, "sess-B", "bravo")
@@ -75,7 +75,7 @@ def test_recall_all_sessions():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             continuity.save_compaction(proj, "sess-A", "alpha")
             time.sleep(0.05)
             continuity.save_compaction(proj, "sess-B", "bravo")
@@ -90,7 +90,7 @@ def test_list_sessions_orders_by_recency():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             continuity.save_compaction(proj, "old", "x")
             time.sleep(0.05)
             continuity.save_compaction(proj, "new", "y")
@@ -110,7 +110,7 @@ def test_save_with_structured_writes_json_sidecar():
             "facts": [{"claim": "secret in .env", "evidence": "user said"}],
             "open_questions": ["test coverage?"],
         }
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             md_path = continuity.save_compaction(
                 proj, "sess-X", "## summary\nbody",
                 telemetry={"outcome": "judged"},
@@ -128,7 +128,7 @@ def test_latest_structured_returns_dict():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             assert continuity.latest_structured(proj) is None
             continuity.save_compaction(proj, "sess-A", "body",
                                        structured={"facts": [{"claim": "x"}]})
@@ -142,7 +142,7 @@ def test_recall_facts_only_via_cli():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             continuity.save_compaction(
                 proj, "sess-A", "body",
                 structured={"facts": [
@@ -168,7 +168,7 @@ def test_recall_compartment_via_cli():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             continuity.save_compaction(
                 proj, "sess-A", "body",
                 structured={
@@ -198,7 +198,7 @@ def test_recall_returns_empty_for_unknown_repo():
         td_p = Path(td)
         proj = td_p / "project"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             assert continuity.recall(proj) == []
             assert continuity.list_sessions(proj) == []
 

@@ -30,7 +30,7 @@ def test_run_calls_keypin_and_scout_for_each_project():
         (a / "tinyctx-graph.json").write_text("{}")
         b = td_p / "beta"; b.mkdir()
         invocations = []
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             registry.register(a)
             registry.register(b)
             with mock.patch.object(subprocess, "run",
@@ -53,7 +53,7 @@ def test_run_with_ingest_mem_calls_mem():
         td_p = Path(td)
         a = td_p / "alpha"; a.mkdir()
         invocations = []
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             registry.register(a)
             with mock.patch.object(subprocess, "run",
                                    side_effect=_fake_run_factory(invocations)):
@@ -67,7 +67,7 @@ def test_run_with_ingest_mem_calls_mem():
 def test_run_returns_1_when_no_projects():
     with TemporaryDirectory() as td:
         td_p = Path(td)
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = dreamer.main(["run"])
@@ -88,7 +88,8 @@ def test_gc_removes_old_session_dirs():
         new_md = new / "compaction-1.md"; new_md.write_text("x")
         old_mtime = time.time() - 60 * 86_400
         os.utime(old_md, (old_mtime, old_mtime))
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        env_patch = {"HOME": str(td_p), "USERPROFILE": str(td_p)}
+        with mock.patch.dict(os.environ, env_patch):
             deleted = dreamer._gc_old_sessions(retention_days=30)
             assert deleted == 1
             assert not old.exists()
@@ -99,7 +100,7 @@ def test_register_unregister_via_cli():
     with TemporaryDirectory() as td:
         td_p = Path(td)
         proj = td_p / "p"; proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = dreamer.main(["register", "--root", str(proj)])
             assert rc == 0
@@ -125,7 +126,7 @@ def test_install_launchd_writes_plist_when_exe_on_path():
         td_p = Path(td)
         # Pretend tinyctx-dreamer is on PATH.
         with mock.patch.object(shutil, "which", return_value="/usr/local/bin/tinyctx-dreamer"):
-            with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+            with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     rc = dreamer.main(["install-launchd"])

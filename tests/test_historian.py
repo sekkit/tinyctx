@@ -80,7 +80,7 @@ def test_update_writes_digest_files_when_triggered():
     with TemporaryDirectory() as td:
         td_p = Path(td)
         proj = td_p / "proj"; proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             ok = _run(historian.update("s3", _body(20), _backend(),
                                        min_new_turns=5, recent_keep=4,
                                        project_root=proj,
@@ -101,7 +101,7 @@ def test_update_increments_revision_each_pass():
     with TemporaryDirectory() as td:
         td_p = Path(td)
         proj = td_p / "proj"; proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             _run(historian.update("s4", _body(10), _backend(),
                                   min_new_turns=5, project_root=proj,
                                   _llm_call=_fake_llm_ok))
@@ -119,7 +119,7 @@ def test_update_quiet_on_llm_failure():
     with TemporaryDirectory() as td:
         td_p = Path(td)
         proj = td_p / "proj"; proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             ok = _run(historian.update("s5", _body(10), _backend(),
                                        min_new_turns=5, project_root=proj,
                                        _llm_call=_fake_llm_fail))
@@ -184,7 +184,7 @@ def test_spawn_update_returns_a_task_object():
     with TemporaryDirectory() as td:
         td_p = Path(td)
         proj = td_p / "proj"; proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             async def _go():
                 t = historian.spawn_update("s10", _body(10), _backend(),
                                            min_new_turns=5, project_root=proj)

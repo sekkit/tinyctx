@@ -75,8 +75,9 @@ def test_filter_to_project_normalizes_relative_and_absolute():
             "../other/x.py":              2,     # outside project
         })
         proj_counts = keypin.filter_to_project(global_counts, proj)
-        assert proj_counts.get("src/auth.py") == 5
-        assert proj_counts.get("src/db.py") == 3
+        norm = {k.replace("\\", "/"): v for k, v in proj_counts.items()}
+        assert norm.get("src/auth.py") == 5
+        assert norm.get("src/db.py") == 3
         # outside-project paths dropped
         for k in proj_counts:
             assert "etc" not in k and "other" not in k
@@ -87,7 +88,7 @@ def test_write_keyfiles_orders_by_count_then_name():
         td_p = Path(td)
         proj = td_p / "proj"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             counts = Counter({"src/b.py": 5, "src/a.py": 5, "src/c.py": 3})
             path = keypin.write_keyfiles(counts, proj, top_n=3)
             text = path.read_text()
@@ -104,7 +105,7 @@ def test_write_keyfiles_handles_empty():
         td_p = Path(td)
         proj = td_p / "proj"
         proj.mkdir()
-        with mock.patch.dict(os.environ, {"HOME": str(td_p)}):
+        with mock.patch.dict(os.environ, {"HOME": str(td_p), "USERPROFILE": str(td_p)}):
             path = keypin.write_keyfiles(Counter(), proj)
             text = path.read_text()
             assert "No Read-tool calls" in text
