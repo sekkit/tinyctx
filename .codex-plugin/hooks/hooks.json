@@ -1,0 +1,19 @@
+{
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash -c 'curl -sf http://127.0.0.1:4141/ > /dev/null || echo \"[tinyctx] proxy not running. Start with: ~/.tinyctx/scripts/start.sh\" 1>&2'",
+          "timeout": 5
+        },
+        {
+          "type": "command",
+          "command": "${CODEX_PLUGIN_DIR}/../scripts/scout-session-start.sh",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}

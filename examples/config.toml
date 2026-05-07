@@ -1,0 +1,41 @@
+# tinyctx config.
+# Copy to ~/.tinyctx/config.toml and edit. Env vars (TINYCTX_*) override file.
+
+[server]
+host = "127.0.0.1"
+port = 4141
+verbose = true
+
+[routing]
+# Compaction handoff prompts always go to the local model. Highest-leverage win.
+redirect_compaction_to_local = true
+sanitize_encrypted_content = true
+
+# Above this estimated input-token count, escalate to frontier.
+escalate_input_tokens = 60000
+# After this many turns in a session, escalate.
+escalate_turn_count = 15
+# Two consecutive upstream errors -> next request escalates.
+escalate_on_error_streak = 2
+
+# "auto" | "local" | "frontier" — debugging override.
+force_route = "auto"
+
+[local]
+# Default points at LMStudio's OpenAI-compatible Responses endpoint.
+# Switch base_url to your vLLM/SGLang/Ollama address as needed.
+# If your local backend ONLY speaks chat-completions, set wire_api = "chat".
+base_url = "http://127.0.0.1:1234/v1"
+wire_api = "responses"
+model = "qwen3.6-27b"
+api_key_env = "TINYCTX_LOCAL_API_KEY"   # optional; LMStudio ignores
+timeout_s = 180
+
+[frontier]
+# Default = the codex backend itself. Codex's auth header is forwarded
+# unchanged when api_key_env is unset, so login state still works.
+base_url = "https://chatgpt.com/backend-api/codex"
+wire_api = "responses"
+model = "gpt-5.5"
+api_key_env = "TINYCTX_FRONTIER_API_KEY"   # leave unset to forward codex auth
+timeout_s = 300

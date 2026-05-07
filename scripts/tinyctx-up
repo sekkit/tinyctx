@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# tinyctx-up — one-shot start / health-check for the tinyctx stack.
+#
+# Idempotent: safe to run any time. Does the right thing whether the
+# service is already running, dead, or never started.
+#
+# Usage:
+#   tinyctx-up           # start (idempotent) + health check
+#   tinyctx-up restart   # force restart the launchd job
+#   tinyctx-up stop      # unload the launchd job
+#   tinyctx-up status    # just print status, don't start anything
+#   tinyctx-up logs      # tail the JSONL request_trace stream
+set -uo pipefail
+
+LABEL="com.tinyctx.proxy"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+PROXY_URL="http://127.0.0.1:4141"
+LMSTUDIO_URL="http://127.0.0.1:1234"
+LOG_DIR="$HOME/.tinyctx/logs"
+
+green() { printf "\033[32m%s\033[0m\n" "$*"; }
+red()   { printf "\033[31m%s\033[0m\n" "$*"; }
+dim()   { printf "\033[90m%s\033[0m\n" "$*"; }
+
+check_alive() {
+  curl -s --max-time 2 "$1" > /dev/null 2>&1
+}
+
+cmd_status() {
+  printf "  LMStudio       (%s)  " "$LMSTUDIO_URL"
+  if check_alive "$LMSTUDIO_URL/v1/models"; then green "alive"; else red "DEAD — open LMStudio + load a model"; fi
+
+  printf "  tinyctx-proxy  (%s)  " "$PROXY_URL"
+  if check_alive "$PROXY_URL/"; then green "alive"; else red "DEAD"; fi
+
+  if launchctl list | grep -q "$LABEL"; then
+    local line=$(launchctl list | grep "$LABEL")
+    local pid=$(echo "$line" | awk '{print $1}')
+    local rc=$(echo "$line"  | awk '{print $2}')
+    printf "  launchd job    %-22s  pid=%s  last-exit=%s\n" "$LABEL" "$pid" "$rc"
+  else
+    printf "  launchd job    %s  " "$LABEL"; red "NOT LOADED"
+  fi
+}
+
+cmd_start() {
+  if ! check_alive "$LMSTUDIO_URL/v1/models"; then
+    red "LMStudio is not responding at $LMSTUDIO_URL."
+    echo "  Open LM Studio.app → load a model → make sure the local server is on."
+    echo "  Then re-run: tinyctx-up"
+    return 1
+  fi
+  if [ ! -f "$PLIST" ]; then
+    red "launchd plist missing: $PLIST"
+    return 1
+  fi
+
+  # `-w` makes load() idempotent + persistent across reboots.
+  launchctl load -w "$PLIST" 2>/dev/null
+
+  for _ in $(seq 1 20); do
+    if check_alive "$PROXY_URL/"; then break; fi
+    sleep 0.3
+  done
+
+  cmd_status
+  echo
+  if check_alive "$PROXY_URL/"; then
+    green "tinyctx is up."
+    echo
+    echo "Use it with codex:"
+    dim   "  codex --profile tinyctx                    # interactive"
+    dim   "  codex exec --profile tinyctx \"do X\"        # one-shot"
+    echo
+    echo "Watch routing decisions live:"
+    dim   "  tinyctx-trace --watch"
+    return 0
+  else
+    red "tinyctx-proxy did not come up within 6s. Check ~/.tinyctx/logs/proxy.err"
+    return 1
+  fi
+}
+
+cmd_stop() {
+  launchctl unload "$PLIST" 2>/dev/null
+  pkill -f "tinyctx.proxy" 2>/dev/null
+  cmd_status
+  green "tinyctx stopped."
+}
+
+cmd_restart() {
+  launchctl unload "$PLIST" 2>/dev/null
+  sleep 1
+  launchctl load -w "$PLIST"
+  for _ in $(seq 1 20); do
+    if check_alive "$PROXY_URL/"; then break; fi
+    sleep 0.3
+  done
+  cmd_status
+  green "tinyctx restarted."
+}
+
+cmd_logs() {
+  local today="$LOG_DIR/tinyctx-$(date +%Y%m%d).jsonl"
+  if [ ! -f "$today" ]; then
+    red "no log yet at $today; run a request first."
+    return 1
+  fi
+  echo "tailing $today (Ctrl-C to exit)"
+  tail -F "$today"
+}
+
+case "${1:-start}" in
+  start|"")     cmd_start ;;
+  stop)         cmd_stop ;;
+  restart)      cmd_restart ;;
+  status)       cmd_status ;;
+  logs)         cmd_logs ;;
+  *)
+    cat <<USAGE
+usage: tinyctx-up [start|stop|restart|status|logs]
+  start     start (idempotent) + health check     (default)
+  stop      unload the launchd job
+  restart   force restart
+  status    print health, don't change anything
+  logs      tail today's request_trace JSONL
+USAGE
+    exit 2
+    ;;
+esac

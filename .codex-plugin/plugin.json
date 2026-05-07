@@ -1,0 +1,35 @@
+{
+  "name": "tinyctx",
+  "version": "0.1.0",
+  "description": "Local-first routing proxy for Codex CLI: redirect compaction summaries to a local 27B model, scrub encrypted_content on cross-model swaps, escalate to GPT-5.5 only when needed.",
+  "homepage": "https://github.com/sekkit/tinyctx",
+  "author": "tinyctx",
+  "license": "MIT",
+  "keywords": ["codex", "router", "proxy", "local-llm", "compaction", "cost-reduction"],
+  "compatibility": {
+    "codex": ">=0.124.0"
+  },
+  "hooks": "hooks/hooks.json",
+  "model_providers": {
+    "tinyctx": {
+      "name": "tinyctx local-first router",
+      "base_url": "http://127.0.0.1:4141/v1",
+      "wire_api": "responses",
+      "request_max_retries": 4,
+      "stream_max_retries": 10,
+      "stream_idle_timeout_ms": 300000
+    }
+  },
+  "profiles": {
+    "tinyctx": {
+      "model_provider": "tinyctx",
+      "model": "tinyctx-auto",
+      "model_context_window": 400000,
+      "model_auto_compact_token_limit": 64000
+    }
+  },
+  "post_install": [
+    "echo 'tinyctx installed. Start the proxy with: ~/.tinyctx/scripts/start.sh'",
+    "echo 'Then run codex with: codex --profile tinyctx'"
+  ]
+}
