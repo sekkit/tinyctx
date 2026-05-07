@@ -35,6 +35,11 @@ wire_api = "responses"
 model = "qwen3.6-27b-crack"
 api_key_env = "TINYCTX_LOCAL_API_KEY"   # LMStudio ignores; set anyway for portability
 timeout_s = 180
+# Drives the "escalate when local can't fit" routing branch — the router
+# escalates only when est_tokens > context_window * context_safe_fraction.
+# Set to whatever your loaded model actually supports.
+context_window = 262144            # qwen3.6-27b-crack 256K build (adjust per build)
+context_safe_fraction = 0.85
 
 # ── (B) DeepSeek API (chat-completions only — proxy translates) ──
 # Pros: ~5–7 s/turn vs ~3 min local; reasoning_content preserved through
@@ -53,6 +58,8 @@ timeout_s = 180
 # model = "deepseek-v4-flash"             # or deepseek-v4-pro
 # api_key_env = "TINYCTX_LOCAL_API_KEY"   # value lives in secrets.env
 # timeout_s = 180
+# context_window = 1000000                # v4-flash and v4-pro both 1M input
+# context_safe_fraction = 0.85            # escalate at ~850K input
 
 # ── (C) Ollama (chat-completions, no reasoning_content) ──
 # [local]

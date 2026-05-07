@@ -84,6 +84,43 @@ def test_compaction_phrase_variants():
     assert not is_compaction_request("write a handoff document for the team")  # no fingerprint
 
 
+def test_context_window_drives_escalation_when_set():
+    """When cfg.local.context_window is set, the router uses it (× safe
+    fraction) instead of the legacy absolute escalate_input_tokens."""
+    from tinyctx.config import Config, BackendCfg
+    cfg = Config()
+    cfg.local = BackendCfg(
+        base_url="x", model="m", wire_api="chat",
+        context_window=1_000_000, context_safe_fraction=0.85,
+    )
+    # 100K input → well below 850K cap → local
+    body = {"input": [{"role": "user",
+                       "content": [{"type": "input_text", "text": "x" * 360_000}]}]}
+    d = decide(body, cfg)
+    assert d.route == "local", d.reason
+
+    # 900K input → above 850K cap → frontier
+    body = {"input": [{"role": "user",
+                       "content": [{"type": "input_text", "text": "x" * 3_500_000}]}]}
+    d = decide(body, cfg)
+    assert d.route == "frontier", d.reason
+    assert "of local ctx 1000000" in d.reason
+
+
+def test_legacy_threshold_used_when_context_window_unset():
+    """If context_window=0, fall back to absolute escalate_input_tokens."""
+    from tinyctx.config import Config, BackendCfg
+    cfg = Config()
+    cfg.local = BackendCfg(base_url="x", model="m", wire_api="chat",
+                           context_window=0)
+    cfg.escalate_input_tokens = 60_000
+    body = {"input": [{"role": "user",
+                       "content": [{"type": "input_text", "text": "x" * 250_000}]}]}
+    d = decide(body, cfg)
+    assert d.route == "frontier"
+    assert "60000" in d.reason
+
+
 if __name__ == "__main__":
     import sys
     failed = 0

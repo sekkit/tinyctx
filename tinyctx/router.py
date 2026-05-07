@@ -130,7 +130,25 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
         return Decision("frontier", f"error_streak={error_streak} >= threshold",
                         est_input_tokens=est, turn_count=turns)
 
-    if est >= cfg.escalate_input_tokens:
+    # Token-size escalation. Two modes:
+    #   (A) If cfg.local.context_window is set, use it as the source of truth:
+    #       escalate when input exceeds context_window * context_safe_fraction
+    #       (default 0.85). This auto-adapts when the user swaps backends —
+    #       a 32K-context Ollama setup escalates at ~27K, a 1M-context
+    #       DeepSeek setup escalates at ~850K. No manual tuning needed.
+    #   (B) Falls back to the absolute `escalate_input_tokens` threshold
+    #       when context_window is 0/unset (legacy behaviour).
+    local_ctx = getattr(cfg.local, "context_window", 0) if hasattr(cfg, "local") else 0
+    if local_ctx and local_ctx > 0:
+        safe_frac = getattr(cfg.local, "context_safe_fraction", 0.85)
+        cap = int(local_ctx * safe_frac)
+        if est >= cap:
+            return Decision(
+                "frontier",
+                f"est_tokens={est} >= {cap} ({safe_frac:.0%} of local ctx {local_ctx})",
+                est_input_tokens=est, turn_count=turns,
+            )
+    elif est >= cfg.escalate_input_tokens:
         return Decision("frontier", f"est_tokens={est} >= {cfg.escalate_input_tokens}",
                         est_input_tokens=est, turn_count=turns)
 

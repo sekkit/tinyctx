@@ -87,6 +87,10 @@ def _start_proxy(local_port: int, frontier_port: int, proxy_port: int) -> thread
     os.environ["TINYCTX_FRONTIER_BASE_URL"] = f"http://127.0.0.1:{frontier_port}/v1"
     os.environ["TINYCTX_FRONTIER_MODEL"] = "gpt-test"
     os.environ["TINYCTX_VERBOSE"] = "0"
+    # Bypass the user's ~/.tinyctx/config.toml (which may set context_window
+    # = 1M for DeepSeek-style backends and break the absolute-threshold
+    # assumption this test makes).
+    os.environ["TINYCTX_CONFIG"] = "/dev/null"
     os.environ.pop("TINYCTX_FORCE_ROUTE", None)
 
     # Reload module so config picks up env.

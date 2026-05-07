@@ -34,6 +34,21 @@ class BackendCfg:
     wire_api: str = "responses"
     timeout_s: float = 300.0
     headers: dict[str, str] = field(default_factory=dict)
+    # The model's advertised input-context window (tokens). Drives the
+    # "escalate when local can't fit it" routing branch — see router.decide.
+    # 0 = unknown / disabled (router falls back to the absolute
+    # `escalate_input_tokens` threshold).
+    #
+    # Examples:
+    #   DeepSeek-v4-flash / -pro: 1_000_000
+    #   Qwen2.5-Coder 32B (LMStudio default): 32_768
+    #   Qwen3.6-27B 256K build: 262_144
+    #   gpt-5.5 via codex backend: 1_000_000
+    context_window: int = 0
+    # Escalate to frontier when est_tokens / context_window exceeds this
+    # fraction. 0.85 leaves ~15% headroom for the model's output and
+    # avoids the well-known long-context quality cliff.
+    context_safe_fraction: float = 0.85
     # Per-backend tool/field scrubbing. Codex emits tool entries with
     # codex-specific `type` values (web_search, image_generation, namespace)
     # and fields (client_metadata, prompt_cache_key) that strict OpenAI-
