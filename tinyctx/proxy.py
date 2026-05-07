@@ -51,6 +51,7 @@ from .sanitize import (
     normalize_for_chat,
     purge_failed_tool_inputs,
     rewrite_model,
+    expand_mcp_namespaces,
     scrub_unsupported_tools,
     strip_encrypted_content,
     strip_unsupported_responses_fields,
@@ -253,6 +254,13 @@ async def responses(request: Request) -> Any:
         before_types = {t.get("type") for t in before_tools
                         if isinstance(t, dict)}
         trace.tools_before = len(before_tools)
+        # Expand codex 0.128+'s `type=namespace` MCP wrappers into
+        # type=function entries first, so the Advisor MCP tool (and any
+        # other MCP-registered function tools) survive scrub.
+        body = expand_mcp_namespaces(
+            body,
+            prefix_inner=os.environ.get("TINYCTX_MCP_NAME_NO_PREFIX") != "1",
+        )
         body = scrub_unsupported_tools(
             body, supported_types=backend.supported_tool_types)
         after_tools = body.get("tools", []) or []

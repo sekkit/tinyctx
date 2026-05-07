@@ -414,13 +414,16 @@ TINYCTX_ADVISOR_TIMEOUT_S = "180"
 
 Auth fallback: if `TINYCTX_ADVISOR_API_KEY` is unset, `advisor.py` reads `~/.codex/auth.json` and forwards the codex `access_token` as the Authorization bearer — same source codex itself uses, so the advisor inherits the user's existing chatgpt login automatically.
 
-**Codex 0.125 namespace note**: codex prefixes MCP tools as `mcp__<server>__<tool>`, so the executor sees this as `mcp__advisor__ask_advisor`. With codex's `tool_search` feature enabled (default), MCP tools are deferred — the executor must search for the tool first. Disable with `--disable tool_search` if you want the tool eagerly exposed.
+**Codex namespace handling** (added in this fix):
+- **Codex 0.128+** wraps MCP-server tools at the wire level inside `type: "namespace"` shells (`{"type": "namespace", "name": "mcp__advisor__", "tools": [{"type": "function", "name": "ask_advisor", ...}]}`). Without expansion, those wrappers get dropped by the function-only scrub and the executor never sees `ask_advisor`. The proxy now runs `expand_mcp_namespaces` before scrub: namespace shells become top-level `type=function` entries with names like `mcp__advisor__ask_advisor`, so DeepSeek (and any other chat-completions backend) can see and call them. Set `TINYCTX_MCP_NAME_NO_PREFIX=1` if a future codex build expects the bare inner tool name instead.
+- **Codex 0.128.0-alpha.1 known dispatcher limitation**: even after the executor model invokes the expanded tool, codex's internal `core/src/tools/router.rs` returns `unsupported call: <name>` for namespace-expanded MCP tools — both with and without the namespace prefix. The wire expansion is verified correct end-to-end (the executor genuinely emits the function call; the dispatch hop on codex's side is what fails). Watch the `code_mode` / `tool_search_always_defer_mcp_tools` features for codex's fix; tinyctx's expansion will work the moment codex's dispatcher accepts the call.
+- **Codex 0.125** doesn't expose MCP tools to the executor at all (everything goes through `tool_search` which isn't surfaced to the model in current builds). Upgrading to 0.128+ is required for advisor visibility, even though the dispatcher round-trip is still pending.
 
 Anthropic's blog reports +2.7 SWE-bench points at -11.9% cost using this pattern (Sonnet+Opus pairing). The DeepSeek+gpt-5.5 pairing should see similar shape — the executor handles 99% of turns at deepseek pricing, and burns the frontier only on the 1-3 hard decisions per task that actually need it.
 
 ## Status
 
-- v0.5.0 — works end-to-end with fake backends and against real codex CLI 0.125.0.
-- **137 tests across 17 files, all passing** (incl. 21 advisor tests covering MCP handshake + streaming + auth resolution + SSE error surfacing), plus a separate proxy+compactor integration test.
+- v0.5.0 — works end-to-end with fake backends and against real codex CLI 0.125.0 / Codex.app 0.128.0-alpha.1.
+- **140 tests across 17 files, all passing** (incl. 21 advisor tests + 3 namespace expansion tests + the proxy+compactor integration test).
 - 6 OSS upstream dependencies wired (graphify, serena, caveman, mem0, LMStudio, magic-context-as-inspiration); 0 reinvented.
-- Total original code: ~4,300 LOC across 18 modules.
+- Total original code: ~4,400 LOC across 18 modules.

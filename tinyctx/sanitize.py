@@ -86,6 +86,75 @@ _DEFAULT_SUPPORTED_TOOL_TYPES = {"function"}
 _DEFAULT_STRIP_FIELDS = ("client_metadata", "prompt_cache_key")
 
 
+def expand_mcp_namespaces(body: dict[str, Any], *,
+                          prefix_inner: bool = True) -> dict[str, Any]:
+    """Codex 0.128+ wraps MCP-server tools in a `type: "namespace"` shell:
+
+        {"type": "namespace", "name": "mcp__advisor__",
+         "description": "...",
+         "tools": [
+             {"type": "function", "name": "ask_advisor",
+              "description": "...", "parameters": {...}, "strict": false},
+             ...
+         ]}
+
+    Without expansion the namespace shell is dropped by `scrub_unsupported_tools`
+    (chat-completions backends only accept `type=function`), so MCP tools like
+    `ask_advisor` never reach the executor — the Advisor Strategy never fires.
+
+    This rewrites every namespace into N function entries, prefixing each
+    inner tool's name with the namespace name so codex's tool dispatcher
+    can still route the call back to the right MCP server. Codex itself
+    documents the convention `mcp__<server>__<tool>` in its base prompt, so
+    the round-trip remains correct.
+
+    Returns a new body. No-op when `tools` is absent or has no namespaces.
+    """
+    if "tools" not in body or not isinstance(body["tools"], list):
+        return body
+    if not any(isinstance(t, dict) and t.get("type") == "namespace"
+               for t in body["tools"]):
+        return body
+    out = deepcopy(body)
+    new_tools: list[dict[str, Any]] = []
+    for t in out["tools"]:
+        if not isinstance(t, dict):
+            new_tools.append(t)
+            continue
+        if t.get("type") != "namespace":
+            new_tools.append(t)
+            continue
+        ns_name = t.get("name") or ""
+        for inner in t.get("tools") or []:
+            if not isinstance(inner, dict):
+                continue
+            if inner.get("type") != "function":
+                # Don't try to handle nested non-function tools — they'd
+                # need their own translation. Leave unchanged for now;
+                # they'll be dropped downstream by scrub if not whitelisted.
+                new_tools.append(inner)
+                continue
+            inner_name = inner.get("name") or ""
+            # codex uses "mcp__<server>__<tool>"; namespace name already
+            # ends with "__" so concatenation just works. If a future
+            # codex version drops the trailing "__", we add it explicitly.
+            if prefix_inner:
+                if ns_name and not ns_name.endswith("__"):
+                    ns_name = ns_name + "__"
+                qualified = (ns_name + inner_name) if ns_name else inner_name
+            else:
+                # Some codex builds expect the inner tool NAME unchanged
+                # at the wire level — they reverse-lookup namespace from
+                # an internal table instead of parsing the prefix. Toggle
+                # via TINYCTX_MCP_NAME_NO_PREFIX=1 (read by the proxy).
+                qualified = inner_name
+            rewritten = dict(inner)
+            rewritten["name"] = qualified
+            new_tools.append(rewritten)
+    out["tools"] = new_tools
+    return out
+
+
 def scrub_unsupported_tools(
     body: dict[str, Any],
     *,
@@ -172,6 +241,7 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
     # Convert tools from Responses API format to chat-completions format.
     # Responses: {"type": "function", "name": "x", "parameters": {...}, "description": "..."}
     # Chat:      {"type": "function", "function": {"name": "x", "parameters": {...}, "description": "..."}}
+    #
     if "tools" in body and isinstance(body["tools"], list):
         chat_tools = []
         for t in body["tools"]:

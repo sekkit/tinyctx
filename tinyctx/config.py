@@ -55,6 +55,11 @@ class BackendCfg:
     # compat backends like LMStudio reject with HTTP 400. The default keep-
     # set covers every common local backend; OpenAI's own endpoint accepts
     # everything so the frontier backend's defaults are effectively no-ops.
+    # codex 0.128+ wraps MCP-server tools in `type=namespace`; the proxy
+    # expands those into top-level `type=function` entries via
+    # `expand_mcp_namespaces` BEFORE this scrub runs, so the default of
+    # `function` only is correct — namespace shells are gone by the time
+    # we get here.
     supported_tool_types: tuple[str, ...] = ("function",)
     strip_request_fields: tuple[str, ...] = ("client_metadata", "prompt_cache_key")
     # Dotted-path defaults injected when codex omits a field a strict

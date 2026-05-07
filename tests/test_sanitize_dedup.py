@@ -221,6 +221,85 @@ def test_scrub_unsupported_tools_no_op_when_no_tools():
     assert out == body
 
 
+def test_expand_mcp_namespaces_unwraps_advisor_namespace():
+    """codex 0.128+ packages MCP function tools inside a `type=namespace`
+    shell; tinyctx must unwrap them into top-level `type=function` entries
+    so scrub_unsupported_tools doesn't drop them and the executor can see
+    them. Names get the `mcp__<server>__<tool>` prefix codex uses for
+    dispatch."""
+    from tinyctx.sanitize import expand_mcp_namespaces
+    body = {
+        "tools": [
+            {"type": "function", "name": "exec_command",
+             "description": "x", "parameters": {"type": "object"}},
+            {"type": "namespace", "name": "mcp__advisor__",
+             "description": "Tools in mcp__advisor__.",
+             "tools": [
+                 {"type": "function", "name": "ask_advisor",
+                  "description": "Consult frontier.",
+                  "parameters": {"type": "object",
+                                 "properties": {"question": {"type": "string"}},
+                                 "required": ["question"]},
+                  "strict": False},
+             ]},
+            {"type": "namespace", "name": "mcp__computer_use__",
+             "description": "Computer use tools.",
+             "tools": [
+                 {"type": "function", "name": "click",
+                  "description": "click ui.", "parameters": {"type": "object"}},
+                 {"type": "function", "name": "drag",
+                  "description": "drag ui.", "parameters": {"type": "object"}},
+             ]},
+        ],
+    }
+    out = expand_mcp_namespaces(body)
+    fn_names = sorted(t["name"] for t in out["tools"]
+                      if t.get("type") == "function")
+    assert fn_names == ["exec_command",
+                        "mcp__advisor__ask_advisor",
+                        "mcp__computer_use__click",
+                        "mcp__computer_use__drag"]
+    # No namespace shells remain (they should be fully expanded).
+    assert not any(t.get("type") == "namespace" for t in out["tools"])
+    # Inner tool's parameters/description preserved on the rewritten entry.
+    advisor = next(t for t in out["tools"]
+                   if t["name"] == "mcp__advisor__ask_advisor")
+    assert advisor["description"] == "Consult frontier."
+    assert advisor["parameters"]["required"] == ["question"]
+    assert advisor["strict"] is False
+    # Original input is not mutated.
+    assert body["tools"][1]["type"] == "namespace"
+
+
+def test_expand_mcp_namespaces_no_op_without_namespace():
+    from tinyctx.sanitize import expand_mcp_namespaces
+    body = {"tools": [{"type": "function", "name": "f"}]}
+    assert expand_mcp_namespaces(body) is body
+
+
+def test_expand_then_scrub_keeps_advisor_drops_codex_specials():
+    """Composition test: the real proxy pipeline runs expand then scrub.
+    After expand, scrub should keep the advisor tool (now type=function)
+    but still drop web_search/image_generation/the empty namespace."""
+    from tinyctx.sanitize import expand_mcp_namespaces, scrub_unsupported_tools
+    body = {
+        "tools": [
+            {"type": "function", "name": "exec_command"},
+            {"type": "web_search", "external_web_access": False},
+            {"type": "image_generation", "output_format": "png"},
+            {"type": "namespace", "name": "mcp__advisor__",
+             "tools": [{"type": "function", "name": "ask_advisor",
+                        "description": "x", "parameters": {"type": "object"}}]},
+        ],
+    }
+    expanded = expand_mcp_namespaces(body)
+    scrubbed = scrub_unsupported_tools(expanded)  # default: function only
+    names = sorted(t["name"] for t in scrubbed["tools"])
+    assert names == ["exec_command", "mcp__advisor__ask_advisor"]
+
+
+
+
 def test_inject_responses_defaults_sets_missing_dotted_path():
     from tinyctx.sanitize import inject_responses_defaults
     body = {"text": {"verbosity": "low"}, "model": "x"}
