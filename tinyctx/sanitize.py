@@ -221,6 +221,45 @@ def inject_responses_defaults(
     return out
 
 
+def _flatten_tool_output(output: Any) -> str:
+    """Codex 0.128+ tool outputs (function_call_output.output) can be:
+      - a plain string ("ran ok")
+      - a list of content items, mixing text and input_image:
+          [{"type": "input_text", "text": "..."},
+           {"type": "input_image", "image_url": "data:image/png;base64,..."}]
+
+    Chat-completions backends (DeepSeek, Ollama) reject `input_image` with
+    HTTP 400 ("unknown variant `input_image`, expected `text`"). Vision is
+    a model capability anyway, and the local executor isn't a vision model,
+    so we flatten to plain text and replace each image with a `[image
+    attached]` placeholder so the executor still knows an image was there.
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if isinstance(item, dict):
+                t = item.get("type")
+                if t in ("text", "input_text", "output_text"):
+                    txt = item.get("text", "")
+                    if isinstance(txt, str) and txt:
+                        parts.append(txt)
+                elif t in ("input_image", "image", "image_url"):
+                    parts.append("[image attached: vision content omitted "
+                                 "for local executor]")
+                # silently drop other unknown types
+        return "\n".join(parts)
+    # Fallback: stringify dicts/etc.
+    try:
+        import json as _j
+        return _j.dumps(output, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return str(output)
+
+
 def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a Responses-style body to a chat-completions body for backends
     that only speak chat (LMStudio default endpoint, Ollama, etc.).
@@ -340,7 +379,7 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
             raw_msgs.append({
                 "role": "tool",
                 "tool_call_id": it.get("call_id") or it.get("id") or "call",
-                "content": it.get("output") or "",
+                "content": _flatten_tool_output(it.get("output")),
             })
 
     # Merge pass: consecutive assistant text + tool_calls → one message;

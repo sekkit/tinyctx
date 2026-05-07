@@ -221,6 +221,58 @@ def test_scrub_unsupported_tools_no_op_when_no_tools():
     assert out == body
 
 
+def test_flatten_tool_output_strips_input_image():
+    """codex 0.128+ tool outputs are lists mixing text and base64 PNGs;
+    DeepSeek's chat-completions API rejects `input_image` with HTTP 400.
+    We must flatten to plain text + a placeholder for each image."""
+    from tinyctx.sanitize import _flatten_tool_output
+    out = _flatten_tool_output([
+        {"type": "input_text", "text": "Build succeeded."},
+        {"type": "input_image", "image_url": "data:image/png;base64,iVBOR..."},
+        {"type": "output_text", "text": "exit 0"},
+    ])
+    assert "Build succeeded." in out
+    assert "exit 0" in out
+    assert "[image attached" in out
+    assert "base64" not in out
+    assert "iVBOR" not in out
+
+
+def test_flatten_tool_output_passes_string_through():
+    from tinyctx.sanitize import _flatten_tool_output
+    assert _flatten_tool_output("plain stdout") == "plain stdout"
+    assert _flatten_tool_output(None) == ""
+
+
+def test_normalize_for_chat_handles_function_call_output_with_image():
+    """End-to-end: a function_call_output whose `output` is a list of
+    content items (text + image) must end up as a single tool message
+    with a flat string content, no `input_image` leaking through."""
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "input": [
+            {"type": "function_call", "call_id": "c1", "name": "screenshot",
+             "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1",
+             "output": [
+                 {"type": "input_text", "text": "screenshot saved"},
+                 {"type": "input_image",
+                  "image_url": "data:image/png;base64,XXX"},
+             ]},
+        ],
+    }
+    out = normalize_for_chat(body)
+    tool_msgs = [m for m in out["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    content = tool_msgs[0]["content"]
+    assert isinstance(content, str), \
+        "function_call_output content must be a plain string for chat APIs"
+    assert "input_image" not in content
+    assert "screenshot saved" in content
+    assert "[image attached" in content
+
+
 def test_expand_mcp_namespaces_unwraps_advisor_namespace():
     """codex 0.128+ packages MCP function tools inside a `type=namespace`
     shell; tinyctx must unwrap them into top-level `type=function` entries
