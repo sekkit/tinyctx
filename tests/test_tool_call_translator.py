@@ -552,6 +552,305 @@ def test_text_choice_intercept_returns_none_no_match():
             _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
 
 
+def test_classifier_disabled_with_env_zero():
+    """Layer 2 (DeepSeek classifier) must not fire when env=0."""
+    import os as _os
+    from tinyctx.tool_call_translator import _classify_final_answer
+    saved = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "0"
+    try:
+        assert _classify_final_answer("x" * 500) is None
+    finally:
+        if saved is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
+
+
+def test_classifier_skips_short_text():
+    """Don't waste a classifier call on tiny messages."""
+    from tinyctx.tool_call_translator import _classify_final_answer
+    assert _classify_final_answer("Done.") is None
+    assert _classify_final_answer("ok.") is None
+
+
+def test_classifier_parses_well_formed_json(monkeypatch=None):
+    """When DeepSeek returns valid JSON, _classify_final_answer parses it."""
+    import os as _os
+    import tinyctx.tool_call_translator as _tct
+    import httpx as _httpx
+
+    class _StreamResp:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_lines(self):
+            payload = {"type": "response.output_text.done",
+                       "text": '{"await_user": true, "options": ["A", "B"]}'}
+            yield "data: " + json.dumps(payload) + "\n"
+            yield "\n"
+
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, method, url, json=None, headers=None):
+            return _StreamResp()
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_client = _httpx.Client
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _httpx.Client = _FakeClient
+    try:
+        out = _tct._classify_final_answer("x" * 250)
+        assert out is not None
+        assert out["await_user"] is True
+        assert out["options"] == ["A", "B"]
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _httpx.Client = saved_client
+
+
+def test_classifier_returns_none_on_http_error():
+    """Classifier degrades silently on backend failure (no advisor cost)."""
+    import os as _os
+    import tinyctx.tool_call_translator as _tct
+    import httpx as _httpx
+
+    class _StreamResp:
+        status_code = 500
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+        def iter_lines(self): return iter([])
+
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, method, url, json=None, headers=None):
+            return _StreamResp()
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_client = _httpx.Client
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _httpx.Client = _FakeClient
+    try:
+        out = _tct._classify_final_answer("x" * 250)
+        assert out is None
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _httpx.Client = saved_client
+
+
+def test_ask_advisor_for_continuation_with_options():
+    """Layer 3: when classifier extracted options, advisor picks one."""
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    captured = {}
+    def fake(question, context="", previous_attempts=""):
+        captured["q"] = question
+        return {"text": "Pick: A — fewer deps.", "usage": None, "error": None}
+    saved = _adv.call_advisor
+    _adv.call_advisor = fake
+    try:
+        out = _tct._ask_advisor_for_continuation(
+            "Which path should I take?",
+            ["A: IMU 6DoF", "B: RemoteLoader fix"],
+        )
+        assert out is not None
+        assert "advisor auto-decision — classifier-detected" in out
+        assert "Pick: A" in out
+        assert "IMU 6DoF" in captured["q"]
+    finally:
+        _adv.call_advisor = saved
+
+
+def test_ask_advisor_for_continuation_without_options():
+    """Layer 3: classifier says await_user but found no explicit options.
+    Advisor proposes next concrete step instead of picking."""
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    captured = {}
+    def fake(question, context="", previous_attempts=""):
+        captured["q"] = question
+        return {"text": "Continue with: implement Madgwick filter — clear next step.",
+                "usage": None, "error": None}
+    saved = _adv.call_advisor
+    _adv.call_advisor = fake
+    try:
+        out = _tct._ask_advisor_for_continuation(
+            "I've finished the analysis. What should I do next?", [])
+        assert out is not None
+        assert "Continue with:" in out
+        assert "next concrete step" in captured["q"]
+    finally:
+        _adv.call_advisor = saved
+
+
+def test_translator_finish_classifier_layer_intercepts_subtle_prompts(monkeypatch=None):
+    """End-to-end: model writes a long subtle 'what next?' final answer
+    (no regex pattern hits, no tool calls). Classifier says await_user=true
+    and extracts no options. Advisor proposes a next step. Result gets
+    folded into the assistant message so codex sees the answer."""
+    import os as _os
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    from tinyctx.tool_call_translator import ChatToResponsesTranslator
+    import httpx as _httpx
+
+    long_subtle_text = (
+        "I've completed the reverse-engineering analysis. The "
+        "EstablishServiceConnection chain requires RemoteLoader vtable "
+        "initialization which our direct path skips. I have a few possible "
+        "directions to explore but I'd like to know your preference before "
+        "proceeding further. The work so far has been exploratory and the "
+        "next step depends on which integration philosophy you prefer."
+    )
+
+    # Mock the classifier HTTP call to say "await_user=true, no options"
+    class _StreamResp:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_lines(self):
+            payload = {"type": "response.output_text.done",
+                       "text": '{"await_user": true, "options": []}'}
+            yield "data: " + json.dumps(payload) + "\n"
+            yield "\n"
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, method, url, json=None, headers=None):
+            return _StreamResp()
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_client = _httpx.Client
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _httpx.Client = _FakeClient
+    _adv.call_advisor = lambda **kw: {
+        "text": "Continue with: prototype IMU 6DoF — fastest validation.",
+        "usage": None, "error": None,
+    }
+    try:
+        t = ChatToResponsesTranslator()
+        t._model = "deepseek-v4-flash"
+        chunks = [
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{
+                    "delta": {"content": long_subtle_text},
+                    "index": 0,
+                }],
+            }) + "\n\n").encode(),
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}],
+            }) + "\n\ndata: [DONE]\n\n").encode(),
+        ]
+        emitted = b""
+        for chunk in chunks:
+            for ev in t.feed(chunk):
+                emitted += ev
+        for ev in t.flush():
+            emitted += ev
+        result = emitted.decode("utf-8")
+        # The em-dash gets JSON-escaped to — in the SSE wire output;
+        # match the ASCII-safe parts.
+        assert "advisor auto-decision" in result
+        assert "classifier-detected" in result
+        assert "Continue with: prototype IMU 6DoF" in result
+        # Original text still present (not replaced, just appended)
+        assert "EstablishServiceConnection" in result
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _httpx.Client = saved_client
+        _adv.call_advisor = saved_adv
+
+
+def test_translator_finish_classifier_skips_when_classifier_says_no():
+    """End-to-end: classifier says await_user=false → no advisor call,
+    text passes through unchanged."""
+    import os as _os
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    from tinyctx.tool_call_translator import ChatToResponsesTranslator
+    import httpx as _httpx
+
+    plain_status = ("All tests pass. Build successful. Implementation "
+                    "complete. Pushed to main and CI is green. " * 5)
+
+    class _StreamResp:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_lines(self):
+            payload = {"type": "response.output_text.done",
+                       "text": '{"await_user": false}'}
+            yield "data: " + json.dumps(payload) + "\n"
+            yield "\n"
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, method, url, json=None, headers=None):
+            return _StreamResp()
+
+    advisor_calls = []
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_client = _httpx.Client
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _httpx.Client = _FakeClient
+    _adv.call_advisor = lambda **kw: advisor_calls.append(kw) or {
+        "text": "should not be called", "usage": None, "error": None}
+    try:
+        t = ChatToResponsesTranslator()
+        t._model = "deepseek-v4-flash"
+        chunks = [
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{"delta": {"content": plain_status}, "index": 0}],
+            }) + "\n\n").encode(),
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}],
+            }) + "\n\ndata: [DONE]\n\n").encode(),
+        ]
+        emitted = b""
+        for chunk in chunks:
+            for ev in t.feed(chunk):
+                emitted += ev
+        for ev in t.flush():
+            emitted += ev
+        result = emitted.decode("utf-8")
+        # advisor was NOT called — classifier said NO
+        assert len(advisor_calls) == 0, \
+            "advisor must NOT be consulted when classifier says NO"
+        # No advisor decision marker in output
+        assert "advisor auto-decision" not in result
+        # Original text still present
+        assert "All tests pass" in result
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _httpx.Client = saved_client
+        _adv.call_advisor = saved_adv
+
+
 def test_translator_finish_intercepts_request_user_input_when_enabled():
     """End-to-end: with env on + advisor mocked, the tool_call entry is
     dropped (so codex's request_user_input UI prompt never fires) and the

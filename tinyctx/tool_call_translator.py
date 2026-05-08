@@ -446,6 +446,187 @@ def _detect_text_choice_prompt(text: str) -> dict[str, list[str]] | None:
     return {"header": cue_line[:200], "options": option_texts}
 
 
+# ── Classifier-driven detection of "final answer awaiting user" ──────
+# The two regex-based intercepts above only catch overt patterns
+# (`request_user_input` calls and `请选择 A → ... B → ...` style lists).
+# Models often write subtler "I'm done — what next?" prose that slips
+# past regex but still leaves the session blocked. Layer 2 routes any
+# zero-tool-call assistant message through a cheap DeepSeek classifier
+# (~1-2s, ~$0.0001) that decides whether the message awaits user input
+# and extracts any options it can find. Only when the classifier says
+# YES do we pay for an advisor (gpt-5.5) consultation.
+
+_CLASSIFIER_PROXY_URL = os.environ.get(
+    "TINYCTX_PROXY_URL", "http://127.0.0.1:4141/v1"
+).rstrip("/") + "/responses"
+
+_CLASSIFIER_INSTRUCTIONS = (
+    "You are a strict JSON classifier. You receive an assistant message and "
+    "decide whether it is a *final-answer-awaiting-user-input* message.\n\n"
+    "A message AWAITS user input when:\n"
+    "- it asks the user to pick between options / approaches\n"
+    "- it asks the user to confirm a direction before proceeding\n"
+    "- it gives a status update and explicitly asks 'what should I do next' "
+    "or 'let me know your preference'\n\n"
+    "A message does NOT await input when:\n"
+    "- it's a status / progress update with no question\n"
+    "- it's a final completion summary ('Done.', 'Build successful.', "
+    "'All tests pass.')\n"
+    "- it's mid-task reasoning that will continue with another tool call\n\n"
+    "Be conservative — prefer await_user=false unless the message clearly "
+    "needs user input.\n\n"
+    "Output ONLY a single JSON object on one line. No prose, no markdown "
+    "fences, no explanation. Schema:\n"
+    "  {\"await_user\": true|false, \"options\": [string, ...]}\n\n"
+    "If await_user is true, populate options with any choices the message "
+    "explicitly lists (e.g. 'A', 'B', 'IMU 6DoF', 'RemoteLoader fix'). If "
+    "no explicit options appear in the message, options should be []."
+)
+
+
+def _resolve_codex_auth() -> str:
+    """Read codex's chatgpt access token (same as advisor.py uses) so the
+    classifier call can authenticate to the same backend stack."""
+    try:
+        from tinyctx.advisor import _resolve_auth_token
+        return _resolve_auth_token()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _classify_final_answer(text: str) -> dict | None:
+    """Synchronously ask the local model (tinyctx-local → DeepSeek) whether
+    `text` is awaiting user input. Returns:
+      {"await_user": True, "options": [...]}  → caller should escalate to advisor
+      {"await_user": False}                   → pass through, no escalation
+      None                                    → classifier failed; pass through
+
+    Triggered only when the env switch is on AND the assistant message has
+    no tool calls AND it's long enough to plausibly be a final summary.
+    """
+    if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
+        return None
+    if len(text) < 200:
+        return None  # too short to be a final-answer prompt
+
+    # Lazy import to avoid circular at module load time
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    payload = {
+        "model": "tinyctx-local",  # forces DeepSeek route in tinyctx
+        "stream": True,             # codex backend rule; DeepSeek also fine
+        "store": False,
+        "instructions": _CLASSIFIER_INSTRUCTIONS,
+        "input": [
+            {"role": "user",
+             "content": [{"type": "input_text", "text": text[-4000:]}]},
+        ],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    tok = _resolve_codex_auth()
+    if tok:
+        headers["Authorization"] = (
+            tok if tok.lower().startswith(("bearer ", "basic ")) else f"Bearer {tok}"
+        )
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            with client.stream("POST", _CLASSIFIER_PROXY_URL,
+                               json=payload, headers=headers) as r:
+                if r.status_code >= 400:
+                    return None
+                # Inline minimal stream consumer (avoids advisor.py import cycle)
+                deltas: list[str] = []
+                final_text: str | None = None
+                for raw in r.iter_lines():
+                    line = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        evt = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    et = evt.get("type")
+                    if et == "response.output_text.delta":
+                        d = evt.get("delta")
+                        if isinstance(d, str):
+                            deltas.append(d)
+                    elif et == "response.output_text.done":
+                        t = evt.get("text")
+                        if isinstance(t, str) and t:
+                            final_text = t
+        out = (final_text if final_text is not None else "".join(deltas)).strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not out:
+        return None
+    # The model sometimes wraps JSON in code fences despite instructions.
+    m = re.search(r"\{.*\}", out, re.DOTALL)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if "await_user" not in parsed:
+        return None
+    parsed["await_user"] = bool(parsed.get("await_user"))
+    parsed["options"] = [str(o) for o in (parsed.get("options") or [])
+                         if isinstance(o, (str, int, float))]
+    return parsed
+
+
+def _ask_advisor_for_continuation(text: str, options: list[str]) -> str | None:
+    """Layer-3 advisor call after the classifier decides the message is
+    awaiting user input. If `options` is non-empty, advisor picks one;
+    otherwise advisor proposes the next concrete action. Returns the
+    suffix to append to _text_buf, or None on failure."""
+    if not text:
+        return None
+    if options:
+        opts_str = "\n".join(f"  - {o}" for o in options)
+        question = (
+            "The executor wrote a final-answer-awaiting-user-input message. "
+            "A small classifier extracted these options. Pick the best one. "
+            "Output format:\n"
+            "  Pick: <option> — <one-sentence rationale>\n\n"
+            f"Options:\n{opts_str}"
+        )
+    else:
+        question = (
+            "The executor wrote a final-answer-awaiting-user-input message "
+            "without listing explicit options — it's asking 'what next?' or "
+            "'should I proceed?' Decide the most reasonable next concrete "
+            "step the executor should take and output:\n"
+            "  Continue with: <next concrete step> — <one-sentence rationale>"
+        )
+    try:
+        from tinyctx.advisor import call_advisor
+        result = call_advisor(
+            question=question,
+            context=("Classifier-detected awaiting-user message:\n\n"
+                     + text[-2000:]),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if result.get("error") or not result.get("text"):
+        return None
+    advice = result["text"].strip()
+    return f"\n\n[advisor auto-decision — classifier-detected]\n{advice}\n"
+
+
 def _try_auto_answer_text_choice(text: str) -> str | None:
     """Text-level fallback for `_try_auto_answer_user_input`. When the
     model writes a "pick A or B" prompt as plain text instead of calling
@@ -805,6 +986,24 @@ class ChatToResponsesTranslator:
         _text_choice = _try_auto_answer_text_choice(self._text_buf)
         if _text_choice is not None:
             self._text_buf += _text_choice
+        else:
+            # Layer 2/3 cascade: if the regex layers didn't catch this
+            # message AND the model emitted no tool calls AND the text is
+            # long enough to plausibly be a final-answer-awaiting-user
+            # prompt that uses subtler phrasing, ask the cheap DeepSeek
+            # classifier whether the message is actually awaiting input.
+            # Only when the classifier says YES do we pay for an advisor
+            # consultation. This catches "I'm done — what's next?" prose
+            # that the regex layers miss.
+            if (not self._tool_calls
+                    and len(self._text_buf) >= 200
+                    and os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") != "0"):
+                _classify = _classify_final_answer(self._text_buf)
+                if _classify and _classify.get("await_user"):
+                    _opts = _classify.get("options") or []
+                    _cont = _ask_advisor_for_continuation(self._text_buf, _opts)
+                    if _cont is not None:
+                        self._text_buf += _cont
 
         yield self._sse("response.output_text.done", {
             "type": "response.output_text.done",
