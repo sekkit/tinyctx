@@ -264,20 +264,65 @@ def test_stream_translator_flush_emits_buffered_tail():
     assert "tail content" in flush_out
 
 
-def test_auto_answer_disabled_by_default():
-    """Without TINYCTX_AUTO_USER_INPUT=1, _try_auto_answer_user_input
-    must be a no-op so the request_user_input flow is unchanged."""
+def test_auto_answer_enabled_by_default():
+    """TINYCTX_AUTO_USER_INPUT defaults to ON. With env unset and no
+    advisor mock, the function attempts a real advisor call and returns
+    None on its httpx failure (no advisor reachable in unit tests).
+    Either way, the function ATTEMPTS to run rather than short-circuiting."""
     import os as _os
+    import tinyctx.advisor as _adv
     from tinyctx.tool_call_translator import _try_auto_answer_user_input
-    saved = _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+    saved_env = _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+    saved_adv = _adv.call_advisor
+    captured = {}
+    def fake(question, context="", previous_attempts=""):
+        captured["called"] = True
+        return {"text": "Pick: A — default-on test.",
+                "usage": None, "error": None}
+    _adv.call_advisor = fake
     try:
         out = _try_auto_answer_user_input(json.dumps({
             "questions": [{"header": "A or B?", "options": ["A", "B"]}]
         }))
-        assert out is None, "must return None when env switch is off"
+        # default is on, so advisor SHOULD have been consulted
+        assert captured.get("called") is True, \
+            "default-on means advisor consulted without explicit env=1"
+        assert out is not None
+        assert "auto-decision" in out
     finally:
-        if saved is not None:
-            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
+        if saved_env is not None:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_auto_answer_disabled_with_env_zero():
+    """`TINYCTX_AUTO_USER_INPUT=0` must explicitly opt out — function
+    returns None without consulting the advisor at all."""
+    import os as _os
+    import tinyctx.advisor as _adv
+    from tinyctx.tool_call_translator import _try_auto_answer_user_input
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "0"
+    captured = {}
+    def fake(**kw):
+        captured["called"] = True
+        return {"text": "should not be called",
+                "usage": None, "error": None}
+    _adv.call_advisor = fake
+    try:
+        out = _try_auto_answer_user_input(json.dumps({
+            "questions": [{"header": "A or B?", "options": ["A", "B"]}]
+        }))
+        assert out is None
+        assert "called" not in captured, \
+            "advisor must NOT be consulted when env=0"
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
 
 
 def test_auto_answer_calls_advisor_when_enabled():
@@ -419,15 +464,41 @@ def test_detect_text_choice_requires_two_plus_options():
     assert _detect_text_choice_prompt(text) is None
 
 
-def test_text_choice_intercept_disabled_by_default():
+def test_text_choice_intercept_enabled_by_default():
+    """Text-choice intercept also defaults to ON. With env unset and an
+    advisor mock, the intercept fires automatically."""
+    import os as _os
+    import tinyctx.advisor as _adv
+    from tinyctx.tool_call_translator import _try_auto_answer_text_choice
+    saved_env = _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+    saved_adv = _adv.call_advisor
+    _adv.call_advisor = lambda **kw: {
+        "text": "Pick: A — default-on text intercept.",
+        "usage": None, "error": None,
+    }
+    try:
+        text = "请选择：\nA → 方案一\nB → 方案二"
+        out = _try_auto_answer_text_choice(text)
+        assert out is not None
+        assert "auto-decision" in out
+    finally:
+        if saved_env is not None:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_text_choice_intercept_disabled_with_env_zero():
     import os as _os
     from tinyctx.tool_call_translator import _try_auto_answer_text_choice
-    saved = _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+    saved = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "0"
     try:
         text = "请选择：\nA → 方案一\nB → 方案二"
         assert _try_auto_answer_text_choice(text) is None
     finally:
-        if saved is not None:
+        if saved is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
             _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
 
 

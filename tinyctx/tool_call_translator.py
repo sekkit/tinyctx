@@ -421,7 +421,7 @@ def _detect_text_choice_prompt(text: str) -> dict[str, list[str]] | None:
     `1) ...`) appear after that cue. Inside reasoning prose where the
     model says "option A would be ..." in passing, no match.
     """
-    if not text or len(text) < 30:
+    if not text or len(text) < 15:
         return None
     tail = text[-1500:]  # only inspect tail to avoid mid-message false positives
     cue = _CHOICE_PROMPT_CUE_RE.search(tail)
@@ -453,8 +453,10 @@ def _try_auto_answer_text_choice(text: str) -> str | None:
     anyway. Returns the assistant text suffix to append (advisor's
     decision) or None when env disabled / no choice detected / advisor
     failed.
+
+    Default behavior is ON; set `TINYCTX_AUTO_USER_INPUT=0` to opt out.
     """
-    if os.environ.get("TINYCTX_AUTO_USER_INPUT") != "1":
+    if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
         return None
     detected = _detect_text_choice_prompt(text)
     if not detected:
@@ -500,8 +502,11 @@ def _try_auto_answer_user_input(arguments_json: str) -> str | None:
     The returned text is plain markdown including the advisor's chosen
     option(s) and a short rationale, prefixed with a clear marker so the
     user can audit auto-decisions in chat history.
+
+    Default behavior is ON; set `TINYCTX_AUTO_USER_INPUT=0` to opt out
+    and let the choice bubble up to Codex.app's UI for manual click.
     """
-    if os.environ.get("TINYCTX_AUTO_USER_INPUT") != "1":
+    if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
         return None
     try:
         args = json.loads(arguments_json) if arguments_json else {}
