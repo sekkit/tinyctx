@@ -395,9 +395,13 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
         return out
 
     # Collect call_ids that have a matching output so we only emit paired calls.
+    # Widen the scan to all _TOOL_RESULT_TYPES (function_call_output, tool_result,
+    # mcp_result) — older codex builds and some MCP paths emit non-default
+    # result types and the previous narrow check silently dropped their
+    # paired function_call items, hiding history from the model.
     output_ids: set[str] = set()
     for it in src:
-        if isinstance(it, dict) and it.get("type") == "function_call_output":
+        if isinstance(it, dict) and it.get("type") in _TOOL_RESULT_TYPES:
             cid = it.get("call_id") or it.get("id") or ""
             if cid:
                 output_ids.add(cid)
@@ -445,8 +449,6 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
                 raw_msgs.append(msg)
         elif t == "function_call":
             cid = it.get("call_id") or it.get("id") or "call"
-            if cid not in output_ids:
-                continue
             tc_msg: dict[str, Any] = {
                 "_tc": True,
                 "role": "assistant",
@@ -463,11 +465,35 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
                 tc_msg["reasoning_content"] = pending_reasoning
                 pending_reasoning = ""
             raw_msgs.append(tc_msg)
-        elif t == "function_call_output":
+            # If the call has no matching output anywhere in src, the
+            # chat-completions backend will reject the request (every
+            # tool_calls message MUST be paired with a tool result).
+            # Was previously a silent `continue` that DROPPED the call
+            # entirely — that hid history from the model and caused
+            # subtle "I don't remember calling X" forgetting. Now we
+            # emit the call AND synthesize a placeholder result so the
+            # chat structure is valid and the model knows the call
+            # happened.
+            if cid not in output_ids:
+                raw_msgs.append({
+                    "role": "tool",
+                    "tool_call_id": cid,
+                    "content": (
+                        "[tinyctx: tool result not present in transcript "
+                        "(call elided by codex history mgmt or in flight); "
+                        "call kept for context continuity]"
+                    ),
+                })
+        elif t in _TOOL_RESULT_TYPES:
+            # Widened from `function_call_output` only — see output_ids
+            # comment above. `output` is the typical Responses-API field;
+            # `content` is what tool_result/mcp_result use.
             raw_msgs.append({
                 "role": "tool",
                 "tool_call_id": it.get("call_id") or it.get("id") or "call",
-                "content": _flatten_tool_output(it.get("output")),
+                "content": _flatten_tool_output(
+                    it.get("output") if it.get("output") is not None else it.get("content")
+                ),
             })
 
     # Merge pass: consecutive assistant text + tool_calls → one message;
@@ -739,8 +765,12 @@ class CacheAwareMutator:
 # on every subsequent request. We cache the summary keyed by (session_id,
 # pre-recent-turn-count) so back-to-back turns reuse it cheaply.
 
-# Cache: {(session_id, n_pre_recent_items_hash): summary_text}
-_PROACTIVE_SUMMARY_CACHE: dict[tuple[str, str], str] = {}
+# Cache: {(session_id, bucket_index): summary_text}
+# bucket_index = len(middle_items) // _PROACTIVE_CACHE_BUCKET_SIZE
+# Same bucket → same cached summary, reused for ~_PROACTIVE_CACHE_BUCKET_SIZE
+# turns. See the long comment in proactive_compact() for the rationale.
+_PROACTIVE_SUMMARY_CACHE: dict[tuple[str, int], str] = {}
+_PROACTIVE_CACHE_BUCKET_SIZE: int = 20
 
 
 def _hash_items(items: list) -> str:
@@ -913,12 +943,44 @@ def proactive_compact(
         repaired_tail.append(it)
     tail = repaired_tail
 
-    cache_key = (session_id, _hash_items(middle))
+    # Cache key strategy: BUCKET-based, not per-turn-hash.
+    #
+    # Old design hashed `middle` directly. Since middle grows by ~1 item
+    # per turn, the hash changed every turn → cache miss every turn →
+    # summarizer ran every turn AND the model saw a slightly different
+    # summary on each turn (information drift, "subtle forgetting").
+    #
+    # New design: bucket the middle by length. Same bucket → same cached
+    # summary, reused across the bucket window (default 20 turns).
+    # When middle grows enough to flip buckets, regenerate ONCE and use
+    # for the next 20 turns. Trade-off: the summary lags by up to 20
+    # turns of fall-off content, which is fine because that content is
+    # ALSO in the recent_keep tail (still shown verbatim).
+    #
+    # The session_id stays in the key so different conversations don't
+    # cross-contaminate. _PROACTIVE_CACHE_BUCKET_SIZE controls the
+    # refresh granularity; smaller = more frequent regeneration =
+    # higher cost but fresher summary.
+    bucket = len(middle) // _PROACTIVE_CACHE_BUCKET_SIZE
+    cache_key = (session_id, bucket)
     summary_text = _PROACTIVE_SUMMARY_CACHE.get(cache_key)
     cached = summary_text is not None
 
     if summary_text is None:
         blob = _flatten_history_for_summary(middle)
+        # Incremental seed: when we have a previous bucket's summary,
+        # prepend it to the blob so the summarizer can extend it rather
+        # than re-summarize from scratch. This keeps continuity across
+        # bucket refreshes — the new summary is a refined version of the
+        # old one + the new fall-off content, not an independent view.
+        prev_summary = _PROACTIVE_SUMMARY_CACHE.get((session_id, bucket - 1))
+        if prev_summary and bucket > 0:
+            blob = (
+                "## Previous handoff summary (carry forward and refine)\n\n"
+                + prev_summary
+                + "\n\n## Additional turns since that summary\n\n"
+                + blob
+            )
         if summarizer is not None:
             try:
                 summary_text = summarizer(blob)

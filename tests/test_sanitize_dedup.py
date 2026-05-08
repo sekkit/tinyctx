@@ -451,6 +451,184 @@ def test_normalize_for_chat_handles_function_call_output_with_image():
     assert "[image attached" in content
 
 
+def test_normalize_for_chat_keeps_orphan_function_call_with_placeholder_result():
+    """Regression: previously normalize_for_chat silently DROPPED any
+    function_call whose call_id had no matching function_call_output in
+    the same body. That hid history from the model — model would then
+    "forget" tools it had called.
+
+    New behavior: emit the function_call AND synthesize a placeholder
+    tool result so chat-completions structure stays valid.
+    """
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type":"input_text","text":"do thing"}]},
+            # Orphan function_call: no matching function_call_output
+            {"type": "function_call", "call_id": "c_orphan",
+             "name": "shell", "arguments": '{"cmd":["ls"]}'},
+        ],
+    }
+    out = normalize_for_chat(body)
+    msgs = out["messages"]
+
+    # The function_call must be emitted
+    asst_with_tc = [m for m in msgs
+                    if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert len(asst_with_tc) == 1, (
+        f"function_call must be emitted, not silently dropped. messages={msgs}"
+    )
+    assert asst_with_tc[0]["tool_calls"][0]["id"] == "c_orphan"
+
+    # And a placeholder tool result must follow it
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1, (
+        f"orphan call should get a synthesized placeholder result. messages={msgs}"
+    )
+    assert tool_msgs[0]["tool_call_id"] == "c_orphan"
+    assert "tinyctx" in tool_msgs[0]["content"].lower()
+    assert "not present" in tool_msgs[0]["content"]
+
+
+def test_normalize_for_chat_widens_tool_result_types():
+    """`output_ids` previously only scanned for `function_call_output`,
+    silently dropping function_calls whose results were emitted as
+    `tool_result` or `mcp_result` (legacy MCP / older codex paths).
+    Now widened to all _TOOL_RESULT_TYPES."""
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "input": [
+            {"type": "function_call", "call_id": "cm1",
+             "name": "mcp__server__tool", "arguments": "{}"},
+            # MCP-style result (not function_call_output)
+            {"type": "mcp_result", "call_id": "cm1",
+             "output": "result from mcp server"},
+        ],
+    }
+    out = normalize_for_chat(body)
+    msgs = out["messages"]
+
+    # Function call should be emitted (not dropped)
+    asst_tc = [m for m in msgs
+               if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert len(asst_tc) == 1
+    # Tool result message should be emitted with the right cid
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "cm1"
+    assert "result from mcp server" in tool_msgs[0]["content"]
+
+
+def test_proactive_compact_cache_uses_bucket_keying_not_per_turn():
+    """Regression: cache key was previously hash(middle_items), which
+    changed every single turn (middle grows by one each turn). That
+    caused a cache miss + summarizer call EVERY turn AND the model
+    saw a slightly different summary each turn (information drift,
+    "subtle forgetting").
+
+    New design: bucket key. Same bucket → same cached summary across
+    ~20 turns. Cache miss only on bucket flip.
+    """
+    from tinyctx.sanitize import (
+        proactive_compact, clear_proactive_cache, _PROACTIVE_CACHE_BUCKET_SIZE,
+    )
+    clear_proactive_cache()
+
+    summarizer_call_count = {"n": 0}
+
+    def fake_summarizer(blob: str) -> str:
+        summarizer_call_count["n"] += 1
+        return f"summary-call-{summarizer_call_count['n']}"
+
+    sid = "bucket-cache-test"
+    # Build a body with enough items that proactive_compact applies and
+    # `middle` falls within bucket 0 first, then crosses into bucket 1.
+    def _body(n_items):
+        items = [{"type":"message","role":"user",
+                  "content":[{"type":"input_text","text":f"u{i}"}]}
+                 for i in range(n_items)]
+        return {"model":"x", "instructions":"y", "input": items}
+
+    # First call: middle has ~30 items. bucket 0 (30//20=1, actually).
+    # Since recent_keep=8, middle = first n-8 items.
+    body1 = _body(40)   # 40-8 = 32 middle, bucket 32//20 = 1
+    out1, info1 = proactive_compact(body1, session_id=sid,
+                                    est_tokens=300_000, threshold_tokens=200_000,
+                                    recent_keep=8, summarizer=fake_summarizer)
+    assert info1["applied"]
+    assert summarizer_call_count["n"] == 1
+
+    # Second call: middle has 33 items (one more). Same bucket (33//20=1).
+    # Should HIT cache, no new summarizer call.
+    body2 = _body(41)
+    out2, info2 = proactive_compact(body2, session_id=sid,
+                                    est_tokens=300_000, threshold_tokens=200_000,
+                                    recent_keep=8, summarizer=fake_summarizer)
+    assert info2["applied"]
+    assert info2["cached"], "same bucket should hit cache"
+    assert summarizer_call_count["n"] == 1, (
+        f"summarizer should NOT have run again for same bucket "
+        f"(was called {summarizer_call_count['n']} times)"
+    )
+
+    # Third call: pad enough items to flip the bucket boundary.
+    # Need middle to reach next bucket (40 items), so input total = 40+8 = 48.
+    body3 = _body(48)
+    out3, info3 = proactive_compact(body3, session_id=sid,
+                                    est_tokens=300_000, threshold_tokens=200_000,
+                                    recent_keep=8, summarizer=fake_summarizer)
+    assert info3["applied"]
+    assert not info3["cached"], "bucket flip should miss cache"
+    assert summarizer_call_count["n"] == 2, (
+        f"summarizer should have run once on bucket flip "
+        f"(was called {summarizer_call_count['n']} times)"
+    )
+
+
+def test_proactive_compact_incremental_seeds_with_previous_bucket_summary():
+    """When bucket flips, the new summary generation should be SEEDED
+    with the previous bucket's summary, not start from scratch. This
+    keeps continuity across bucket boundaries — the new summary is a
+    refined version of the old one + new fall-off content."""
+    from tinyctx.sanitize import proactive_compact, clear_proactive_cache
+    clear_proactive_cache()
+
+    captured_blobs: list[str] = []
+
+    def capturing_summarizer(blob: str) -> str:
+        captured_blobs.append(blob)
+        return f"summary-v{len(captured_blobs)}"
+
+    sid = "incremental-test"
+    def _body(n):
+        items = [{"type":"message","role":"user",
+                  "content":[{"type":"input_text","text":f"item-{i}"}]}
+                 for i in range(n)]
+        return {"model":"x","instructions":"y","input": items}
+
+    # Bucket 1
+    proactive_compact(_body(40), session_id=sid, est_tokens=300_000,
+                      threshold_tokens=200_000, recent_keep=8,
+                      summarizer=capturing_summarizer)
+    # Force bucket 2 (middle ≥ 40 items)
+    proactive_compact(_body(48), session_id=sid, est_tokens=300_000,
+                      threshold_tokens=200_000, recent_keep=8,
+                      summarizer=capturing_summarizer)
+
+    # Second blob should be SEEDED with first summary
+    assert len(captured_blobs) == 2
+    second = captured_blobs[1]
+    assert "Previous handoff summary" in second
+    assert "summary-v1" in second, (
+        f"second summarizer call must include previous bucket's summary "
+        f"as seed; got: {second[:300]}"
+    )
+    assert "Additional turns since that summary" in second
+
+
 def test_expand_mcp_namespaces_unwraps_advisor_namespace():
     """codex 0.128+ packages MCP function tools inside a `type=namespace`
     shell; tinyctx must unwrap them into top-level `type=function` entries
