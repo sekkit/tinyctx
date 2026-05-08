@@ -91,6 +91,77 @@ def _log(event: str, **fields: Any) -> None:
         pass
 
 
+_PROACTIVE_SUMMARY_SYSTEM_PROMPT = (
+    "You are summarizing the OLDER turns of an in-progress coding session "
+    "that is about to be truncated to fit within a context window. The "
+    "RECENT turns will continue verbatim after your summary; the model "
+    "reading your summary is the same one that wrote those turns. Your "
+    "job is to give it just enough memory to keep working without losing "
+    "the thread.\n\n"
+    "Output a 250-500 word markdown handoff with these sections:\n"
+    "## What we were trying to do\n"
+    "  The user's actual goal. Be specific. Include any pivot the user made.\n"
+    "## Files & decisions\n"
+    "  Concrete paths touched. Decisions made (e.g. \"keep the env-knob\" or\n"
+    "  \"drop SLAM setup\"). Verbatim where possible.\n"
+    "## Commands & outcomes\n"
+    "  Exact commands run and what they returned (success/failure + key\n"
+    "  output line). Do NOT include long stderr — one line per command.\n"
+    "## What's left / next step\n"
+    "  Pending work the model was about to do, or the question it was\n"
+    "  about to ask. Be explicit so the next turn can resume.\n\n"
+    "Rules:\n"
+    "  - Concrete > abstract. Say \"removed RayNeo SLAM env knobs in\n"
+    "    com.foo.Bar.kt:42\" not \"made some Kotlin changes\".\n"
+    "  - Drop redundancy and chitchat.\n"
+    "  - Do NOT invent anything not in the conversation.\n"
+    "  - Keep it terse. The next model has tokens to spare elsewhere."
+)
+
+
+def _make_local_summarizer(local: BackendCfg):
+    """Return a synchronous summarizer callable suitable for
+    sanitize.proactive_compact. The callable calls the local backend's
+    /chat/completions endpoint to produce a real handoff summary instead
+    of the deterministic '[N older turns omitted]' placeholder.
+
+    Cache hits in proactive_compact's session-keyed cache reuse the
+    summary, so this fires roughly once per session even on long runs.
+
+    Failures fall back to the placeholder via proactive_compact's own
+    exception handler — never blocks the request.
+    """
+    def _summarize(blob: str) -> str:
+        url = local.base_url.rstrip("/") + "/chat/completions"
+        api_key = os.environ.get(local.api_key_env or "")
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        payload = {
+            "model": local.model or "local",
+            "messages": [
+                {"role": "system", "content": _PROACTIVE_SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": blob[:120_000]},
+            ],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "max_tokens": 1200,
+            "stream": False,
+        }
+        # Synchronous httpx — proactive_compact wraps us in asyncio.to_thread
+        # at the proxy layer, so we don't block the event loop.
+        with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=30.0,
+                                                write=15.0, pool=5.0)) as c:
+            r = c.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError("local summarizer returned empty")
+        return text.strip()
+    return _summarize
+
+
 def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
     if backend.api_key_env:
         v = os.environ.get(backend.api_key_env)
@@ -261,8 +332,17 @@ async def responses(request: Request) -> Any:
              or not CFG.proactive_compact_only_on_frontier)
     )
     if pc_should_run:
-        summarizer = None  # deterministic placeholder mode (zero added latency)
-        body, pc_info = proactive_compact(
+        summarizer = (
+            _make_local_summarizer(CFG.local)
+            if CFG.proactive_compact_use_summarizer
+            else None
+        )
+        # proactive_compact is sync and the summarizer (when provided) does a
+        # blocking httpx.Client call to the local model (~3-8s on cache miss,
+        # 0s on cache hit). Run in a worker thread so we don't block the
+        # asyncio event loop and stall other concurrent requests.
+        body, pc_info = await asyncio.to_thread(
+            proactive_compact,
             body,
             session_id=sid,
             est_tokens=decision.est_input_tokens,

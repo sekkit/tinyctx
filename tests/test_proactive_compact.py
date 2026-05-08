@@ -313,6 +313,97 @@ def test_proactive_compact_no_stub_when_tail_pair_intact():
     assert info["synthetic_call_stubs"] == 0
 
 
+def test_local_summarizer_calls_backend_and_returns_text():
+    """proxy._make_local_summarizer should POST to the local backend's
+    /chat/completions endpoint and return the assistant message text.
+
+    Fake the upstream with a small HTTPServer in a thread; verify the
+    summarizer hits it with the right payload shape and returns the
+    reply.
+    """
+    import json as _json
+    import socket
+    import threading
+    from contextlib import closing
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received: list[dict] = []
+
+    class _FakeChat(BaseHTTPRequestHandler):
+        def log_message(self, *a, **k): pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(n) if n else b""
+            received.append(_json.loads(raw))
+            reply = _json.dumps({
+                "choices": [{"message": {"role": "assistant",
+                                          "content": "FAKE HANDOFF\n## What we were trying to do\nfoo"}}]
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _FakeChat)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        from tinyctx.config import BackendCfg
+        from tinyctx.proxy import _make_local_summarizer
+        backend = BackendCfg(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key_env="DOES_NOT_EXIST_ENV",
+            model="fake-deepseek",
+            wire_api="chat",
+        )
+        summarize = _make_local_summarizer(backend)
+        out = summarize("a very large blob of conversation history")
+
+        assert "FAKE HANDOFF" in out
+        # check what we sent upstream
+        assert len(received) == 1
+        sent = received[0]
+        assert sent["model"] == "fake-deepseek"
+        assert sent["stream"] is False
+        msgs = sent["messages"]
+        assert msgs[0]["role"] == "system"
+        assert "handoff" in msgs[0]["content"].lower()
+        assert msgs[1]["role"] == "user"
+        assert "very large blob" in msgs[1]["content"]
+    finally:
+        httpd.shutdown()
+
+
+def test_proactive_compact_with_summarizer_uses_real_summary():
+    """End-to-end: when proactive_compact is given a summarizer, the
+    summary item carries the real LLM output, not the placeholder."""
+    clear_proactive_cache()
+    body = _make_body(30)
+
+    def my_summarizer(blob: str) -> str:
+        return ("## What we were trying to do\nUser asked to refactor "
+                "the SLAM module.\n## Files & decisions\nMain.kt:42 "
+                "removed env-knob.\n## Next step\nRun tests.")
+
+    out, info = proactive_compact(
+        body, session_id="real-summary-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+        summarizer=my_summarizer,
+    )
+    assert info["applied"] is True
+    summary_text = out["input"][-9]["content"][0]["text"]
+    # Real summary should appear in the prepended user item
+    assert "SLAM module" in summary_text
+    assert "Main.kt:42" in summary_text
+    # placeholder marker NOT present in this case (we got a real summary)
+    assert "older turns omitted to fit context" not in summary_text
+
+
 def test_clear_proactive_cache_session_scoped():
     clear_proactive_cache()
     body = _make_body(30)
