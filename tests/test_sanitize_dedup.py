@@ -239,6 +239,28 @@ def test_inject_advisor_hint_appends_to_instructions():
     assert "spawn_agent" not in body["instructions"]
 
 
+def test_inject_advisor_hint_includes_output_format_guidance():
+    """The hint must also tell the model NOT to wrap final answers in
+    `cat << EOF` heredoc — observed in real Codex.app session: model
+    treated long final summaries as exec_command output, which Codex.app
+    UI then folded into a collapsed tool-call block making the conclusion
+    invisible to the user."""
+    from tinyctx.sanitize import inject_advisor_hint
+    body = {
+        "model": "gpt-5.5",
+        "instructions": "You are codex.",
+        "input": [{"role": "user", "content": "hi"}],
+    }
+    out = inject_advisor_hint(body)
+    inst = out["instructions"]
+    # Must mention the anti-pattern by name
+    assert "cat" in inst.lower() and "EOF" in inst
+    assert "apply_patch" in inst  # tells model to use apply_patch for files
+    assert "exec_command" in inst  # tells model what exec_command IS for
+    # Must distinguish prose vs files vs side-effects
+    assert "assistant message" in inst.lower()
+
+
 def test_inject_advisor_hint_skips_advisor_sub_thread():
     """The advisor sub-thread itself uses model=tinyctx-frontier; injecting
     advisor guidance into its prompt would loop and waste budget. Skip."""
