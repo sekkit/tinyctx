@@ -451,6 +451,59 @@ def test_normalize_for_chat_handles_function_call_output_with_image():
     assert "[image attached" in content
 
 
+def test_normalize_for_chat_translates_max_output_tokens_to_max_tokens():
+    """When the body comes in with `max_output_tokens` (Responses API)
+    and chat-completions normalization runs, `max_tokens` (chat API)
+    must be set to the same value. This is critical for runaway-cap
+    enforcement: tinyctx injects `max_output_tokens=16000` into local
+    requests to prevent 80-second / 1.25 MB DeepSeek thinking loops
+    that cause "peer closed connection" stream errors.
+
+    User reported pattern of session interruption traced to this.
+    """
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "max_output_tokens": 16000,
+        "input": [{"type":"message","role":"user",
+                   "content":[{"type":"input_text","text":"hi"}]}],
+    }
+    out = normalize_for_chat(body)
+    assert out.get("max_tokens") == 16000, (
+        f"max_output_tokens must translate to max_tokens for chat backends; "
+        f"got out={out!r}"
+    )
+
+
+def test_normalize_for_chat_max_tokens_explicit_takes_precedence():
+    """If the caller already set `max_tokens` explicitly, it wins over
+    the `max_output_tokens` translation."""
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "max_tokens": 4000,
+        "max_output_tokens": 16000,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+    }
+    out = normalize_for_chat(body)
+    assert out.get("max_tokens") == 4000
+
+
+def test_inject_responses_defaults_caps_runaway_output_for_local():
+    """End-to-end: the default config's local.inject_defaults must
+    contain `max_output_tokens` so runaway local-model output is
+    capped. This is the production protection for the interruption
+    pattern."""
+    from tinyctx.config import Config
+    cfg = Config()
+    assert "max_output_tokens" in cfg.local.inject_defaults
+    assert cfg.local.inject_defaults["max_output_tokens"] >= 4000
+    assert cfg.local.inject_defaults["max_output_tokens"] <= 64000
+    # frontier should NOT have this (codex's chatgpt backend rejects
+    # max_output_tokens; we let it run with its own server-side limit)
+    assert "max_output_tokens" not in cfg.frontier.inject_defaults
+
+
 def test_normalize_for_chat_keeps_orphan_function_call_with_placeholder_result():
     """Regression: previously normalize_for_chat silently DROPPED any
     function_call whose call_id had no matching function_call_output in

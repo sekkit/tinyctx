@@ -365,6 +365,13 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
     for k in ("temperature", "top_p", "max_tokens", "tool_choice", "stop"):
         if k in body:
             out[k] = body[k]
+    # Responses-API uses `max_output_tokens`; chat-completions uses
+    # `max_tokens`. Translate when the chat field is absent so any cap
+    # set via `inject_responses_defaults` (e.g. local.inject_defaults
+    # max_output_tokens=16000 to prevent runaway DeepSeek output) is
+    # actually honored on the chat wire.
+    if "max_tokens" not in out and isinstance(body.get("max_output_tokens"), int):
+        out["max_tokens"] = body["max_output_tokens"]
     # Convert tools from Responses API format to chat-completions format.
     # Responses: {"type": "function", "name": "x", "parameters": {...}, "description": "..."}
     # Chat:      {"type": "function", "function": {"name": "x", "parameters": {...}, "description": "..."}}

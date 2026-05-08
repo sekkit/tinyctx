@@ -90,6 +90,19 @@ class Config:
         model=_env("TINYCTX_LOCAL_MODEL", "qwen3.6-27b") or "",
         wire_api=_env("TINYCTX_LOCAL_WIRE_API", "chat") or "chat",
         timeout_s=float(_env("TINYCTX_LOCAL_TIMEOUT_S", "180") or 180),
+        # Cap runaway output. Without this, DeepSeek/etc. can stream
+        # 1+ MB of tokens for 80+ seconds (observed today: a 77k-input
+        # turn produced 1.25 MB / 80 s before the upstream cut its own
+        # connection mid-stream — manifested as "peer closed connection
+        # without sending complete message body" stream_error and the
+        # codex.app UI showed the turn as interrupted). 16 000 tokens
+        # is generous: a long structured answer is ~3-8k tokens; the
+        # cap only bites runaway thinking loops. Set this to 0 in
+        # config.toml [local] to disable.
+        inject_defaults={
+            "text.format.type": "text",
+            "max_output_tokens": int(_env("TINYCTX_LOCAL_MAX_OUTPUT_TOKENS", "16000") or 16000),
+        },
     ))
 
     # Frontier path: GPT-5.5 (or whatever upstream codex is registered with).
