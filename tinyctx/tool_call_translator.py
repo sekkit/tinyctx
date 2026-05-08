@@ -506,8 +506,8 @@ def _classify_final_answer(text: str) -> dict | None:
     """
     if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
         return None
-    if len(text) < 200:
-        return None  # too short to be a final-answer prompt
+    if not text or not text.strip():
+        return None  # nothing to classify
 
     # Lazy import to avoid circular at module load time
     try:
@@ -995,10 +995,29 @@ class ChatToResponsesTranslator:
             # Only when the classifier says YES do we pay for an advisor
             # consultation. This catches "I'm done — what's next?" prose
             # that the regex layers miss.
-            if (not self._tool_calls
-                    and len(self._text_buf) >= 200
-                    and os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") != "0"):
+            _enabled = os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") != "0"
+            _no_tool_calls = not self._tool_calls
+            _has_text = bool(self._text_buf and self._text_buf.strip())
+            # No length gate — classifier (DeepSeek) is the semantic judge.
+            # Any zero-tool-call assistant message with non-empty text gets
+            # routed through the classifier; cheap enough (~1-2s, $0.0001)
+            # that we don't pre-filter by length. Empty text is the only
+            # genuine no-op skip.
+            try:
+                from tinyctx.proxy import _log
+                _log("classifier_gate",
+                     enabled=_enabled, no_tool_calls=_no_tool_calls,
+                     has_text=_has_text, text_len=len(self._text_buf),
+                     will_run=(_enabled and _no_tool_calls and _has_text))
+            except Exception:
+                pass
+            if _enabled and _no_tool_calls and _has_text:
                 _classify = _classify_final_answer(self._text_buf)
+                try:
+                    from tinyctx.proxy import _log
+                    _log("classifier_result", result=_classify)
+                except Exception:
+                    pass
                 if _classify and _classify.get("await_user"):
                     _opts = _classify.get("options") or []
                     _cont = _ask_advisor_for_continuation(self._text_buf, _opts)

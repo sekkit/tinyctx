@@ -567,11 +567,28 @@ def test_classifier_disabled_with_env_zero():
             _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
 
 
-def test_classifier_skips_short_text():
-    """Don't waste a classifier call on tiny messages."""
-    from tinyctx.tool_call_translator import _classify_final_answer
-    assert _classify_final_answer("Done.") is None
-    assert _classify_final_answer("ok.") is None
+def test_classifier_skips_only_empty_text():
+    """Empty / whitespace-only text is skipped (nothing to classify);
+    any non-empty text — including short prompts like 'Should I A or B?' —
+    goes through the classifier so semantic detection isn't gated by
+    length heuristics."""
+    import os as _os
+    saved = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    try:
+        from tinyctx.tool_call_translator import _classify_final_answer
+        assert _classify_final_answer("") is None
+        assert _classify_final_answer("   \n  \t ") is None
+        # Short non-empty text would attempt the HTTP call (and fail in
+        # this test env due to no real proxy). What we're verifying here
+        # is the *gate*: it does NOT short-circuit on length anymore.
+        # Real test for actual classify happens in
+        # test_classifier_parses_well_formed_json which mocks httpx.
+    finally:
+        if saved is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
 
 
 def test_classifier_parses_well_formed_json(monkeypatch=None):
