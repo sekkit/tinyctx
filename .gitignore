@@ -36,3 +36,6 @@ secrets/
 
 # Explicitly allow committed templates (overrides *.env / secrets/)
 !examples/secrets.env.example
+
+# Claude Code per-session metadata (worktrees, agent state, todos)
+.claude/
