@@ -45,6 +45,7 @@ structured `function_call` items, we leave them alone.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from copy import deepcopy
@@ -392,6 +393,76 @@ def _parse_sse_event(raw: str) -> tuple[str | None, Any]:
         return ev_name, None
 
 
+def _try_auto_answer_user_input(arguments_json: str) -> str | None:
+    """codex 0.128 emits `request_user_input` (a function tool) when the
+    model wants the user to pick an option. By default that bubbles up to
+    Codex.app's UI as a clickable choice prompt — blocking the session
+    until the user clicks. With `TINYCTX_AUTO_USER_INPUT=1`, this helper
+    intercepts the call BEFORE codex emits the UI prompt: it synchronously
+    consults the advisor (frontier gpt-5.5), parses the chosen option, and
+    returns assistant text to be appended to the model's reply. The caller
+    then drops the original function_call so codex never sees it.
+
+    Returns None when:
+      - the env switch is off,
+      - the arguments JSON is malformed / empty,
+      - the advisor call fails (timeout / network) — in which case the
+        function_call falls back to the normal user-prompt flow.
+
+    The returned text is plain markdown including the advisor's chosen
+    option(s) and a short rationale, prefixed with a clear marker so the
+    user can audit auto-decisions in chat history.
+    """
+    if os.environ.get("TINYCTX_AUTO_USER_INPUT") != "1":
+        return None
+    try:
+        args = json.loads(arguments_json) if arguments_json else {}
+    except json.JSONDecodeError:
+        return None
+    questions = args.get("questions") or []
+    if not questions:
+        return None
+
+    # Build a tight advisor prompt from the questions array.
+    parts = []
+    for i, q in enumerate(questions, 1):
+        if not isinstance(q, dict):
+            continue
+        header = q.get("header") or q.get("label") or "(no header)"
+        opts = q.get("options") or []
+        opts_str = "\n".join(f"  - {o}" for o in opts) if opts else "  (free text)"
+        parts.append(f"Q{i}: {header}\nOptions:\n{opts_str}")
+    if not parts:
+        return None
+    question = (
+        "The executor is about to ask the user to pick an option. Pick the "
+        "best option for each question below. Output format:\n"
+        "  Q1: <chosen option> — <one-sentence rationale>\n"
+        "  Q2: <chosen option> — <one-sentence rationale>\n\n"
+        "Be decisive. If the question has no clear winner, say so but still "
+        "pick the safer / more reversible option.\n\n"
+        + "\n\n".join(parts)
+    )
+
+    # Lazy-import advisor (it's a sibling module that opens an httpx client
+    # to the running tinyctx proxy at /v1/responses with model=tinyctx-frontier;
+    # circular imports avoided by deferring to call time).
+    try:
+        from tinyctx.advisor import call_advisor
+        result = call_advisor(
+            question=question,
+            context="auto_user_input intercept — user enabled "
+                    "TINYCTX_AUTO_USER_INPUT, so this routes through advisor "
+                    "instead of bubbling up to Codex.app's UI.",
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if result.get("error") or not result.get("text"):
+        return None
+    advice = result["text"].strip()
+    return f"\n\n[advisor auto-decision — TINYCTX_AUTO_USER_INPUT=1]\n{advice}\n"
+
+
 def _split_around_tool_calls(buf: str) -> tuple[str, str, str]:
     """Return (head_text, _ignored_, tail_text) where head is everything
     before the first `<tool_call>` and tail is everything after the LAST
@@ -613,6 +684,25 @@ class ChatToResponsesTranslator:
         if not self._message_item_emitted:
             self._message_item_emitted = True
             yield from self._emit_message_item_start()
+
+        # Auto-answer `request_user_input` via the advisor (env-gated).
+        # When TINYCTX_AUTO_USER_INPUT=1, intercept calls to the
+        # `request_user_input` function tool, synchronously ask the advisor
+        # to pick, append its choice to the assistant text, and DROP the
+        # original function_call so codex never raises the UI prompt.
+        # Multiple request_user_input calls in one turn all get redirected.
+        # Failures (advisor down, malformed args) fall through to normal flow.
+        _to_drop = []
+        for _idx, _entry in self._tool_calls.items():
+            if _entry.get("name") != "request_user_input":
+                continue
+            _choice_text = _try_auto_answer_user_input(_entry.get("arguments", ""))
+            if _choice_text is None:
+                continue  # disabled / failed → leave the function_call in place
+            self._text_buf += _choice_text
+            _to_drop.append(_idx)
+        for _idx in _to_drop:
+            del self._tool_calls[_idx]
 
         yield self._sse("response.output_text.done", {
             "type": "response.output_text.done",

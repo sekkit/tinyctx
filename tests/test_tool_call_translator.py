@@ -264,6 +264,172 @@ def test_stream_translator_flush_emits_buffered_tail():
     assert "tail content" in flush_out
 
 
+def test_auto_answer_disabled_by_default():
+    """Without TINYCTX_AUTO_USER_INPUT=1, _try_auto_answer_user_input
+    must be a no-op so the request_user_input flow is unchanged."""
+    import os as _os
+    from tinyctx.tool_call_translator import _try_auto_answer_user_input
+    saved = _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+    try:
+        out = _try_auto_answer_user_input(json.dumps({
+            "questions": [{"header": "A or B?", "options": ["A", "B"]}]
+        }))
+        assert out is None, "must return None when env switch is off"
+    finally:
+        if saved is not None:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
+
+
+def test_auto_answer_calls_advisor_when_enabled():
+    """With TINYCTX_AUTO_USER_INPUT=1, intercept calls advisor and
+    returns its text wrapped with an audit-trail marker."""
+    import os as _os
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    captured = {}
+
+    def fake_call_advisor(question, context="", previous_attempts=""):
+        captured["question"] = question
+        captured["context"] = context
+        return {"text": "Q1: A — fewer vendor deps.", "usage": None,
+                "error": None}
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _adv.call_advisor = fake_call_advisor
+    try:
+        out = _tct._try_auto_answer_user_input(json.dumps({
+            "questions": [{
+                "header": "Pick architecture path",
+                "options": ["A: IMU 6DoF", "B: RemoteLoader fix"],
+            }]
+        }))
+        assert out is not None
+        assert "advisor auto-decision" in out
+        assert "Q1: A" in out
+        assert "IMU 6DoF" in captured["question"]
+        assert "RemoteLoader" in captured["question"]
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_auto_answer_returns_none_on_advisor_failure():
+    import os as _os
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _adv.call_advisor = lambda **kw: {"text": "", "usage": None,
+                                      "error": "network"}
+    try:
+        out = _tct._try_auto_answer_user_input(json.dumps({
+            "questions": [{"header": "x", "options": ["a"]}]
+        }))
+        assert out is None
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_auto_answer_skips_malformed_or_empty():
+    import os as _os
+    from tinyctx.tool_call_translator import _try_auto_answer_user_input
+    saved = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    try:
+        assert _try_auto_answer_user_input("{not json") is None
+        assert _try_auto_answer_user_input("") is None
+        assert _try_auto_answer_user_input("{}") is None
+        assert _try_auto_answer_user_input(
+            json.dumps({"questions": []})) is None
+    finally:
+        if saved is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
+
+
+def test_translator_finish_intercepts_request_user_input_when_enabled():
+    """End-to-end: with env on + advisor mocked, the tool_call entry is
+    dropped (so codex's request_user_input UI prompt never fires) and the
+    advisor's decision text gets folded into the assistant message text
+    instead — codex sees the model just answered directly."""
+    import os as _os
+    import tinyctx.advisor as _adv
+    from tinyctx.tool_call_translator import ChatToResponsesTranslator
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _adv.call_advisor = lambda **kw: {
+        "text": "Q1: B — RemoteLoader fix is closer to vendor intent.",
+        "usage": None, "error": None,
+    }
+    try:
+        t = ChatToResponsesTranslator()
+        t._model = "deepseek-v4-flash"
+        # text first, then a request_user_input function_call, then done
+        chunks = [
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{
+                    "delta": {"content": "Considering options..."},
+                    "index": 0,
+                }],
+            }) + "\n\n").encode(),
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0, "id": "fc_abc", "type": "function",
+                        "function": {
+                            "name": "request_user_input",
+                            "arguments": json.dumps({
+                                "questions": [{
+                                    "header": "Pick A or B",
+                                    "options": ["A: IMU", "B: RemoteLoader"],
+                                }]
+                            }),
+                        },
+                    }]},
+                    "index": 0,
+                }],
+            }) + "\n\n").encode(),
+            ("data: " + json.dumps({
+                "id": "x", "object": "chat.completion.chunk",
+                "choices": [{
+                    "delta": {}, "finish_reason": "tool_calls", "index": 0,
+                }],
+            }) + "\n\ndata: [DONE]\n\n").encode(),
+        ]
+        emitted = b""
+        for chunk in chunks:
+            for ev in t.feed(chunk):
+                emitted += ev
+        for ev in t.flush():
+            emitted += ev
+        text = emitted.decode("utf-8")
+        assert "advisor auto-decision" in text
+        assert "Q1: B" in text
+        # the function_call name was NOT emitted to codex
+        assert "request_user_input" not in text
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
 if __name__ == "__main__":
     import sys
     failed = 0
