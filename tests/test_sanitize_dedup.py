@@ -489,6 +489,59 @@ def test_normalize_for_chat_max_tokens_explicit_takes_precedence():
     assert out.get("max_tokens") == 4000
 
 
+def test_cap_responses_fields_lowers_excessive_values():
+    """Force-cap mechanism. Unlike inject_responses_defaults, this MUST
+    override an existing value when it exceeds the cap. Codex.app sends
+    max_output_tokens=128000 by default; without this cap, runaway
+    DeepSeek thinking loops produce 1.6 MB / 86s streams that the
+    upstream cuts mid-flight, manifesting as session interruptions."""
+    from tinyctx.sanitize import cap_responses_fields
+    body = {"model": "x", "max_output_tokens": 128000}
+    out = cap_responses_fields(body, {"max_output_tokens": 16000})
+    assert out["max_output_tokens"] == 16000
+
+
+def test_cap_responses_fields_leaves_lower_values_alone():
+    """If the existing value is BELOW the cap, leave it. We want to
+    cap excess, not raise floors."""
+    from tinyctx.sanitize import cap_responses_fields
+    body = {"max_output_tokens": 4000}
+    out = cap_responses_fields(body, {"max_output_tokens": 16000})
+    assert out["max_output_tokens"] == 4000
+
+
+def test_cap_responses_fields_skips_missing_fields():
+    """If the field isn't present, leave the body alone (cap doesn't
+    inject; use inject_responses_defaults for that)."""
+    from tinyctx.sanitize import cap_responses_fields
+    body = {"model": "x"}
+    out = cap_responses_fields(body, {"max_output_tokens": 16000})
+    assert "max_output_tokens" not in out
+
+
+def test_cap_responses_fields_does_not_mutate_input():
+    """Defensive copy semantics like the rest of sanitize."""
+    import json
+    from tinyctx.sanitize import cap_responses_fields
+    body = {"max_output_tokens": 200000}
+    snap = json.dumps(body, sort_keys=True)
+    cap_responses_fields(body, {"max_output_tokens": 16000})
+    assert json.dumps(body, sort_keys=True) == snap
+
+
+def test_local_backend_caps_max_output_tokens_in_default_config():
+    """E2E: Config().local must set cap_fields with max_output_tokens
+    so codex.app's default 128000 gets lowered. This is the production
+    knob that prevents runaway-induced session interruptions."""
+    from tinyctx.config import Config
+    cfg = Config()
+    assert "max_output_tokens" in cfg.local.cap_fields
+    assert cfg.local.cap_fields["max_output_tokens"] >= 4000
+    assert cfg.local.cap_fields["max_output_tokens"] <= 64000
+    # Frontier intentionally has no cap (chatgpt backend rejects field)
+    assert "max_output_tokens" not in cfg.frontier.cap_fields
+
+
 def test_inject_responses_defaults_caps_runaway_output_for_local():
     """End-to-end: the default config's local.inject_defaults must
     contain `max_output_tokens` so runaway local-model output is

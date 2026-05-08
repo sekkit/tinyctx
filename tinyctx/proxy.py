@@ -46,6 +46,7 @@ from . import historian
 from .router import Decision, decide
 from .sanitize import (
     CacheAwareMutator,
+    cap_responses_fields,
     dedup_tool_calls,
     inject_responses_defaults,
     normalize_for_chat,
@@ -160,6 +161,18 @@ def _make_local_summarizer(local: BackendCfg):
             raise RuntimeError("local summarizer returned empty")
         return text.strip()
     return _summarize
+
+
+def _get_dotted(d: dict[str, Any], path: str) -> Any:
+    """Read a dotted-path value from a nested dict; None if missing."""
+    cur: Any = d
+    for k in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+        if cur is None:
+            return None
+    return cur
 
 
 def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
@@ -428,6 +441,21 @@ async def responses(request: Request) -> Any:
     if backend.inject_defaults:
         body = inject_responses_defaults(body, backend.inject_defaults)
         trace.fields_injected = sorted(backend.inject_defaults.keys())
+    if backend.cap_fields:
+        # FORCE cap fields where the inbound value exceeds the cap.
+        # Distinct from inject_defaults: caps OVERRIDE existing values
+        # (codex sends max_output_tokens=128000 by default; we cap to
+        # 16000 to prevent runaway DeepSeek output).
+        before_caps = {p: _get_dotted(body, p) for p in backend.cap_fields}
+        body = cap_responses_fields(body, backend.cap_fields)
+        after_caps = {p: _get_dotted(body, p) for p in backend.cap_fields}
+        capped = [p for p in backend.cap_fields
+                  if before_caps[p] != after_caps[p]]
+        if capped:
+            trace.fields_capped = capped
+            _log("cap_fields", session=sid,
+                 capped={p: {"from": before_caps[p], "to": after_caps[p]}
+                         for p in capped})
 
     # Frontier-only: trim the tools array to what was actually used in
     # the recent window + an essentials allowlist. Codex sends ~50 tools

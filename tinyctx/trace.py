@@ -56,6 +56,10 @@ class RequestTrace:
     tool_types_dropped: list[str] = field(default_factory=list)
     fields_stripped: list[str] = field(default_factory=list)
     fields_injected: list[str] = field(default_factory=list)
+    # Fields whose inbound value exceeded a configured cap and were
+    # lowered before forwarding (e.g. max_output_tokens 128000 → 16000
+    # to prevent DeepSeek runaway thinking loops).
+    fields_capped: list[str] = field(default_factory=list)
 
     # mutation gate (cache-aware deferral for dedup/purge/historian-substitute)
     mutation_wanted: bool = False

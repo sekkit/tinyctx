@@ -75,6 +75,12 @@ class BackendCfg:
     # itself; false for frontier (the OpenAI backend already returns
     # structured items).
     translate_tool_calls: bool = True
+    # Hard caps. Unlike `inject_defaults` (which only sets if missing),
+    # these LOWER the field's value when it exceeds the cap. Useful when
+    # codex sends `max_output_tokens=128000` (default high value) and we
+    # need to cap at 16000 to prevent DeepSeek runaway thinking loops.
+    # Dotted-path → int cap. Empty by default (no cap).
+    cap_fields: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,6 +107,12 @@ class Config:
         # config.toml [local] to disable.
         inject_defaults={
             "text.format.type": "text",
+            "max_output_tokens": int(_env("TINYCTX_LOCAL_MAX_OUTPUT_TOKENS", "16000") or 16000),
+        },
+        # Force-cap codex's max_output_tokens (default 128000) to our
+        # safe limit. Without this the inject_defaults was a no-op
+        # because codex always provides the field.
+        cap_fields={
             "max_output_tokens": int(_env("TINYCTX_LOCAL_MAX_OUTPUT_TOKENS", "16000") or 16000),
         },
     ))

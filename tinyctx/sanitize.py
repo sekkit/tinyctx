@@ -309,6 +309,47 @@ def inject_responses_defaults(
     return out
 
 
+def cap_responses_fields(
+    body: dict[str, Any],
+    caps: dict[str, int],
+) -> dict[str, Any]:
+    """Force-cap numeric fields: set body[path] = min(existing, cap).
+    Unlike `inject_responses_defaults`, this OVERRIDES existing values
+    when they exceed the cap — necessary for hard limits like
+    max_output_tokens that callers set higher than is safe.
+
+    Real bug found while diagnosing 1.6 MB / 86s DeepSeek runaway today
+    (21:11): codex.app sends `max_output_tokens=128000` in its Responses
+    requests. The `inject_responses_defaults({"max_output_tokens":16000})`
+    we added in commit 5715d40 was a no-op because the field was always
+    already present from codex. With this helper we cap from above,
+    landing the actually-effective max at min(128000, 16000) = 16000.
+
+    `caps` is a dotted-path → integer cap map. Caps a value if greater
+    than the cap. Leaves missing values alone (use inject + cap for both
+    "set if missing" and "lower if too high").
+    """
+    if not caps:
+        return body
+    out = deepcopy(body)
+    for path, cap in caps.items():
+        if not isinstance(cap, int) or cap <= 0:
+            continue
+        keys = path.split(".")
+        cur = out
+        for k in keys[:-1]:
+            v = cur.get(k)
+            if not isinstance(v, dict):
+                break
+            cur = cur[k]
+        else:
+            leaf = keys[-1]
+            cur_val = cur.get(leaf)
+            if isinstance(cur_val, int) and cur_val > cap:
+                cur[leaf] = cap
+    return out
+
+
 def _flatten_tool_output(output: Any) -> str:
     """Codex 0.128+ tool outputs (function_call_output.output) can be:
       - a plain string ("ran ok")
