@@ -219,6 +219,7 @@ async def _local_call(client: httpx.AsyncClient, backend: BackendCfg,
                       temperature: float = 0.2) -> str:
     """One call to a local OpenAI-compat /chat/completions endpoint. Returns
     the assistant message text, or raises on failure."""
+    import os as _os
     url = backend.base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": backend.model or "local",
@@ -232,6 +233,20 @@ async def _local_call(client: httpx.AsyncClient, backend: BackendCfg,
         "stream": False,
     }
     headers = {"Content-Type": "application/json"}
+    # Send Authorization when the backend declares an api_key_env. LMStudio
+    # ignored auth so this used to be a no-op; DeepSeek (and most hosted
+    # OpenAI-compat backends) require it. Without this header every
+    # compactor draft hits 401 and codex's auto-compact silently falls
+    # back to a 43-char "[tinyctx compactor: all subagents failed]"
+    # placeholder, which obliterates the model's memory and surfaces as
+    # "earlier task details were compacted out" in the codex.app UI.
+    if backend.api_key_env:
+        api_key = _os.environ.get(backend.api_key_env)
+        if api_key:
+            headers["Authorization"] = (
+                api_key if api_key.lower().startswith(("bearer ", "basic "))
+                else f"Bearer {api_key}"
+            )
     r = await client.post(url, json=payload, headers=headers,
                           timeout=backend.timeout_s or 180.0)
     r.raise_for_status()

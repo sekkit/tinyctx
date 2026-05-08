@@ -61,13 +61,77 @@ def _spawn_fake(received: list[dict], scripts: dict[str, str]) -> tuple[Threadin
     return httpd, port
 
 
-def _backend(port: int, *, model: str = "qwen-fake") -> BackendCfg:
+def _backend(port: int, *, model: str = "qwen-fake",
+             api_key_env: str | None = None) -> BackendCfg:
     return BackendCfg(
         base_url=f"http://127.0.0.1:{port}/v1",
         model=model,
         wire_api="chat",
         timeout_s=10.0,
+        api_key_env=api_key_env,
     )
+
+
+def test_local_call_sends_authorization_when_api_key_env_set():
+    """Regression: compactor._local_call MUST send an Authorization header
+    when the backend declares an api_key_env. Without this, every
+    DeepSeek-style hosted backend returns 401, all 3 role drafts fail,
+    and codex's auto-compact silently degrades to a 43-char placeholder
+    that wipes out the model's memory.
+
+    Live trace 16:32:22 confirmed this bug surface as
+    'earlier task details were compacted out' in codex.app's UI.
+    """
+    import json as _json
+    import os as _os
+    received: list[dict] = []
+
+    class _AuthCheck(BaseHTTPRequestHandler):
+        def log_message(self, *a, **kw): pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = _json.loads(self.rfile.read(n))
+            received.append({
+                "authorization": self.headers.get("Authorization", ""),
+                "model": body.get("model"),
+            })
+            out = _json.dumps({"choices":[{"message":{"content":"ok"}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    import socket
+    with socket.socket() as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _AuthCheck)
+    Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        env_var = "TEST_TINYCTX_FAKE_API_KEY"
+        _os.environ[env_var] = "sk-fake-deadbeef"
+        backend = _backend(port, api_key_env=env_var)
+
+        async def go():
+            import httpx
+            from tinyctx.compactor import _local_call
+            async with httpx.AsyncClient() as client:
+                return await _local_call(client, backend, "system", "user",
+                                          max_tokens=50)
+
+        # Use new_event_loop pattern to match other tests in this file
+        # (asyncio.run() in Py3.9 closes the loop and breaks subsequent
+        # tests that call get_event_loop()).
+        result = asyncio.new_event_loop().run_until_complete(go())
+        assert result == "ok"
+        assert len(received) == 1
+        assert received[0]["authorization"] == "Bearer sk-fake-deadbeef", (
+            f"compactor must send Bearer auth, got: {received[0]['authorization']!r}"
+        )
+    finally:
+        httpd.shutdown()
+        _os.environ.pop("TEST_TINYCTX_FAKE_API_KEY", None)
 
 
 # ---------------------------------------------------------------- unit
