@@ -224,6 +224,95 @@ def test_proactive_compact_does_not_mutate_input_body():
     assert json.dumps(body, sort_keys=True) == snapshot
 
 
+def test_proactive_compact_synthesizes_stub_for_orphan_tool_output():
+    """When the tail contains a function_call_output whose matching
+    function_call lived in the (now compacted) middle, the upstream
+    Responses API rejects with 'No tool call found for function call
+    output'. We must synthesize a function_call stub immediately before
+    the output so the pair is structurally valid.
+
+    This is the exact bug that caused chatgpt.com to 400 today at
+    15:44:09 after 5 successful 200s — the 6th request happened to slice
+    on a boundary that orphaned a tool result.
+    """
+    clear_proactive_cache()
+    items: list = []
+    # 30 plain user/assistant turns (60 items) — these will be "middle"
+    for i in range(30):
+        items.append({"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": f"u{i}"}]})
+        items.append({"type": "message", "role": "assistant",
+                      "content": [{"type": "output_text", "text": f"a{i}"}]})
+    # Then the last 8 (recent_keep) items include an orphan output:
+    # function_call lives at index 60 (will be in middle, dropped),
+    # function_call_output lives at index -3 (in tail, surviving).
+    items[59] = {  # replace one middle assistant turn with the original call
+        "type": "function_call", "call_id": "call_ABC",
+        "name": "shell", "arguments": '{"command":["ls"]}',
+    }
+    items.append({"type": "function_call_output", "call_id": "call_ABC",
+                  "output": "file1.txt\n"})
+    # Add 7 more recent items to round out tail = 8
+    for i in range(7):
+        items.append({"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": f"recent_u{i}"}]})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="orphan-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    assert info["synthetic_call_stubs"] == 1, (
+        f"expected 1 synthetic stub, got {info['synthetic_call_stubs']}"
+    )
+
+    # Check that the output_call_ABC has its matching synthetic call right before it
+    new_input = out["input"]
+    found_pair = False
+    for i, it in enumerate(new_input):
+        if (isinstance(it, dict)
+                and it.get("type") == "function_call_output"
+                and it.get("call_id") == "call_ABC"):
+            # Look at the item just before
+            assert i > 0
+            prev = new_input[i - 1]
+            assert prev.get("type") == "function_call"
+            assert prev.get("call_id") == "call_ABC"
+            assert prev.get("name") == "tinyctx_compacted_call"
+            found_pair = True
+            break
+    assert found_pair, "synthetic call stub was not placed before the orphan output"
+
+
+def test_proactive_compact_no_stub_when_tail_pair_intact():
+    """If a function_call AND its function_call_output both live in the
+    tail (or both in head), no synthetic stub is needed."""
+    clear_proactive_cache()
+    items: list = []
+    for i in range(30):
+        items.append({"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": f"u{i}"}]})
+        items.append({"type": "message", "role": "assistant",
+                      "content": [{"type": "output_text", "text": f"a{i}"}]})
+    # Add a clean tool_call/output pair INSIDE the tail (last 8)
+    items.append({"type": "function_call", "call_id": "call_XYZ",
+                  "name": "shell", "arguments": '{"command":["ls"]}'})
+    items.append({"type": "function_call_output", "call_id": "call_XYZ",
+                  "output": "ok"})
+    for i in range(6):
+        items.append({"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": f"r{i}"}]})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="pair-intact-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    assert info["synthetic_call_stubs"] == 0
+
+
 def test_clear_proactive_cache_session_scoped():
     clear_proactive_cache()
     body = _make_body(30)

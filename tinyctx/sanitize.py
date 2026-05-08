@@ -863,6 +863,48 @@ def proactive_compact(
     middle = rest[:-recent_keep]
     tail = rest[-recent_keep:]
 
+    # Tool-call/output pairing repair. The Responses API requires every
+    # `function_call_output` to have a matching `function_call` somewhere
+    # earlier in the input. Slicing the middle away can leave orphan
+    # outputs in tail whose calls were dropped — chatgpt.com 400s with:
+    #   "No tool call found for function call output with call_id ..."
+    #
+    # Strategy: for every orphan output in tail (i.e. output whose call_id
+    # is not present as a function_call in head ∪ tail), synthesize a stub
+    # `function_call` item with that call_id immediately before the output.
+    # The stub carries an obvious tinyctx marker so the upstream model
+    # sees the call as "already happened in the compacted history".
+    head_call_ids = {
+        it.get("call_id") or it.get("id")
+        for it in head if isinstance(it, dict)
+        and it.get("type") in _TOOL_CALL_TYPES
+    }
+    tail_call_ids = {
+        it.get("call_id") or it.get("id")
+        for it in tail if isinstance(it, dict)
+        and it.get("type") in _TOOL_CALL_TYPES
+    }
+    repaired_tail: list = []
+    synthetic_calls = 0
+    for it in tail:
+        if (isinstance(it, dict)
+                and it.get("type") in _TOOL_RESULT_TYPES):
+            cid = it.get("call_id") or it.get("id") or ""
+            if cid and cid not in head_call_ids and cid not in tail_call_ids:
+                # Synthesize a matching function_call stub right before this output.
+                repaired_tail.append({
+                    "type": "function_call",
+                    "call_id": cid,
+                    "name": "tinyctx_compacted_call",
+                    "arguments": json.dumps({
+                        "note": "original call was elided by tinyctx "
+                                "proactive_compact; see summary item above"
+                    }),
+                })
+                synthetic_calls += 1
+        repaired_tail.append(it)
+    tail = repaired_tail
+
     cache_key = (session_id, _hash_items(middle))
     summary_text = _PROACTIVE_SUMMARY_CACHE.get(cache_key)
     cached = summary_text is not None
@@ -906,10 +948,14 @@ def proactive_compact(
     info["applied"] = True
     info["reason"] = (f"est_tokens={est_tokens} >= {threshold_tokens}, "
                       f"compacted {len(middle)} middle items "
-                      f"({'cached' if cached else 'fresh'} summary)")
+                      f"({'cached' if cached else 'fresh'} summary"
+                      + (f", {synthetic_calls} synthetic call stubs"
+                         if synthetic_calls else "")
+                      + ")")
     info["items_after"] = len(out["input"])
     info["middle_items_compacted"] = len(middle)
     info["cached"] = cached
+    info["synthetic_call_stubs"] = synthetic_calls
     return out, info
 
 
