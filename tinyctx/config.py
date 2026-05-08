@@ -161,6 +161,30 @@ class Config:
     mutation_threshold: float = 0.65   # context usage trigger (0..1)
     default_context_window: int = 1_000_000  # used when request doesn't say
 
+    # Proactive history truncation (proxy-side defense against "Codex ran
+    # out of room"). When est_input_tokens reaches this threshold AND the
+    # request is NOT codex's own compaction request, the proxy rewrites
+    # body.input to keep system items + most recent N turns plus a single
+    # tinyctx-generated summary item replacing the older middle. The
+    # upstream model sees a slim payload that fits; codex's client-side
+    # history is unchanged so the UI still shows every turn.
+    #
+    # codex.app 0.128 hard-codes per-model context_window=272000 for
+    # gpt-5.5 and ships auto_compact_token_limit=null. Auto-compact only
+    # fires when the user adds `model_auto_compact_token_limit` at the TOP
+    # LEVEL of config.toml (profile-scoped doesn't apply to the default
+    # profile). Even with that fixed, the proxy needs its own backstop.
+    #
+    # 0 = disabled. Default 200_000 stays below codex's 272k internal
+    # ceiling so the slim body fits no matter what codex thinks.
+    proactive_compact_threshold: int = 200_000
+    # Number of recent turns kept verbatim during proactive truncation.
+    proactive_compact_recent_keep: int = 8
+    # When true, summary uses one local-model call per session-summary cache
+    # miss. When false, uses a deterministic "N older turns omitted"
+    # placeholder (fast, free, lossy).
+    proactive_compact_use_summarizer: bool = True
+
     # If set, force every request through one of {"local", "frontier", "auto"}.
     # Useful for debugging.
     force_route: str = field(default_factory=lambda: _env("TINYCTX_FORCE_ROUTE", "auto") or "auto")

@@ -84,6 +84,16 @@ class RequestTrace:
     compactor_used: bool = False
     compactor_outcome: str = ""
 
+    # proactive_compact (proxy-side history truncation when est_tokens
+    # exceeds CFG.proactive_compact_threshold, defending against codex
+    # 0.128's "ran out of room" with auto-compact disabled at the model
+    # level). Fires before forward; codex's local history is unchanged.
+    proactive_compact_applied: bool = False
+    proactive_compact_reason: str = ""
+    proactive_compact_items_before: int = 0
+    proactive_compact_items_after: int = 0
+    proactive_compact_middle_compacted: int = 0
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +178,9 @@ def render_compact_row(t: RequestTrace) -> str:
             transforms_bits.append("/".join(bits))
     elif t.mutation_wanted:
         transforms_bits.append("mut-defer")
+    if t.proactive_compact_applied:
+        transforms_bits.append(
+            f"pcompact-{t.proactive_compact_middle_compacted}")
     transforms = " ".join(transforms_bits) or "—"
     trans = f"x{t.translated_calls}" if t.translated_calls else ("✓" if t.translated else "—")
     return (
@@ -220,6 +233,17 @@ def render_verbose(t: RequestTrace) -> str:
     ])
     if t.compactor_used:
         lines.append(f"  COMPACTOR    used  outcome={t.compactor_outcome}")
+    if t.proactive_compact_applied or t.proactive_compact_reason:
+        lines.append(
+            f"  PROACTIVE_C  applied={t.proactive_compact_applied}  "
+            f"reason={t.proactive_compact_reason}"
+        )
+        if t.proactive_compact_applied:
+            lines.append(
+                f"               items {t.proactive_compact_items_before}"
+                f" → {t.proactive_compact_items_after} "
+                f"(middle compacted: {t.proactive_compact_middle_compacted})"
+            )
     return "\n".join(lines)
 
 

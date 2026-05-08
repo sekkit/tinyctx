@@ -702,3 +702,223 @@ class CacheAwareMutator:
 
     def mark_applied(self, session_id: str, *, now: float | None = None) -> None:
         self.last_applied[session_id] = now if now is not None else time.time()
+
+
+# ----------------------------------------------- proactive history truncation
+#
+# Why this exists: codex.app 0.128 hard-codes `context_window: 272000` for
+# gpt-5.5 and ships `auto_compact_token_limit: null` (auto-compact disabled
+# by default). When tinyctx routes to a 1M-context backend like DeepSeek,
+# codex's client-side history can grow to ~850k before it gives up with
+# "Codex ran out of room in the model's context window. Start a new thread
+# or clear earlier history before retrying." — and tinyctx never gets to
+# influence that error path because codex aborts client-side.
+#
+# Two layers of defense:
+#   (1) Set `model_auto_compact_token_limit = 200000` at the TOP LEVEL of
+#       ~/.codex/config.toml so codex itself triggers compact before its
+#       internal 272k ceiling. (Profile-scoped settings don't apply when
+#       running the default profile; this is a known foot-gun.)
+#   (2) Proxy-side fallback (this function): when codex DOESN'T self-compact
+#       in time, tinyctx detects est_tokens above a danger threshold and
+#       silently rewrites the forwarded body — keeps system prompt + most
+#       recent N turns + a single tinyctx-generated summary item replacing
+#       the older middle. The upstream model sees a slim body that fits;
+#       codex's client-side history is unchanged so the UI still shows
+#       every turn.
+#
+# Tradeoff: codex re-sends the bloated history every turn, so we'd compact
+# on every subsequent request. We cache the summary keyed by (session_id,
+# pre-recent-turn-count) so back-to-back turns reuse it cheaply.
+
+# Cache: {(session_id, n_pre_recent_items_hash): summary_text}
+_PROACTIVE_SUMMARY_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _hash_items(items: list) -> str:
+    blob = json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_compaction_request(body: dict[str, Any]) -> bool:
+    """Cheap fingerprint match — same patterns as router.is_compaction_request
+    but without importing router (avoid circular import)."""
+    inst = body.get("instructions") or ""
+    if not isinstance(inst, str):
+        return False
+    s = inst.lower()
+    return ("create a handoff summary" in s
+            or "another llm that will resume the task" in s
+            or "seamlessly continue the work" in s)
+
+
+def _flatten_history_for_summary(items: list, *, max_chars: int = 60_000) -> str:
+    """Mini version of compactor._flatten_history — no role drafts, just a
+    plain transcript blob for a single-pass compactor call."""
+    out: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        role = it.get("role") or it.get("type") or ""
+        content = it.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for c in content:
+                if isinstance(c, dict):
+                    t = c.get("type")
+                    if t in ("text", "input_text", "output_text"):
+                        parts.append(str(c.get("text", "")))
+            text = "\n".join(parts)
+        elif role in ("function_call", "tool_use"):
+            args = it.get("arguments") or it.get("input") or ""
+            text = f"[tool call: {it.get('name','?')}({str(args)[:400]})]"
+        elif role in ("function_call_output", "tool_result"):
+            v = it.get("output") or it.get("content") or ""
+            if isinstance(v, (list, dict)):
+                v = json.dumps(v, ensure_ascii=False)[:1500]
+            text = f"[tool result: {str(v)[:1500]}]"
+        if text and text.strip():
+            out.append(f"<{role}>\n{text.strip()}\n</{role}>")
+    blob = "\n\n".join(out)
+    if len(blob) > max_chars:
+        head = blob[: max_chars // 4]
+        tail = blob[-(3 * max_chars // 4):]
+        blob = head + "\n\n... [middle truncated by tinyctx proactive_compact] ...\n\n" + tail
+    return blob
+
+
+def proactive_compact(
+    body: dict[str, Any],
+    *,
+    session_id: str,
+    est_tokens: int,
+    threshold_tokens: int,
+    recent_keep: int = 8,
+    summarizer: Callable[[str], str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """If `est_tokens >= threshold_tokens`, rewrite `body.input` to:
+        [system items kept as-is]
+        + [single message item with a tinyctx summary of older turns]
+        + [last `recent_keep` items kept as-is]
+
+    Returns (new_body, info_dict). `info_dict` always includes:
+        applied: bool         — whether truncation actually happened
+        reason: str           — human-readable for trace
+        items_before: int
+        items_after: int
+
+    `summarizer` takes the flattened history blob and returns a summary
+    string. If None or it raises, we fall back to a deterministic
+    "[tinyctx: N older turns omitted to fit context]" placeholder so we
+    NEVER fail the request — quality regression beats hard error.
+
+    Skips when:
+      - est_tokens < threshold_tokens
+      - body is itself a codex compaction request (don't compact a compact)
+      - history has fewer items than `recent_keep + 3` (nothing to drop)
+      - body has no `input` array (chat-completions style or odd shape)
+    """
+    info: dict[str, Any] = {"applied": False, "reason": "below_threshold",
+                            "items_before": 0, "items_after": 0}
+
+    if est_tokens < threshold_tokens:
+        return body, info
+
+    if _is_compaction_request(body):
+        info["reason"] = "skip_codex_compaction"
+        return body, info
+
+    items = body.get("input")
+    if not isinstance(items, list):
+        info["reason"] = "no_input_array"
+        return body, info
+
+    info["items_before"] = len(items)
+    if len(items) < recent_keep + 3:
+        info["reason"] = f"too_few_items ({len(items)} < {recent_keep + 3})"
+        return body, info
+
+    # Split: keep system-ish items at the head, summarize middle, keep tail.
+    # Codex puts system bytes in `instructions` (top-level), not in `input`,
+    # so most input items are conversational. We still defensively keep any
+    # leading "system" or "developer" role items at the head.
+    head: list = []
+    rest: list = list(items)
+    while rest:
+        first = rest[0]
+        if isinstance(first, dict):
+            r = first.get("role") or first.get("type") or ""
+            if r in ("system", "developer"):
+                head.append(rest.pop(0))
+                continue
+        break
+
+    if len(rest) <= recent_keep:
+        info["reason"] = f"recent_keep covers all rest ({len(rest)} <= {recent_keep})"
+        return body, info
+
+    middle = rest[:-recent_keep]
+    tail = rest[-recent_keep:]
+
+    cache_key = (session_id, _hash_items(middle))
+    summary_text = _PROACTIVE_SUMMARY_CACHE.get(cache_key)
+    cached = summary_text is not None
+
+    if summary_text is None:
+        blob = _flatten_history_for_summary(middle)
+        if summarizer is not None:
+            try:
+                summary_text = summarizer(blob)
+            except Exception as e:  # noqa: BLE001
+                summary_text = (
+                    f"[tinyctx proactive_compact: summarizer failed ({e!s}); "
+                    f"{len(middle)} older turns omitted to fit context]"
+                )
+        if not summary_text:
+            summary_text = (
+                f"[tinyctx proactive_compact: {len(middle)} older turns "
+                "omitted to fit context. Recent turns and system prompt "
+                "remain. Ask the user if you need details from earlier.]"
+            )
+        _PROACTIVE_SUMMARY_CACHE[cache_key] = summary_text
+
+    summary_item = {
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": (
+                "[tinyctx auto-compact: the conversation is approaching the "
+                "context window limit. Earlier turns have been replaced with "
+                "this summary. The most recent turns follow this message "
+                "verbatim.]\n\n## Handoff summary of earlier turns\n\n"
+                + summary_text
+            ),
+        }],
+    }
+
+    out = deepcopy(body)
+    out["input"] = head + [summary_item] + tail
+
+    info["applied"] = True
+    info["reason"] = (f"est_tokens={est_tokens} >= {threshold_tokens}, "
+                      f"compacted {len(middle)} middle items "
+                      f"({'cached' if cached else 'fresh'} summary)")
+    info["items_after"] = len(out["input"])
+    info["middle_items_compacted"] = len(middle)
+    info["cached"] = cached
+    return out, info
+
+
+def clear_proactive_cache(session_id: str | None = None) -> None:
+    """Test helper: clear the proactive_compact summary cache. Pass a
+    session_id to clear only that session, or None to clear everything."""
+    if session_id is None:
+        _PROACTIVE_SUMMARY_CACHE.clear()
+        return
+    keys_to_drop = [k for k in _PROACTIVE_SUMMARY_CACHE if k[0] == session_id]
+    for k in keys_to_drop:
+        _PROACTIVE_SUMMARY_CACHE.pop(k, None)

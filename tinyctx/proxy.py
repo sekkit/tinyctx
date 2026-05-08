@@ -49,6 +49,7 @@ from .sanitize import (
     dedup_tool_calls,
     inject_responses_defaults,
     normalize_for_chat,
+    proactive_compact,
     purge_failed_tool_inputs,
     rewrite_model,
     expand_mcp_namespaces,
@@ -239,6 +240,31 @@ async def responses(request: Request) -> Any:
             )
         except Exception as e:  # noqa: BLE001
             _log("historian_spawn_failed", session=sid, error=str(e))
+
+    # Proactive history truncation (last line of defense against "Codex
+    # ran out of room"). Fires only when est_tokens crosses
+    # CFG.proactive_compact_threshold AND the request is NOT already a
+    # codex compaction request. Replaces the middle of body.input with a
+    # tinyctx summary item; codex's client-side history is unchanged so
+    # the UI still shows every turn. See sanitize.proactive_compact for
+    # full rationale.
+    if CFG.proactive_compact_threshold > 0 and not decision.is_compaction:
+        summarizer = None  # deterministic placeholder mode (zero added latency)
+        body, pc_info = proactive_compact(
+            body,
+            session_id=sid,
+            est_tokens=decision.est_input_tokens,
+            threshold_tokens=CFG.proactive_compact_threshold,
+            recent_keep=CFG.proactive_compact_recent_keep,
+            summarizer=summarizer,
+        )
+        trace.proactive_compact_applied = pc_info["applied"]
+        trace.proactive_compact_reason = pc_info["reason"]
+        if pc_info["applied"]:
+            trace.proactive_compact_items_before = pc_info["items_before"]
+            trace.proactive_compact_items_after = pc_info["items_after"]
+            trace.proactive_compact_middle_compacted = pc_info.get("middle_items_compacted", 0)
+            _log("proactive_compact", session=sid, **pc_info)
 
     # Inject the advisor sub-agent usage hint into instructions BEFORE
     # rewrite_model — the inject function reads body.model to skip the
