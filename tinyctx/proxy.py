@@ -40,7 +40,7 @@ from .compactor import (
     build_responses_api_sse,
     compact_with_debate,
 )
-from .config import BackendCfg, Config, load_config
+from .config import BackendCfg, Config, effective_proactive_compact_threshold, load_config
 from .continuity import save_compaction
 from . import historian
 from .router import Decision, decide
@@ -325,8 +325,13 @@ async def responses(request: Request) -> Any:
     # since the local backend has 1M context (cost-free to overspend) and
     # the model benefits from full history. Only frontier needs the
     # 272k-ceiling defense + per-token cost discipline.
+    # Effective threshold is derived from frontier.context_window so
+    # swapping models (gpt-5.5 ↔ gemini ↔ smaller) auto-adjusts. Falls
+    # back to the absolute config value if context_window is unset.
+    pc_threshold = effective_proactive_compact_threshold(CFG)
+    trace.proactive_compact_threshold_used = pc_threshold
     pc_should_run = (
-        CFG.proactive_compact_threshold > 0
+        pc_threshold > 0
         and not decision.is_compaction
         and (decision.route == "frontier"
              or not CFG.proactive_compact_only_on_frontier)
@@ -346,7 +351,7 @@ async def responses(request: Request) -> Any:
             body,
             session_id=sid,
             est_tokens=decision.est_input_tokens,
-            threshold_tokens=CFG.proactive_compact_threshold,
+            threshold_tokens=pc_threshold,
             recent_keep=CFG.proactive_compact_recent_keep,
             summarizer=summarizer,
         )

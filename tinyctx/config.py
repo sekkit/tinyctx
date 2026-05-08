@@ -101,6 +101,13 @@ class Config:
         model=_env("TINYCTX_FRONTIER_MODEL", "gpt-5.5") or "",
         wire_api="responses",
         timeout_s=float(_env("TINYCTX_FRONTIER_TIMEOUT_S", "300") or 300),
+        # Codex.app 0.128 hard-codes context_window=272000 for gpt-5.5
+        # in its model catalog. Setting it here lets
+        # `effective_proactive_compact_threshold` derive the right
+        # compact threshold automatically (272k × 0.75 ≈ 204k). Override
+        # in config.toml [frontier] section when using a different
+        # frontier (gemini, opus, etc.).
+        context_window=int(_env("TINYCTX_FRONTIER_CONTEXT_WINDOW", "272000") or 272000),
         supported_tool_types=(),     # empty = keep all
         strip_request_fields=(),     # empty = keep all
         inject_defaults={},          # empty = inject nothing
@@ -175,9 +182,28 @@ class Config:
     # LEVEL of config.toml (profile-scoped doesn't apply to the default
     # profile). Even with that fixed, the proxy needs its own backstop.
     #
-    # 0 = disabled. Default 200_000 stays below codex's 272k internal
-    # ceiling so the slim body fits no matter what codex thinks.
+    # 0 = disabled. Default 200_000 is the ABSOLUTE FALLBACK used only when
+    # frontier.context_window isn't set. The preferred path is dynamic:
+    # tinyctx multiplies the configured frontier context window by
+    # `proactive_compact_safe_fraction` to get the effective threshold,
+    # so swapping models adjusts the threshold automatically.
+    #
+    # Examples (with proactive_compact_safe_fraction=0.75):
+    #   frontier.context_window=272000  (gpt-5.5)   → effective 204000
+    #   frontier.context_window=128000  (small)     → effective  96000
+    #   frontier.context_window=2000000 (gemini)    → effective 1500000
+    #
+    # If neither frontier.context_window nor a custom threshold is set,
+    # we fall back to this absolute number.
+    #
+    # See `effective_proactive_compact_threshold(cfg)`.
     proactive_compact_threshold: int = 200_000
+    # Fraction of frontier.context_window that proactive_compact uses as
+    # its trigger. 0.75 leaves ~25% headroom for output tokens, tools,
+    # and tinyctx's own additions (advisor hint, summary item). Set to
+    # 0.0 to disable auto-derivation and force use of the absolute
+    # `proactive_compact_threshold` value above.
+    proactive_compact_safe_fraction: float = 0.75
     # Number of recent turns kept verbatim during proactive truncation.
     proactive_compact_recent_keep: int = 8
     # When true, summary uses one local-model call per session-summary cache
@@ -225,6 +251,30 @@ class Config:
 
     # Verbose JSONL logging
     verbose: bool = field(default_factory=lambda: (_env("TINYCTX_VERBOSE", "1") or "1") == "1")
+
+
+def effective_proactive_compact_threshold(cfg: "Config") -> int:
+    """Compute the actual proactive_compact threshold for the current
+    runtime, derived from frontier.context_window when available.
+
+    Resolution order:
+      1. If `frontier.context_window > 0` AND
+         `proactive_compact_safe_fraction > 0`:
+         return int(context_window * safe_fraction)
+      2. Else: return cfg.proactive_compact_threshold (absolute fallback)
+
+    Returning 0 disables proactive_compact entirely. The proxy treats 0
+    as "skip the gate".
+
+    This lets users switch frontier models (gpt-5.5 → gemini-2.5 →
+    smaller) and have the threshold track context_window automatically,
+    without rewiring config every time.
+    """
+    cw = getattr(cfg.frontier, "context_window", 0) or 0
+    sf = cfg.proactive_compact_safe_fraction
+    if cw > 0 and sf > 0:
+        return int(cw * sf)
+    return int(cfg.proactive_compact_threshold or 0)
 
 
 def load_config() -> Config:

@@ -98,6 +98,11 @@ class RequestTrace:
     # means the slice boundary cut a real (call, output) pair and we
     # repaired it; 0 means tail was already structurally consistent.
     proactive_compact_synthetic_calls: int = 0
+    # Effective threshold actually used for the gate decision. When 0,
+    # the gate was skipped entirely. When > 0 and not equal to the
+    # config's static `proactive_compact_threshold`, that's the dynamic
+    # value derived from frontier.context_window × safe_fraction.
+    proactive_compact_threshold_used: int = 0
 
     # What we forwarded UPSTREAM (after every transform). Use these to
     # calculate "how many tokens the user actually paid for" vs. what
