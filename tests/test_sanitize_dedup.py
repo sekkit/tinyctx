@@ -239,6 +239,66 @@ def test_inject_advisor_hint_appends_to_instructions():
     assert "spawn_agent" not in body["instructions"]
 
 
+def test_inject_advisor_hint_aligns_with_anthropic_advisor_strategy():
+    """Anthropic's official Advisor Strategy doc lists FOUR concrete
+    triggers + a treatment-of-advice protocol. tinyctx's hint must
+    contain all of them verbatim (or near-verbatim) so the executor
+    model gets the full benefit Anthropic's SWE-bench numbers
+    measured. Source:
+    platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool
+
+    User directive: "需要完整对齐, 不可以省略".
+    """
+    from tinyctx.sanitize import _ADVISOR_HINT
+    txt = _ADVISOR_HINT
+
+    # 1. Conciseness rule (Anthropic claims 35-45% cost reduction).
+    assert "under 100 words" in txt
+    assert "enumerated steps" in txt
+    assert "not explanations" in txt
+
+    # 2. The four trigger rules.
+    # (a) BEFORE substantive work
+    assert "BEFORE substantive work" in txt
+    assert "before writing" in txt
+    assert "before committing to an interpretation" in txt
+    assert "before building on an assumption" in txt
+    # (b) Orientation vs substantive distinction
+    assert "Orientation is not substantive work" in txt
+    # (c) BEFORE declaring done
+    assert "task is complete" in txt or "declaring done" in txt
+    assert "make your deliverable durable" in txt
+    # (d) When stuck
+    assert "stuck" in txt.lower()
+    assert "errors recurring" in txt
+    assert "approach not converging" in txt
+    # (e) When changing approach
+    assert "change of approach" in txt
+
+    # 3. Frequency guidance.
+    assert "longer than a few steps" in txt
+    assert "before committing to an approach and once before declaring done" in txt
+    assert "first call" in txt  # adds most of its value on the first call
+    assert "approach crystallizes" in txt
+
+    # 4. Treatment-of-advice protocol.
+    assert "give it serious weight" in txt.lower()
+    assert "fails empirically" in txt
+    assert "primary-source evidence" in txt
+    assert "passing self-test is not evidence" in txt
+
+    # 5. Reconcile-call pattern (data conflicts with advice).
+    assert "don't silently switch" in txt.lower()
+    assert "reconcile" in txt or "Surface the conflict" in txt
+    assert "which constraint breaks the tie" in txt
+
+    # 6. Mechanism-specific note: spawn_agent only forwards `task`.
+    # tinyctx's reality differs from Anthropic's parameterless advisor()
+    # tool; the hint must call this out so the executor packs context.
+    assert "only forwards the `task` field" in txt
+    assert "pack the task" in txt.lower() or "Pack the task" in txt
+
+
 def test_inject_advisor_hint_includes_output_format_guidance():
     """The hint must also tell the model NOT to wrap final answers in
     `cat << EOF` heredoc — observed in real Codex.app session: model
