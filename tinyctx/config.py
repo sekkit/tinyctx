@@ -184,6 +184,40 @@ class Config:
     # miss. When false, uses a deterministic "N older turns omitted"
     # placeholder (fast, free, lossy).
     proactive_compact_use_summarizer: bool = True
+    # When true, proactive_compact ONLY fires for the frontier route. The
+    # local model has a 1M-context backend (DeepSeek-v4-flash) so compact
+    # is unnecessary AND degrades quality (model loses context). For the
+    # frontier path, every token costs real money and the 272k internal
+    # ceiling matters — compact is essential. Default true per user
+    # directive: "本地的小模型不用太节约 token; 主要是给 frontier 要尽量的优化".
+    proactive_compact_only_on_frontier: bool = True
+
+    # ----- Frontier-only token-budget optimizations ---------------------
+    # Trim the `tools` array down to a working set when forwarding to
+    # frontier. Codex 0.128 sends ~50 tools per request (~10k tokens) but
+    # most sessions only use a handful. Strategy:
+    #   keep tools whose name appears in the most recent `frontier_tools_recent_window`
+    #   input items as a function_call.name, PLUS an essentials allowlist
+    #   so the model never gets stuck without shell/apply_patch/advisor.
+    # Disabled (false) on local because (a) 1M ctx absorbs the cost and
+    # (b) we don't want to surprise the local model by silently dropping
+    # tools mid-conversation.
+    frontier_trim_tools: bool = True
+    frontier_tools_recent_window: int = 30  # how many recent input items to scan
+    frontier_tools_essentials: tuple[str, ...] = (
+        "shell", "apply_patch", "container.exec",
+        "update_plan",
+        "view_image", "image_view",
+        # MCP advisor and the user's most-used MCP tools
+        "mcp__advisor__ask_advisor",
+    )
+
+    # Skip injecting the advisor-sub-agent usage hint when the request is
+    # already routed to frontier. The hint exists to teach the cheap local
+    # model that it CAN escalate to a frontier advisor — pointless on the
+    # frontier itself, where the model IS the advisor. Saves ~1-2k tokens
+    # per frontier request.
+    frontier_skip_advisor_hint: bool = True
 
     # If set, force every request through one of {"local", "frontier", "auto"}.
     # Useful for debugging.

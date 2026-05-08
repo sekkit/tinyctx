@@ -57,6 +57,7 @@ from .sanitize import (
     scrub_unsupported_tools,
     strip_encrypted_content,
     strip_unsupported_responses_fields,
+    trim_tools_for_frontier,
 )
 from .tool_call_translator import ChatToResponsesTranslator, StreamTranslator, rebuild_response
 from .trace import RequestTrace
@@ -248,7 +249,18 @@ async def responses(request: Request) -> Any:
     # tinyctx summary item; codex's client-side history is unchanged so
     # the UI still shows every turn. See sanitize.proactive_compact for
     # full rationale.
-    if CFG.proactive_compact_threshold > 0 and not decision.is_compaction:
+    #
+    # Gated by `proactive_compact_only_on_frontier`: skip when route=local
+    # since the local backend has 1M context (cost-free to overspend) and
+    # the model benefits from full history. Only frontier needs the
+    # 272k-ceiling defense + per-token cost discipline.
+    pc_should_run = (
+        CFG.proactive_compact_threshold > 0
+        and not decision.is_compaction
+        and (decision.route == "frontier"
+             or not CFG.proactive_compact_only_on_frontier)
+    )
+    if pc_should_run:
         summarizer = None  # deterministic placeholder mode (zero added latency)
         body, pc_info = proactive_compact(
             body,
@@ -266,12 +278,27 @@ async def responses(request: Request) -> Any:
             trace.proactive_compact_middle_compacted = pc_info.get("middle_items_compacted", 0)
             trace.proactive_compact_synthetic_calls = pc_info.get("synthetic_call_stubs", 0)
             _log("proactive_compact", session=sid, **pc_info)
+    else:
+        trace.proactive_compact_applied = False
+        trace.proactive_compact_reason = (
+            "skipped_local_route"
+            if decision.route == "local" and CFG.proactive_compact_only_on_frontier
+            else "disabled_or_compaction"
+        )
 
     # Inject the advisor sub-agent usage hint into instructions BEFORE
     # rewrite_model — the inject function reads body.model to skip the
     # advisor's own sub-thread (model="tinyctx-frontier"). After this
     # call, rewrite_model overwrites body.model with the backend's id.
-    body = inject_advisor_hint(body)
+    #
+    # Frontier-only optimization: skip the hint when route=frontier. The
+    # hint teaches the cheap local model that it can escalate to a
+    # frontier advisor — pointless on the frontier itself. Saves ~1-2k
+    # tokens per frontier request.
+    if decision.route == "frontier" and CFG.frontier_skip_advisor_hint:
+        trace.advisor_hint_skipped = True
+    else:
+        body = inject_advisor_hint(body)
 
     if backend.model:
         body = rewrite_model(body, backend.model)
@@ -316,6 +343,37 @@ async def responses(request: Request) -> Any:
     if backend.inject_defaults:
         body = inject_responses_defaults(body, backend.inject_defaults)
         trace.fields_injected = sorted(backend.inject_defaults.keys())
+
+    # Frontier-only: trim the tools array to what was actually used in
+    # the recent window + an essentials allowlist. Codex sends ~50 tools
+    # (~10k tokens) every request; most sessions only call a handful.
+    # Local backend skips this — 1M context absorbs the full catalog
+    # cheaply and we don't want to surprise the local model.
+    if decision.route == "frontier" and CFG.frontier_trim_tools:
+        # Codex 0.128 also exposes any tool whose name starts with
+        # "mcp__advisor__" — the advisor agent route — keep all of those
+        # by name pattern, not just the literal essentials.
+        tools_now = body.get("tools") or []
+        advisor_tool_names = tuple(
+            t.get("name","") for t in tools_now
+            if isinstance(t, dict)
+            and isinstance(t.get("name"), str)
+            and t.get("name","").startswith("mcp__advisor__")
+        )
+        essentials_extended = tuple(CFG.frontier_tools_essentials) + advisor_tool_names
+        body, tt_info = trim_tools_for_frontier(
+            body,
+            recent_window=CFG.frontier_tools_recent_window,
+            essentials=essentials_extended,
+        )
+        trace.tools_trimmed_applied = tt_info["applied"]
+        trace.tools_trimmed_before = tt_info["tools_before"]
+        trace.tools_trimmed_after = tt_info["tools_after"]
+        trace.tools_trimmed_dropped = tt_info["dropped_names"][:30]  # cap
+        if tt_info["applied"]:
+            _log("frontier_trim_tools", session=sid, **{
+                k: v for k, v in tt_info.items() if k != "kept_names"
+            })
 
     _log("route", session=sid, decision=decision.route, reason=decision.reason,
          is_compaction=decision.is_compaction, est_tokens=decision.est_input_tokens,

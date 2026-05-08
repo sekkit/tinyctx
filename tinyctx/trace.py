@@ -109,6 +109,13 @@ class RequestTrace:
     # forwarded_breakdown keys (all int token estimates):
     #   instructions, tools, input, other
 
+    # Frontier-only optimizations
+    advisor_hint_skipped: bool = False
+    tools_trimmed_applied: bool = False
+    tools_trimmed_before: int = 0
+    tools_trimmed_after: int = 0
+    tools_trimmed_dropped: list = field(default_factory=list)
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

@@ -959,6 +959,91 @@ def proactive_compact(
     return out, info
 
 
+def trim_tools_for_frontier(
+    body: dict[str, Any],
+    *,
+    recent_window: int = 30,
+    essentials: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reduce `body["tools"]` to a working set before forwarding to frontier.
+
+    Codex 0.128 sends ~50 tools per request (~10k tokens). Most sessions
+    only call a handful. This filter keeps:
+      (a) any tool whose name appears as a function_call.name within the
+          last `recent_window` items of body.input — i.e. tools the model
+          ACTUALLY USED recently, so it can repeat the pattern;
+      (b) any tool whose name is in `essentials` — guaranteed to remain
+          available even on a fresh turn (shell, apply_patch, advisor, etc.).
+
+    Returns (new_body, info_dict) with info:
+        applied: bool
+        reason: str
+        tools_before, tools_after: int
+        kept_names: list[str]   (sorted, for trace logging)
+        dropped_names: list[str]
+
+    Defensive: if body has no tools, no input, or fewer tools than 5,
+    returns the body unchanged (no point trimming a small list).
+    """
+    info: dict[str, Any] = {"applied": False, "reason": "no_tools",
+                            "tools_before": 0, "tools_after": 0,
+                            "kept_names": [], "dropped_names": []}
+
+    tools = body.get("tools")
+    if not isinstance(tools, list) or len(tools) < 5:
+        info["reason"] = f"few_tools ({len(tools) if isinstance(tools, list) else 0} < 5)"
+        info["tools_before"] = len(tools) if isinstance(tools, list) else 0
+        info["tools_after"] = info["tools_before"]
+        return body, info
+
+    info["tools_before"] = len(tools)
+
+    # Collect tool names actually used in the recent window.
+    items = body.get("input")
+    used_names: set[str] = set()
+    if isinstance(items, list) and items:
+        for it in items[-recent_window:]:
+            if not isinstance(it, dict):
+                continue
+            if it.get("type") in _TOOL_CALL_TYPES:
+                name = it.get("name")
+                if isinstance(name, str):
+                    used_names.add(name)
+
+    keep_set = set(essentials) | used_names
+
+    kept: list = []
+    dropped_names: list[str] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            kept.append(t)
+            continue
+        name = t.get("name") or ""
+        if name in keep_set:
+            kept.append(t)
+        else:
+            dropped_names.append(name)
+
+    if len(kept) == len(tools):
+        info["reason"] = "all_tools_in_keep_set"
+        info["tools_after"] = len(kept)
+        info["kept_names"] = sorted({t.get("name","") for t in kept if isinstance(t, dict)})
+        return body, info
+
+    out = deepcopy(body)
+    out["tools"] = kept
+
+    info["applied"] = True
+    info["reason"] = (
+        f"recent={len(used_names)} essentials={len(essentials)} -> "
+        f"kept {len(kept)}/{len(tools)}"
+    )
+    info["tools_after"] = len(kept)
+    info["kept_names"] = sorted({t.get("name","") for t in kept if isinstance(t, dict)})
+    info["dropped_names"] = sorted(dropped_names)
+    return out, info
+
+
 def clear_proactive_cache(session_id: str | None = None) -> None:
     """Test helper: clear the proactive_compact summary cache. Pass a
     session_id to clear only that session, or None to clear everything."""
