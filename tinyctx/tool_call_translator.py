@@ -393,6 +393,94 @@ def _parse_sse_event(raw: str) -> tuple[str | None, Any]:
         return ev_name, None
 
 
+# Regex matching a markdown-style multiple-choice prompt at the end of a
+# message. Conservative: requires (a) a "请选择 / pick / which / choose"
+# style cue in the last few lines, AND (b) at least 2 enumerated options
+# with `A → ...`, `B. ...`, `1) ...` style markers.
+# Tuned to NOT fire on incidental "option A" mentions inside reasoning.
+_CHOICE_PROMPT_CUE_RE = re.compile(
+    r"(请选择|请选|请决定|哪个|"
+    r"which (?:option|one)|pick (?:one|an option)|choose (?:one|an option)|"
+    r"shall I|should I|do you want)",
+    re.IGNORECASE,
+)
+_CHOICE_OPTION_LINE_RE = re.compile(
+    r"^\s*([A-Da-d1-9])\s*[\.\):\->→]\s*\S+",
+    re.MULTILINE,
+)
+
+
+def _detect_text_choice_prompt(text: str) -> dict[str, list[str]] | None:
+    """Detect a multi-choice prompt at the END of an assistant message
+    (model wrote 'pick A or B' as plain text instead of calling
+    `request_user_input`). Returns {"header": ..., "options": [...]} when
+    confident, None otherwise.
+
+    Conservative: only fires when (1) a cue phrase appears in the last
+    ~600 chars AND (2) at least 2 enumerated option lines (`A → ...`,
+    `1) ...`) appear after that cue. Inside reasoning prose where the
+    model says "option A would be ..." in passing, no match.
+    """
+    if not text or len(text) < 30:
+        return None
+    tail = text[-1500:]  # only inspect tail to avoid mid-message false positives
+    cue = _CHOICE_PROMPT_CUE_RE.search(tail)
+    if not cue:
+        return None
+    after_cue = tail[cue.start():]
+    options = _CHOICE_OPTION_LINE_RE.findall(after_cue)
+    if len(options) < 2:
+        return None
+    # Extract option lines verbatim (label + body)
+    option_texts: list[str] = []
+    for m in re.finditer(r"^\s*([A-Da-d1-9])\s*[\.\):\->→]\s*(.+?)$",
+                         after_cue, re.MULTILINE):
+        label = m.group(1).upper()
+        body = m.group(2).strip().rstrip(",;.")
+        if body:
+            option_texts.append(f"{label}: {body}")
+    if len(option_texts) < 2:
+        return None
+    # Header = the line containing the cue (or the line before options)
+    cue_line = after_cue[:after_cue.find("\n")].strip() if "\n" in after_cue else after_cue.strip()
+    return {"header": cue_line[:200], "options": option_texts}
+
+
+def _try_auto_answer_text_choice(text: str) -> str | None:
+    """Text-level fallback for `_try_auto_answer_user_input`. When the
+    model writes a "pick A or B" prompt as plain text instead of calling
+    `request_user_input`, detect the pattern and route to the advisor
+    anyway. Returns the assistant text suffix to append (advisor's
+    decision) or None when env disabled / no choice detected / advisor
+    failed.
+    """
+    if os.environ.get("TINYCTX_AUTO_USER_INPUT") != "1":
+        return None
+    detected = _detect_text_choice_prompt(text)
+    if not detected:
+        return None
+    header = detected["header"]
+    opts = detected["options"]
+    question = (
+        "The executor wrote a multi-choice prompt as plain text instead of "
+        "calling request_user_input. Pick the best option. Output format:\n"
+        "  Pick: <label> — <one-sentence rationale>\n\n"
+        f"Header: {header}\n\nOptions:\n" + "\n".join(f"  - {o}" for o in opts)
+    )
+    try:
+        from tinyctx.advisor import call_advisor
+        result = call_advisor(
+            question=question,
+            context="text-level choice intercept (TINYCTX_AUTO_USER_INPUT=1)",
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if result.get("error") or not result.get("text"):
+        return None
+    advice = result["text"].strip()
+    return f"\n\n[advisor auto-decision — text-choice intercept]\n{advice}\n"
+
+
 def _try_auto_answer_user_input(arguments_json: str) -> str | None:
     """codex 0.128 emits `request_user_input` (a function tool) when the
     model wants the user to pick an option. By default that bubbles up to
@@ -703,6 +791,15 @@ class ChatToResponsesTranslator:
             _to_drop.append(_idx)
         for _idx in _to_drop:
             del self._tool_calls[_idx]
+
+        # Text-level fallback: even when model writes a "pick A or B"
+        # prompt as plain prose (NOT a request_user_input call), still
+        # intercept it and route to the advisor. Same env switch.
+        # Conservative regex: only fires on enumerated option lists
+        # following a cue phrase, in the message tail.
+        _text_choice = _try_auto_answer_text_choice(self._text_buf)
+        if _text_choice is not None:
+            self._text_buf += _text_choice
 
         yield self._sse("response.output_text.done", {
             "type": "response.output_text.done",

@@ -358,6 +358,129 @@ def test_auto_answer_skips_malformed_or_empty():
             _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
 
 
+def test_detect_text_choice_chinese_arrow_format():
+    """The exact format observed in the live RayNeo session — Chinese
+    cue + A/B options with arrow markers — should be detected."""
+    from tinyctx.tool_call_translator import _detect_text_choice_prompt
+    text = """逆向分析完成。核心发现：
+... [analysis] ...
+
+== 重写方案 ==
+有两个方向：
+
+**方案 A: IMU 自实现 6DoF（推荐）**
+不依赖任何 vendor Binder/AIDL。
+
+**方案 B: RemoteLoader 初始化修复**
+在 JNI 中加载 libRayNeoXRRemoteLoader.so
+
+请选择：
+A → IMU 自实现 6DoF
+B → RemoteLoader 初始化修复
+"""
+    out = _detect_text_choice_prompt(text)
+    assert out is not None, "must detect 请选择 + A → / B → format"
+    assert "请选择" in out["header"]
+    assert any("IMU" in o for o in out["options"])
+    assert any("RemoteLoader" in o for o in out["options"])
+
+
+def test_detect_text_choice_english_format():
+    from tinyctx.tool_call_translator import _detect_text_choice_prompt
+    text = """Here's the situation. Two valid paths:
+
+Which option do you prefer?
+A. Use the existing transaction system
+B. Add a new event-sourcing layer
+C. Hybrid (transactions + outbox)
+"""
+    out = _detect_text_choice_prompt(text)
+    assert out is not None
+    assert len(out["options"]) >= 3
+
+
+def test_detect_text_choice_does_not_fire_on_incidental_mentions():
+    """Must NOT fire when 'option A' or 'option B' is just mentioned
+    in passing inside reasoning prose."""
+    from tinyctx.tool_call_translator import _detect_text_choice_prompt
+    text = ("I considered option A briefly but option B has better "
+            "ergonomics. Option A would require migrating the schema "
+            "which is risky. So I went with B. Done — applied the "
+            "patches and tests pass.")
+    out = _detect_text_choice_prompt(text)
+    assert out is None, \
+        "incidental mentions of options inside prose must not trigger"
+
+
+def test_detect_text_choice_requires_two_plus_options():
+    """A single 'A. blah' line is just numbered prose, not a choice."""
+    from tinyctx.tool_call_translator import _detect_text_choice_prompt
+    text = "Please confirm:\nA. proceed with migration"
+    assert _detect_text_choice_prompt(text) is None
+
+
+def test_text_choice_intercept_disabled_by_default():
+    import os as _os
+    from tinyctx.tool_call_translator import _try_auto_answer_text_choice
+    saved = _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+    try:
+        text = "请选择：\nA → 方案一\nB → 方案二"
+        assert _try_auto_answer_text_choice(text) is None
+    finally:
+        if saved is not None:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
+
+
+def test_text_choice_intercept_calls_advisor_when_enabled():
+    import os as _os
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as _tct
+    captured = {}
+    def fake_call_advisor(question, context="", previous_attempts=""):
+        captured["q"] = question
+        return {"text": "Pick: A — fewer external deps.",
+                "usage": None, "error": None}
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _adv.call_advisor = fake_call_advisor
+    try:
+        text = ("做完逆向分析。\n\n请选择：\n"
+                "A → IMU 自实现 6DoF\n"
+                "B → RemoteLoader 初始化修复")
+        out = _tct._try_auto_answer_text_choice(text)
+        assert out is not None
+        assert "advisor auto-decision" in out
+        assert "text-choice intercept" in out
+        assert "Pick: A" in out
+        assert "IMU" in captured["q"]
+        assert "RemoteLoader" in captured["q"]
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_text_choice_intercept_returns_none_no_match():
+    import os as _os
+    import tinyctx.tool_call_translator as _tct
+    saved = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    try:
+        # plain finish text with no choice prompt → no advisor call needed
+        out = _tct._try_auto_answer_text_choice(
+            "Done. All tests pass. Build successful.")
+        assert out is None
+    finally:
+        if saved is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
+
+
 def test_translator_finish_intercepts_request_user_input_when_enabled():
     """End-to-end: with env on + advisor mocked, the tool_call entry is
     dropped (so codex's request_user_input UI prompt never fires) and the

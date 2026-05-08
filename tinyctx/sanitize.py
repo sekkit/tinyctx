@@ -120,6 +120,18 @@ When you give the user the final summary / conclusion / report at the end of a t
 If you genuinely need to write content to a file, use `apply_patch` (creates the file directly) — never `cat heredoc | tee` and never `cat << EOF > file`. Reserve `exec_command` for shell side-effects (`gradle build`, `pytest`, file inspection), not for prose output.
 
 In short: **prose answers go in the assistant message, files go through apply_patch, shell side-effects go through exec_command.**
+
+## When you need the user to choose between options
+
+If you find yourself wanting to write something like:
+
+```
+请选择：
+A → IMU 自实现 6DoF
+B → RemoteLoader 初始化修复
+```
+
+…stop. Don't put a multiple-choice prompt as plain text in the assistant message. The user has the `request_user_input` tool wired up; **call that tool** with the question and options, and the system will route the choice (either to the user's UI or to an automated frontier advisor, depending on configuration). Plain-text "请选择 A or B" gets the session stuck waiting on a human; the tool gets it routed and answered cleanly.
 """
 
 # Marker the injector looks for to avoid double-injection.
