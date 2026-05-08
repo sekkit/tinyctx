@@ -603,16 +603,27 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                    chat_to_responses: bool = False,
                    trace: RequestTrace | None = None) -> Any:
     timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+    # Transport-level retry. httpx retries ONLY on connection-level
+    # failures (DNS, TCP connect, ConnectError, ConnectTimeout) and
+    # NEVER on HTTP responses (200/4xx/5xx). Exactly the semantics we
+    # want — short DeepSeek hiccups (e.g. 21:49:00 connect timeout
+    # after which codex.app stalled for 2 hours) are retried silently
+    # without exposing the user to error toasts. Genuine server
+    # responses pass through untouched. Set retries=0 to disable.
+    transport = httpx.AsyncHTTPTransport(retries=int(
+        os.environ.get("TINYCTX_UPSTREAM_RETRIES", "1") or 1
+    ))
     if is_stream:
         return StreamingResponse(
             _stream_proxy(url, headers, body, sid, decision, timeout,
+                          transport=transport,
                           translate_tool_calls=translate_tool_calls,
                           chat_to_responses=chat_to_responses,
                           trace=trace),
             media_type="text/event-stream",
         )
     started = time.time()
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
         try:
             r = await client.post(url, headers=headers, json=body)
         except httpx.HTTPError as e:
@@ -655,7 +666,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
 async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         sid: str, decision: Decision,
                         timeout: httpx.Timeout,
-                        *, translate_tool_calls: bool = False,
+                        *, transport: httpx.AsyncBaseTransport | None = None,
+                        translate_tool_calls: bool = False,
                         chat_to_responses: bool = False,
                         trace: RequestTrace | None = None) -> AsyncIterator[bytes]:
     started = time.time()
@@ -693,7 +705,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     upstream_failed = False
     upstream_failure_msg = ""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
             async with client.stream("POST", url, headers=headers, json=body) as r:
                 status = r.status_code
                 if r.status_code >= 400:
