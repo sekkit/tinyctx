@@ -264,6 +264,7 @@ async def responses(request: Request) -> Any:
             trace.proactive_compact_items_before = pc_info["items_before"]
             trace.proactive_compact_items_after = pc_info["items_after"]
             trace.proactive_compact_middle_compacted = pc_info.get("middle_items_compacted", 0)
+            trace.proactive_compact_synthetic_calls = pc_info.get("synthetic_call_stubs", 0)
             _log("proactive_compact", session=sid, **pc_info)
 
     # Inject the advisor sub-agent usage hint into instructions BEFORE
@@ -468,6 +469,30 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         translator = StreamTranslator()
     else:
         translator = None
+    # codex.app's SSE parser raises "stream closed before response.completed"
+    # if we close the stream after `event: error` without emitting a
+    # synthetic terminator. We always end with response.completed so codex
+    # observes a structurally valid SSE close — even when the upstream
+    # itself errored. The completion has status=incomplete so codex still
+    # surfaces the failure correctly.
+    def _terminator_event(message: str, *, status_label: str = "incomplete") -> bytes:
+        rid = "resp_" + uuid4().hex[:24]
+        payload = {
+            "type": "response.completed",
+            "response": {
+                "id": rid,
+                "object": "response",
+                "model": body.get("model") or "tinyctx",
+                "status": status_label,
+                "incomplete_details": {"reason": "tinyctx_proxy_terminator",
+                                       "message": message[:500]},
+                "output": [],
+            },
+        }
+        return f"event: response.completed\ndata: {json.dumps(payload)}\n\n".encode()
+
+    upstream_failed = False
+    upstream_failure_msg = ""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, headers=headers, json=body) as r:
@@ -478,23 +503,37 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     _log("upstream_error", session=sid, status=r.status_code,
                          url=url, body=text[:2000])
                     yield f"event: error\ndata: {json.dumps({'status': r.status_code, 'body': text[:2000]})}\n\n".encode()
-                    return
-                _SESSION_ERROR_STREAK[sid] = 0
-                async for chunk in r.aiter_raw():
-                    bytes_out += len(chunk)
-                    if translator is None:
-                        yield chunk
-                    else:
-                        for out in translator.feed(chunk):
+                    upstream_failed = True
+                    upstream_failure_msg = f"upstream {r.status_code}: {text[:200]}"
+                else:
+                    _SESSION_ERROR_STREAK[sid] = 0
+                    async for chunk in r.aiter_raw():
+                        bytes_out += len(chunk)
+                        if translator is None:
+                            yield chunk
+                        else:
+                            for out in translator.feed(chunk):
+                                yield out
+                    if translator is not None:
+                        for out in translator.flush():
                             yield out
-                if translator is not None:
-                    for out in translator.flush():
-                        yield out
     except httpx.HTTPError as e:
         _SESSION_ERROR_STREAK[sid] += 1
         _log("stream_error", session=sid, error=str(e))
         status = 0
         yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n".encode()
+        upstream_failed = True
+        upstream_failure_msg = f"http error: {e!s}"
+    # Always emit a structurally valid response.completed terminator so
+    # codex.app's SSE parser doesn't raise "stream closed before
+    # response.completed". For the success path we hope the upstream
+    # already emitted its own response.completed; emitting a second one
+    # is fine (codex's parser uses last-wins).
+    try:
+        if upstream_failed:
+            yield _terminator_event(upstream_failure_msg or "tinyctx upstream failure")
+    except Exception:  # noqa: BLE001 — never fail the finally
+        pass
     finally:
         elapsed = round(time.time() - started, 3)
         _log("stream_done", session=sid, route=decision.route, bytes=bytes_out,

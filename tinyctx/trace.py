@@ -93,6 +93,11 @@ class RequestTrace:
     proactive_compact_items_before: int = 0
     proactive_compact_items_after: int = 0
     proactive_compact_middle_compacted: int = 0
+    # Synthetic function_call stubs we inserted into tail to repair
+    # orphan function_call_outputs left after middle-truncation. >0 here
+    # means the slice boundary cut a real (call, output) pair and we
+    # repaired it; 0 means tail was already structurally consistent.
+    proactive_compact_synthetic_calls: int = 0
 
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
