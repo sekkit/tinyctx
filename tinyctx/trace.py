@@ -99,6 +99,16 @@ class RequestTrace:
     # repaired it; 0 means tail was already structurally consistent.
     proactive_compact_synthetic_calls: int = 0
 
+    # What we forwarded UPSTREAM (after every transform). Use these to
+    # calculate "how many tokens the user actually paid for" vs. what
+    # codex.app sent in (est_input_tokens). The diff measures tinyctx's
+    # win.
+    forwarded_bytes: int = 0          # serialized JSON length of forward_body
+    forwarded_tokens_est: int = 0     # cheap char/3.6 estimate
+    forwarded_breakdown: dict = field(default_factory=dict)
+    # forwarded_breakdown keys (all int token estimates):
+    #   instructions, tools, input, other
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

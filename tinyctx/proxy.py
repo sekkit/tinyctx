@@ -347,6 +347,34 @@ async def responses(request: Request) -> Any:
 
     trace.target_url = url
     trace.is_stream = is_stream
+
+    # Measure what we're actually forwarding (post-transform). Lets us
+    # quantify the win from sanitize/proactive_compact and find waste:
+    # `est_input_tokens - forwarded_tokens_est` is the savings, and the
+    # breakdown shows where the remaining tokens go.
+    try:
+        from .router import estimate_tokens, _flatten_text
+        fb_serialized = json.dumps(forward_body, ensure_ascii=False, default=str)
+        trace.forwarded_bytes = len(fb_serialized.encode("utf-8"))
+        trace.forwarded_tokens_est = estimate_tokens(fb_serialized)
+        breakdown: dict[str, int] = {}
+        # instructions
+        inst = forward_body.get("instructions") or ""
+        breakdown["instructions"] = estimate_tokens(inst if isinstance(inst, str) else json.dumps(inst, ensure_ascii=False))
+        # tools
+        tools = forward_body.get("tools") or []
+        breakdown["tools"] = estimate_tokens(json.dumps(tools, ensure_ascii=False, default=str))
+        # input items
+        inp = forward_body.get("input") or forward_body.get("messages") or []
+        breakdown["input"] = estimate_tokens(_flatten_text(inp))
+        # other = everything else
+        other = {k: v for k, v in forward_body.items()
+                 if k not in ("instructions", "tools", "input", "messages")}
+        breakdown["other"] = estimate_tokens(json.dumps(other, ensure_ascii=False, default=str))
+        trace.forwarded_breakdown = breakdown
+    except Exception:  # noqa: BLE001 — instrumentation must never fail forward
+        pass
+
     return await _forward(url, headers, forward_body, is_stream, sid, decision,
                           translate_tool_calls=backend.translate_tool_calls,
                           chat_to_responses=(backend.wire_api != "responses"),
