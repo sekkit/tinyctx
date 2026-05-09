@@ -46,16 +46,40 @@ install_pipx() {
   return 0
 }
 
-# graphify: code knowledge graph + multimodal indexing
-if ! command -v graphify >/dev/null 2>&1; then
-  if command -v pipx >/dev/null 2>&1; then
-    echo "  - installing graphifyy (graphify) via pipx"
-    pipx install graphifyy >/dev/null || echo "    (skip) pipx install graphifyy failed"
-  else
-    echo "  - graphify not installed (skipped: pipx missing)"
-  fi
+# --- 3e. graphify: tree-sitter codebase knowledge graph + codex skill.
+echo "  - bootstrapping graphify (tree-sitter knowledge-graph codex skill)"
+"$ROOT/.venv/bin/python" -m tinyctx.graphify_bootstrap install --quiet \
+     --project "$ROOT" \
+  || echo "    (graphify bootstrap had warnings — run tinyctx-graphify status)"
+
+# --- 3f. scout SessionStart hook: inject scout.md into codex turn 1.
+echo "  - registering scout SessionStart hook in ~/.codex/hooks.json"
+"$ROOT/.venv/bin/python" -m tinyctx.scout_hook_bootstrap install --quiet \
+  || echo "    (scout-hook registration had warnings — run tinyctx-scout-hook status)"
+
+# --- 3a. gitnexus: tree-sitter codebase knowledge-graph MCP server.
+echo "  - bootstrapping gitnexus (tree-sitter knowledge-graph MCP)"
+"$ROOT/.venv/bin/python" -m tinyctx.gitnexus_bootstrap install --quiet \
+  || echo "    (gitnexus bootstrap had warnings — run tinyctx-gitnexus status)"
+
+# --- 3b. serena: LSP-backed symbolic ops MCP server.
+echo "  - bootstrapping serena (LSP symbolic ops MCP)"
+"$ROOT/.venv/bin/python" -m tinyctx.serena_bootstrap install --quiet \
+  || echo "    (serena bootstrap had warnings — run tinyctx-serena status)"
+
+# --- 3c. caveman-shrink: tool-output compression MCP middleware.
+echo "  - bootstrapping caveman-shrink (output compression MCP)"
+"$ROOT/.venv/bin/python" -m tinyctx.caveman_bootstrap install --quiet \
+  || echo "    (caveman bootstrap had warnings — run tinyctx-caveman status)"
+
+# --- 3d. mem0: cross-session project memory (optional dep).
+echo "  - bootstrapping mem0 (cross-session memory, optional)"
+if [ "${TINYCTX_MEM0_DISABLE:-0}" = "1" ]; then
+  echo "    (TINYCTX_MEM0_DISABLE=1; skipping)"
 else
-  echo "  - graphify present: $(command -v graphify)"
+  "$ROOT/.venv/bin/python" -m pip install --quiet 'mem0ai' \
+    && echo "    (mem0ai installed; activate via tinyctx-mem add/search)" \
+    || echo "    (mem0ai install failed; manual: pip install 'tinyctx[mem]')"
 fi
 
 # serena: LSP-backed symbolic ops
@@ -73,23 +97,7 @@ else
   echo "  - serena present"
 fi
 
-# caveman: cross-agent output-token compressor (JuliusBrussee/caveman, MIT).
-# Provides caveman-shrink MCP middleware that compresses tool descriptions
-# and outputs while preserving code/URLs. Replaces our placeholder
-# pre-escalation compressor.
-if [ ! -d "$TINYCTX_HOME/vendor/caveman" ]; then
-  if command -v git >/dev/null 2>&1; then
-    echo "  - cloning caveman into $TINYCTX_HOME/vendor/caveman"
-    mkdir -p "$TINYCTX_HOME/vendor"
-    git clone --depth 1 https://github.com/JuliusBrussee/caveman.git \
-        "$TINYCTX_HOME/vendor/caveman" >/dev/null 2>&1 \
-        || echo "    (skip) caveman clone failed"
-  else
-    echo "  - caveman not installed (skipped: git missing)"
-  fi
-else
-  echo "  - caveman vendored at $TINYCTX_HOME/vendor/caveman"
-fi
+# (caveman handled by step 3c above via tinyctx.caveman_bootstrap)
 
 # --- 4. Print codex config snippet ------------------------------------------
 cat <<'EOF'

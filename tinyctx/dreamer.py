@@ -77,6 +77,12 @@ def cmd_run(args) -> int:
         if _run("keypin scan",
                 ["tinyctx-keypin", "scan", "--root", str(proj)]) != 0:
             fails += 1
+        # Graphify per-project wiring (idempotent; "already configured" if so).
+        # Skips silently when graphify binary isn't installed globally.
+        if _run("graphify wire",
+                ["tinyctx-graphify", "install", "--quiet",
+                 "--project", str(proj)]) != 0:
+            fails += 1
         if args.ingest_mem:
             if _run("mem ingest",
                     ["tinyctx-mem", "ingest-compaction", "--root", str(proj)]) != 0:

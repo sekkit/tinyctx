@@ -125,6 +125,24 @@ class RequestTrace:
     tools_trimmed_after: int = 0
     tools_trimmed_dropped: list = field(default_factory=list)
 
+    # Repeat-Read delta collapse (read_delta.collapse_repeated_reads).
+    # Fires alongside dedup/purge under the cache-aware gate. When it
+    # applied, reads ≥2 of the same path were rewritten as unified
+    # diffs vs. their first occurrence in body.input.
+    read_delta_applied: bool = False
+    read_delta_candidates: int = 0
+    read_delta_replacements: int = 0
+    read_delta_bytes_saved: int = 0
+    read_delta_paths: list = field(default_factory=list)
+
+    # LLMLingua-2 pre-escalation compression (frontier-only, opt-in).
+    # Compresses bulky tool-result payloads before forwarding to frontier
+    # while preserving cache-critical fields (instructions/tools/messages).
+    lingua_applied: bool = False
+    lingua_items_compressed: int = 0
+    lingua_chars_before: int = 0
+    lingua_chars_after: int = 0
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

@@ -43,6 +43,67 @@ cmd_status() {
   fi
 }
 
+# launchd / system spawns may have a minimal PATH; export the dirs
+# where uv / npm / homebrew typically install binaries so each
+# bootstrap can detect already-installed tools (serena, gitnexus, etc.).
+_bootstrap_path() {
+  echo "$HOME/.local/bin:$HOME/.local/node/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+}
+
+_gitnexus_bootstrap_async() {
+  # Fire-and-forget. Detached + nohup'd so we don't block proxy start.
+  # Bootstrap is fully idempotent — fast no-op when already configured.
+  local venv_py="$HOME/dev/tinyctx/.venv/bin/python"
+  [ -x "$venv_py" ] || venv_py="$(command -v python3)"
+  [ -n "$venv_py" ] || return 0
+  (cd "$HOME/dev/tinyctx" 2>/dev/null \
+   && PATH="$(_bootstrap_path)" nohup "$venv_py" \
+        -m tinyctx.gitnexus_bootstrap install --quiet \
+        >> "$LOG_DIR/gitnexus-bootstrap.log" 2>&1 &)
+}
+
+_graphify_bootstrap_async() {
+  # Fire-and-forget. Iterates all registered projects so each codex
+  # session sees the AGENTS.md / hooks.json wiring without manual setup.
+  local venv_py="$HOME/dev/tinyctx/.venv/bin/python"
+  [ -x "$venv_py" ] || venv_py="$(command -v python3)"
+  [ -n "$venv_py" ] || return 0
+  (cd "$HOME/dev/tinyctx" 2>/dev/null \
+   && PATH="$(_bootstrap_path)" nohup "$venv_py" \
+        -m tinyctx.graphify_bootstrap install --quiet --all-registered \
+        >> "$LOG_DIR/graphify-bootstrap.log" 2>&1 &)
+}
+
+_serena_bootstrap_async() {
+  local venv_py="$HOME/dev/tinyctx/.venv/bin/python"
+  [ -x "$venv_py" ] || venv_py="$(command -v python3)"
+  [ -n "$venv_py" ] || return 0
+  (cd "$HOME/dev/tinyctx" 2>/dev/null \
+   && PATH="$(_bootstrap_path)" nohup "$venv_py" \
+        -m tinyctx.serena_bootstrap install --quiet \
+        >> "$LOG_DIR/serena-bootstrap.log" 2>&1 &)
+}
+
+_caveman_bootstrap_async() {
+  local venv_py="$HOME/dev/tinyctx/.venv/bin/python"
+  [ -x "$venv_py" ] || venv_py="$(command -v python3)"
+  [ -n "$venv_py" ] || return 0
+  (cd "$HOME/dev/tinyctx" 2>/dev/null \
+   && PATH="$(_bootstrap_path)" nohup "$venv_py" \
+        -m tinyctx.caveman_bootstrap install --quiet \
+        >> "$LOG_DIR/caveman-bootstrap.log" 2>&1 &)
+}
+
+_scout_hook_bootstrap_async() {
+  local venv_py="$HOME/dev/tinyctx/.venv/bin/python"
+  [ -x "$venv_py" ] || venv_py="$(command -v python3)"
+  [ -n "$venv_py" ] || return 0
+  (cd "$HOME/dev/tinyctx" 2>/dev/null \
+   && PATH="$(_bootstrap_path)" nohup "$venv_py" \
+        -m tinyctx.scout_hook_bootstrap install --quiet \
+        >> "$LOG_DIR/scout-hook-bootstrap.log" 2>&1 &)
+}
+
 cmd_start() {
   if ! check_alive "$LMSTUDIO_URL/v1/models"; then
     red "LMStudio is not responding at $LMSTUDIO_URL."
@@ -62,6 +123,14 @@ cmd_start() {
     if check_alive "$PROXY_URL/"; then break; fi
     sleep 0.3
   done
+
+  # All bootstraps are fully idempotent + async detached so they don't
+  # block proxy startup. Each writes to its own ~/.tinyctx/logs/*.log.
+  _gitnexus_bootstrap_async
+  _graphify_bootstrap_async
+  _serena_bootstrap_async
+  _caveman_bootstrap_async
+  _scout_hook_bootstrap_async
 
   cmd_status
   echo
@@ -96,6 +165,11 @@ cmd_restart() {
     if check_alive "$PROXY_URL/"; then break; fi
     sleep 0.3
   done
+  _gitnexus_bootstrap_async
+  _graphify_bootstrap_async
+  _serena_bootstrap_async
+  _caveman_bootstrap_async
+  _scout_hook_bootstrap_async
   cmd_status
   green "tinyctx restarted."
 }
