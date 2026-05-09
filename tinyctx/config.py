@@ -293,6 +293,24 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
+    # Model-driven escalation: ask the LOCAL model itself whether to
+    # escalate this turn to frontier. Aligned with Anthropic Advisor
+    # Strategy (claude.com/blog/the-advisor-strategy) — the executor
+    # decides, not infrastructure-by-bytes. See tinyctx/self_classify.py
+    # for the prompt and contract.
+    #
+    # Default ON. Adds ~200ms and ~$0.000035 per fresh user query
+    # (tool-result roundtrips skipped). Cached 60s by per-project key
+    # so codex retries don't re-classify.
+    self_classify_enabled: bool = True
+    # P(escalate) >= this → frontier. 0.7 matches the existing trained-
+    # classifier threshold. Lower = more aggressive escalation.
+    self_classify_threshold: float = 0.7
+    # Time budget for the classifier call. If the local model is slow,
+    # we want to fail fast and let the heuristic take over rather than
+    # adding seconds of latency to every turn.
+    self_classify_timeout_s: float = 5.0
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`

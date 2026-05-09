@@ -389,6 +389,48 @@ async def responses(request: Request) -> Any:
                             turn_count=decision.turn_count)
         trace.forced_by_client_model = True
 
+    # Model-driven escalation (Anthropic Advisor Strategy alignment):
+    # ask the LOCAL model itself whether this turn deserves the advisor.
+    # Only runs when:
+    #   - feature is enabled
+    #   - we'd otherwise route to local (don't second-guess explicit
+    #     frontier escalation, force_route, error_streak, compaction)
+    #   - this isn't a force_route / explicit-model override
+    # Failures are silent — the classifier returns None and the
+    # original heuristic decision stands. See tinyctx/self_classify.py.
+    if (CFG.self_classify_enabled
+            and decision.route == "local"
+            and not decision.is_compaction
+            and not trace.forced_by_client_model):
+        try:
+            from . import self_classify
+            api_key = (os.environ.get(CFG.local.api_key_env)
+                       if CFG.local.api_key_env else None)
+            sc = await self_classify.classify(
+                body,
+                local_base_url=CFG.local.base_url,
+                local_model=CFG.local.model,
+                api_key=api_key,
+                timeout_s=CFG.self_classify_timeout_s,
+                scope=proj_sid,
+            )
+            if sc is not None:
+                trace.self_classify_p = sc.p
+                trace.self_classify_reason = sc.reason
+                trace.self_classify_cached = sc.cached
+                if sc.escalate and sc.p >= CFG.self_classify_threshold:
+                    decision = Decision(
+                        "frontier",
+                        f"self-classify p={sc.p:.2f}: {sc.reason}",
+                        is_compaction=decision.is_compaction,
+                        est_input_tokens=decision.est_input_tokens,
+                        turn_count=decision.turn_count,
+                    )
+                    backend = CFG.frontier
+                    trace.self_classify_overrode = True
+        except Exception as e:  # noqa: BLE001 — classifier must never fail forward
+            _log("self_classify_error", session=sid, error=str(e))
+
     trace.route = decision.route
     trace.route_reason = decision.reason
     trace.is_compaction = decision.is_compaction

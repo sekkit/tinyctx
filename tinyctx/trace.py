@@ -145,6 +145,18 @@ class RequestTrace:
     global_agent_rules_injected: bool = False
     global_agent_rules_chars: int = 0
 
+    # Model-driven self-classification (Anthropic Advisor Strategy
+    # aligned): when the proxy asked the local model "should this turn
+    # escalate?", these fields capture its answer. p=0.0 (default)
+    # means classifier didn't run or returned None (skipped — body
+    # wasn't a fresh user query, classifier unreachable, etc.).
+    # `self_classify_overrode` flips the route from local→frontier
+    # based on the classifier's verdict.
+    self_classify_p: float = 0.0
+    self_classify_reason: str = ""
+    self_classify_cached: bool = False
+    self_classify_overrode: bool = False
+
     # Number of SSE keepalive `: tinyctx keepalive\n\n` comment lines
     # emitted during this stream while waiting for upstream chunks. >0
     # means the upstream went silent for at least
