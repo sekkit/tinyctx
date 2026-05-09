@@ -1262,7 +1262,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             _log("soft_completion_classify_skipped",
                                  session=sid,
                                  reason=diag.skipped_reason,
-                                 extracted_text_chars=diag.extracted_text_chars)
+                                 extracted_text_chars=diag.extracted_text_chars,
+                                 raw_buffer_chars=diag.raw_buffer_chars,
+                                 raw_head=diag.raw_buffer_head,
+                                 raw_tail=diag.raw_buffer_tail)
                         elif diag.backend_error:
                             _log("soft_completion_classify_backend_error",
                                  session=sid,

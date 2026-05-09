@@ -265,6 +265,12 @@ class ClassifyDiag:
     backend_status: int = 0         # http status if response received
     raw_content_preview: str = ""   # first 200 chars of upstream content
     extracted_text_chars: int = 0   # how much text the classifier saw
+    # Raw SSE buffer head + tail for debugging: when extraction yields
+    # 0 chars but raw buffer is non-empty, we want to see what shape
+    # the upstream actually sent.
+    raw_buffer_chars: int = 0
+    raw_buffer_head: str = ""
+    raw_buffer_tail: str = ""
 
 
 async def classify_at_stream_end(
@@ -309,6 +315,14 @@ async def classify_at_stream_end_diag(
     diag = ClassifyDiag()
 
     raw = _OUTPUT_BUFFER.get(proj_sid, "")
+    diag.raw_buffer_chars = len(raw)
+    if raw:
+        # Capture head + tail to debug "raw non-empty but extracted 0"
+        # cases. Head shows the SSE event format codex actually emits;
+        # tail shows the closing portion (where soft-punts typically
+        # appear). 400 chars each = ~800 chars of debug payload.
+        diag.raw_buffer_head = raw[:400]
+        diag.raw_buffer_tail = raw[-400:] if len(raw) > 400 else ""
     if not raw:
         diag.skipped_reason = "no_buffer"
         return diag
