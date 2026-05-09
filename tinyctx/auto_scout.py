@@ -168,8 +168,31 @@ def _bootstrap_sync(root: Path, install_graphify: bool) -> None:
         graph_path = cdir / "graph.json"
         graph_path.write_text(json.dumps(graph_data), encoding="utf-8")
 
+        # Build scout.md using the USER'S configured local backend, not
+        # scout.py's hardcoded LMStudio default. Otherwise scout.call_local_model
+        # POSTs to http://127.0.0.1:1234/v1 (LMStudio) and 400s when the
+        # user is actually running DeepSeek / Ollama / vLLM / whatever.
         try:
-            scout.build_scout(graph_path, root, top_k=scout.DEFAULT_TOP_K)
+            from .config import load_config
+            cfg = load_config()
+            backend = cfg.local
+            base_url = backend.base_url or scout.DEFAULT_BASE_URL
+            model = backend.model or scout.DEFAULT_MODEL
+            api_key = (os.environ.get(backend.api_key_env)
+                       if backend.api_key_env else None)
+        except Exception:  # noqa: BLE001
+            base_url = scout.DEFAULT_BASE_URL
+            model = scout.DEFAULT_MODEL
+            api_key = None
+
+        try:
+            scout.build_scout(
+                graph_path, root,
+                top_k=scout.DEFAULT_TOP_K,
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+            )
         except Exception:  # noqa: BLE001 — local model unreachable, etc.
             return
     except Exception:  # noqa: BLE001 — defensive, never bubble up
