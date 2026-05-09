@@ -471,6 +471,27 @@ async def responses(request: Request) -> Any:
         except Exception as e:  # noqa: BLE001 — watchdog must never block
             _log("stuck_loop_error", session=sid, error=str(e))
 
+    # Soft-completion gate: if the previous turn ended with a "soft
+    # punt to user" pattern (matched in the streaming sniffer), inject
+    # an advisor-vet reminder requiring the agent to route any user-
+    # facing question through advisor first. Per user directive: "如果
+    # 非要提问，走 advisor 进行回答". See tinyctx/soft_completion.py.
+    if (CFG.soft_completion_gate_enabled
+            and not decision.is_compaction
+            and not trace.forced_by_client_model):
+        try:
+            from . import soft_completion
+            body, was_gated, gate_pattern = (
+                soft_completion.maybe_inject_soft_completion_gate(
+                    body, proj_sid))
+            if was_gated:
+                trace.soft_completion_gate_injected = True
+                trace.soft_completion_gate_pattern = gate_pattern
+                _log("soft_completion_gate_injected", session=sid,
+                     proj_sid=proj_sid, pattern=gate_pattern)
+        except Exception as e:  # noqa: BLE001
+            _log("soft_completion_gate_error", session=sid, error=str(e))
+
     # Sanitize before any model swap.
     if CFG.sanitize_encrypted_content:
         trace.encrypted_content_stripped = _count_encrypted(body)
@@ -968,6 +989,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     keepalive_interval = CFG.stream_keepalive_interval_s
     keepalives_emitted = 0
 
+    # Soft-completion sniffer state. Reset the per-session output buffer
+    # at start of this stream so we match within THIS turn only. The
+    # flag (in soft_completion module) survives across streams until
+    # the gate injection consumes it on the next request.
+    if CFG.soft_completion_gate_enabled:
+        try:
+            from . import soft_completion
+            soft_completion.reset_stream(sid)
+        except Exception:  # noqa: BLE001 — instrumentation must never fail forward
+            pass
+
     upstream_failed = False
     upstream_failure_msg = ""
     try:
@@ -1051,6 +1083,20 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         continue
                     # tag is None → real response-body chunk
                     bytes_out += len(payload)
+                    # Soft-completion sniffer: scan raw bytes for "soft
+                    # punt to user" patterns. Patterns survive across
+                    # split SSE chunks via per-session ring buffer.
+                    if CFG.soft_completion_gate_enabled:
+                        try:
+                            from . import soft_completion as _sc
+                            matched = _sc.scan_chunk(sid, payload)
+                            if matched and trace is not None and not trace.soft_completion_detected:
+                                trace.soft_completion_detected = True
+                                trace.soft_completion_pattern = matched
+                                _log("soft_completion_detected",
+                                     session=sid, pattern=matched)
+                        except Exception:  # noqa: BLE001
+                            pass
                     if translator is None:
                         yield payload
                     else:
@@ -1089,6 +1135,18 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         _SESSION_ERROR_STREAK[sid] = 0
                         async for chunk in r.aiter_raw():
                             bytes_out += len(chunk)
+                            # Soft-completion sniffer (no-keepalive path)
+                            if CFG.soft_completion_gate_enabled:
+                                try:
+                                    from . import soft_completion as _sc
+                                    matched = _sc.scan_chunk(sid, chunk)
+                                    if matched and trace is not None and not trace.soft_completion_detected:
+                                        trace.soft_completion_detected = True
+                                        trace.soft_completion_pattern = matched
+                                        _log("soft_completion_detected",
+                                             session=sid, pattern=matched)
+                                except Exception:  # noqa: BLE001
+                                    pass
                             if translator is None:
                                 yield chunk
                             else:

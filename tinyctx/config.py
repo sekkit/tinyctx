@@ -335,6 +335,18 @@ class Config:
     # skip the watchdog nudge (it's already doing the right thing).
     stuck_loop_advisor_grace_s: float = 600.0
 
+    # Soft-completion gate: when an agent ends a turn by asking the user
+    # a meta-question ("what would you like to work on next?") instead
+    # of completing tracker items + running verification, the proxy
+    # detects the pattern in the streamed output and on the next request
+    # injects a `<system-reminder>` requiring the agent to vet the
+    # would-be question through advisor first. See soft_completion.py.
+    #
+    # Triggered by live trace 2026-05-10 where stuck_loop saved a
+    # session from a 1300+ turn loop, but the agent then soft-punted
+    # to the user instead of completing the 4 tracker items.
+    soft_completion_gate_enabled: bool = True
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`

@@ -165,6 +165,17 @@ class RequestTrace:
     stuck_reminder_injected: bool = False
     stuck_turn_count_at_inject: int = 0
 
+    # Soft-completion gate. `*_detected` flips True when the streaming
+    # response from upstream matches a "soft punt to user" pattern (per
+    # soft_completion.py). `*_gate_injected` flips True on the *next*
+    # request to the same session, when we inject the advisor-vet
+    # reminder into body.input. Each session can show one detection
+    # per stream and one injection per stream consumed.
+    soft_completion_detected: bool = False
+    soft_completion_pattern: str = ""
+    soft_completion_gate_injected: bool = False
+    soft_completion_gate_pattern: str = ""
+
     # Number of SSE keepalive `: tinyctx keepalive\n\n` comment lines
     # emitted during this stream while waiting for upstream chunks. >0
     # means the upstream went silent for at least
