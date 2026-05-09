@@ -130,17 +130,17 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
         return Decision("frontier", f"error_streak={error_streak} >= threshold",
                         est_input_tokens=est, turn_count=turns)
 
-    # Token-size escalation. Two modes:
-    #   (A) If cfg.local.context_window is set, use it as the source of truth:
-    #       escalate when input exceeds context_window * context_safe_fraction
-    #       (default 0.85). This auto-adapts when the user swaps backends —
-    #       a 32K-context Ollama setup escalates at ~27K, a 1M-context
-    #       DeepSeek setup escalates at ~850K. No manual tuning needed.
-    #   (B) Falls back to the absolute `escalate_input_tokens` threshold
-    #       when context_window is 0/unset (legacy behaviour).
+    # Token-size and turn-count escalation are OPT-IN as of the
+    # Advisor-Strategy alignment (claude.com/blog/the-advisor-strategy).
+    # Anthropic's design has the EXECUTOR MODEL decide when to invoke
+    # the advisor (via spawn_agent / the advisor tool); infrastructure
+    # does not auto-escalate based on byte counts. So defaults below
+    # are 0 = disabled. Users with a small-context local backend
+    # (LMStudio 32k, etc.) can still re-enable by setting non-zero
+    # values in ~/.tinyctx/config.toml.
     local_ctx = getattr(cfg.local, "context_window", 0) if hasattr(cfg, "local") else 0
-    if local_ctx and local_ctx > 0:
-        safe_frac = getattr(cfg.local, "context_safe_fraction", 0.85)
+    safe_frac = getattr(cfg.local, "context_safe_fraction", 0.0) or 0.0
+    if local_ctx and safe_frac > 0:
         cap = int(local_ctx * safe_frac)
         if est >= cap:
             return Decision(
@@ -148,11 +148,11 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
                 f"est_tokens={est} >= {cap} ({safe_frac:.0%} of local ctx {local_ctx})",
                 est_input_tokens=est, turn_count=turns,
             )
-    elif est >= cfg.escalate_input_tokens:
+    elif cfg.escalate_input_tokens and est >= cfg.escalate_input_tokens:
         return Decision("frontier", f"est_tokens={est} >= {cfg.escalate_input_tokens}",
                         est_input_tokens=est, turn_count=turns)
 
-    if turns >= cfg.escalate_turn_count:
+    if cfg.escalate_turn_count and turns >= cfg.escalate_turn_count:
         return Decision("frontier", f"turn_count={turns} >= {cfg.escalate_turn_count}",
                         est_input_tokens=est, turn_count=turns)
 

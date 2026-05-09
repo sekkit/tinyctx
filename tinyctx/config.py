@@ -46,9 +46,13 @@ class BackendCfg:
     #   gpt-5.5 via codex backend: 1_000_000
     context_window: int = 0
     # Escalate to frontier when est_tokens / context_window exceeds this
-    # fraction. 0.85 leaves ~15% headroom for the model's output and
-    # avoids the well-known long-context quality cliff.
-    context_safe_fraction: float = 0.85
+    # fraction.
+    #
+    # 0.0 = disabled (default, aligned with Anthropic Advisor Strategy
+    # — the model decides when to escalate, not infrastructure-by-bytes).
+    # Set to e.g. 0.85 in `~/.tinyctx/config.toml [local]` if you run a
+    # small-context backend that genuinely can't fit a long body.
+    context_safe_fraction: float = 0.0
     # Per-backend tool/field scrubbing. Codex emits tool entries with
     # codex-specific `type` values (web_search, image_generation, namespace)
     # and fields (client_metadata, prompt_cache_key) that strict OpenAI-
@@ -146,10 +150,22 @@ class Config:
         translate_tool_calls=False,  # frontier already returns structured items
     ))
 
-    # Routing thresholds. Conservative defaults — escalate only when needed.
-    escalate_input_tokens: int = 60_000     # estimated input tokens above this -> frontier
-    escalate_turn_count: int = 15           # turn count above this -> frontier
-    escalate_on_error_streak: int = 2       # repeated tool-failure -> frontier
+    # Routing thresholds.
+    #
+    # Aligned with Anthropic's Advisor Strategy: the EXECUTOR MODEL
+    # decides when to escalate, infrastructure does not auto-escalate
+    # based on byte counts. So `escalate_input_tokens` and
+    # `escalate_turn_count` default to 0 = disabled. The model gets the
+    # frontier (via spawn_agent / advisor tool) when IT decides it
+    # needs strategic input — not because we counted bytes.
+    #
+    # If you run a small-context local backend (LMStudio 32k, Ollama
+    # default) where the local truly cannot fit a long body, set these
+    # to positive values in `~/.tinyctx/config.toml [routing]` and the
+    # router will fall back to size-based escalation as a safety net.
+    escalate_input_tokens: int = 0          # 0 = disabled (was 60_000)
+    escalate_turn_count: int = 0            # 0 = disabled (was 15)
+    escalate_on_error_streak: int = 2       # repeated tool-failure -> frontier (kept; Anthropic "when stuck")
 
     # If true, the compaction handoff prompt is always routed to the local model.
     # This is the highest-leverage cost win and the reason this proxy exists.
