@@ -182,7 +182,20 @@ def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
         if v:
             return v
     # fall back to codex's own Authorization header (passthrough mode)
-    return codex_auth
+    if codex_auth:
+        return codex_auth
+    # Last resort: read codex's OAuth access_token from ~/.codex/auth.json so
+    # non-codex clients (task-master, Aider, ...) can share codex's ChatGPT
+    # subscription auth without setting OPENAI_API_KEY. Token rotation is
+    # handled by the codex CLI itself; we just re-read on each request.
+    try:
+        with open(os.path.expanduser("~/.codex/auth.json")) as f:
+            tok = json.load(f).get("tokens", {}).get("access_token")
+        if tok:
+            return tok
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return None
 
 
 def _select_backend(decision: Decision) -> BackendCfg:

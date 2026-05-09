@@ -860,6 +860,38 @@ def test_strip_unsupported_responses_fields_drops_specified():
     assert "client_metadata" in body
 
 
+def test_frontier_default_strips_max_output_tokens():
+    """Regression: chatgpt.com/backend-api/codex (the default frontier
+    backend) returns HTTP 400 'Unsupported parameter: max_output_tokens'
+    when the field is present. Codex.app sends it (default 128000)
+    anyway. The default frontier config must strip it before forward.
+
+    Live error captured 19:40:11 today:
+        upstream_error: 'Unsupported parameter: max_output_tokens'
+    """
+    from tinyctx.config import Config
+    from tinyctx.sanitize import strip_unsupported_responses_fields
+    cfg = Config()
+    assert "max_output_tokens" in cfg.frontier.strip_request_fields, (
+        "frontier default must strip max_output_tokens — chatgpt.com "
+        "codex backend rejects it with HTTP 400"
+    )
+    # End-to-end: a body with max_output_tokens loses it under the
+    # default frontier strip set
+    body = {
+        "model": "gpt-5.5",
+        "max_output_tokens": 128000,
+        "instructions": "x",
+        "input": [],
+    }
+    out = strip_unsupported_responses_fields(
+        body, drop=cfg.frontier.strip_request_fields)
+    assert "max_output_tokens" not in out
+    # Other fields preserved
+    assert out["model"] == "gpt-5.5"
+    assert out["instructions"] == "x"
+
+
 def test_purge_handles_is_error_flag():
     body = {
         "input": [

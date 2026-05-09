@@ -134,7 +134,14 @@ class Config:
         # frontier (gemini, opus, etc.).
         context_window=int(_env("TINYCTX_FRONTIER_CONTEXT_WINDOW", "272000") or 272000),
         supported_tool_types=(),     # empty = keep all
-        strip_request_fields=(),     # empty = keep all
+        # chatgpt.com/backend-api/codex (the default frontier) rejects
+        # `max_output_tokens` with HTTP 400 ("Unsupported parameter").
+        # Codex.app sends it anyway with a default of 128000. Strip on
+        # this path so the request goes through. If you point frontier
+        # at a non-codex OpenAI Responses endpoint that DOES accept
+        # max_output_tokens, override `strip_request_fields=()` in
+        # ~/.tinyctx/config.toml.
+        strip_request_fields=("max_output_tokens",),
         inject_defaults={},          # empty = inject nothing
         translate_tool_calls=False,  # frontier already returns structured items
     ))
