@@ -1062,6 +1062,38 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         except Exception:  # noqa: BLE001 — instrumentation must never fail forward
             pass
 
+    # Stream-rewrite state. If enabled, intercept the first
+    # `response.completed` SSE event in the OUTGOING stream, hold it
+    # while the soft-completion classifier runs, and conditionally
+    # inject a synthetic function_call to advisor BEFORE flushing the
+    # held event. See tinyctx/stream_rewrite.py for rationale + risk.
+    held_completion_buf = bytearray()
+    holding_completion = [False]  # list-wrapped for nonlocal-like closure
+    rewrite_enabled = CFG.soft_completion_stream_rewrite_enabled
+
+    def _intercept_completed(out_bytes: bytes) -> bytes:
+        """Return bytes safe to yield to client. If the response.completed
+        marker is detected, hold the marker (and any subsequent bytes
+        of this and later chunks) in `held_completion_buf` so we can
+        run the classifier first and conditionally inject synthetic
+        events before flushing it. No-op when rewrite is disabled."""
+        if not rewrite_enabled:
+            return out_bytes
+        if holding_completion[0]:
+            # Already holding — append everything else, yield nothing
+            held_completion_buf.extend(out_bytes)
+            return b""
+        try:
+            from . import stream_rewrite as _sr
+        except Exception:  # noqa: BLE001
+            return out_bytes
+        if not _sr.looks_like_response_completed(out_bytes):
+            return out_bytes
+        pre, completed_part = _sr.split_at_completed(out_bytes)
+        holding_completion[0] = True
+        held_completion_buf.extend(completed_part)
+        return pre  # bytes BEFORE the marker — yield those
+
     upstream_failed = False
     upstream_failure_msg = ""
     try:
@@ -1156,13 +1188,77 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         except Exception:  # noqa: BLE001
                             pass
                     if translator is None:
-                        yield payload
+                        out_bytes = _intercept_completed(payload)
+                        if out_bytes:
+                            yield out_bytes
                     else:
                         for out in translator.feed(payload):
-                            yield out
+                            out_bytes = _intercept_completed(out)
+                            if out_bytes:
+                                yield out_bytes
                 if translator is not None and not upstream_failed:
                     for out in translator.flush():
-                        yield out
+                        out_bytes = _intercept_completed(out)
+                        if out_bytes:
+                            yield out_bytes
+
+                # ─── stream-rewrite synthesis ──────────────────────
+                # We held back the response.completed event. Decide
+                # whether to inject a synthetic advisor function_call
+                # in front of it, then flush.
+                if rewrite_enabled and holding_completion[0]:
+                    try:
+                        from . import soft_completion as _sc
+                        from . import stream_rewrite as _sr
+                        api_key = (os.environ.get(CFG.local.api_key_env)
+                                   if CFG.local.api_key_env else None)
+                        buffer_snapshot = _sc._OUTPUT_BUFFER.get(sid, "")
+                        # Synchronous classification — we're at stream
+                        # end, no other bytes flowing. Bounded by
+                        # self_classify_timeout_s (default 30s).
+                        diag = await _sc.classify_at_stream_end_diag(
+                            sid,
+                            local_base_url=CFG.local.base_url,
+                            local_model=CFG.local.model,
+                            api_key=api_key,
+                            timeout_s=CFG.self_classify_timeout_s,
+                            threshold=CFG.self_classify_threshold,
+                            raw_buffer=buffer_snapshot,
+                        )
+                        if (diag.result is not None
+                                and diag.result.soft_punt
+                                and diag.result.p >= CFG.soft_completion_stream_rewrite_threshold):
+                            text_excerpt = _sc._extract_text_from_buffer(
+                                buffer_snapshot)
+                            task_body = _sr.build_task_body(
+                                text_excerpt,
+                                diag.result.reason,
+                                diag.result.p)
+                            for evt in _sr.synthetic_advisor_call_events(
+                                    task_body,
+                                    tool_name=CFG.soft_completion_stream_rewrite_tool_name):
+                                yield evt
+                            _log("soft_completion_stream_rewrite_injected",
+                                 session=sid,
+                                 p=diag.result.p,
+                                 reason=diag.result.reason,
+                                 task_chars=len(task_body))
+                            if trace is not None:
+                                trace.soft_completion_gate_injected = True
+                                trace.soft_completion_gate_pattern = (
+                                    f"stream-rewrite: {diag.result.reason}")[:80]
+                        else:
+                            _log("soft_completion_stream_rewrite_skipped",
+                                 session=sid,
+                                 reason=("not_punt" if diag.result is None
+                                         else f"p={diag.result.p:.2f}"
+                                              f"<{CFG.soft_completion_stream_rewrite_threshold}"))
+                    except Exception as e:  # noqa: BLE001
+                        _log("soft_completion_stream_rewrite_error",
+                             session=sid, error=str(e))
+                    # Always flush the held response.completed at the end
+                    if held_completion_buf:
+                        yield bytes(held_completion_buf)
             finally:
                 if not producer.done():
                     producer.cancel()
@@ -1201,6 +1297,13 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                     _sc.accumulate_chunk(sid, chunk)
                                 except Exception:  # noqa: BLE001
                                     pass
+                            # NOTE: stream rewrite intercept is wired in
+                            # the keepalive path above; this no-keepalive
+                            # branch (CFG.stream_keepalive_interval_s == 0)
+                            # passes chunks through unmodified. Stream
+                            # rewrite without keepalive would need its
+                            # own intercept here too — left as a TODO
+                            # since keepalive is on by default in tinyctx.
                             if translator is None:
                                 yield chunk
                             else:

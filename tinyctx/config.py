@@ -363,6 +363,29 @@ class Config:
     # to the user instead of completing the 4 tracker items.
     soft_completion_gate_enabled: bool = True
 
+    # Stream rewriting: when soft_completion classifier returns PUNT
+    # with confidence ≥ rewrite_threshold, intercept the upstream's
+    # `response.completed` event, run the classifier synchronously,
+    # and if punt → inject a synthetic function_call to the advisor
+    # MCP tool BEFORE the response.completed. Codex sees the function
+    # call, routes to advisor automatically. Bypasses the rule-based
+    # gate (which depends on agent self-discipline).
+    #
+    # Risk profile: relies on codex parsing a synthetic function_call
+    # event. If codex's namespace dispatcher rejects the call (e.g.
+    # the codex 0.128 "unsupported call" issue noted in
+    # ~/.codex/config.toml), the rewrite would surface as an error in
+    # codex chat. Default OFF until validated against live codex.
+    soft_completion_stream_rewrite_enabled: bool = False
+    # Confidence required for the synthetic function_call rewrite.
+    # Higher than the gate threshold (0.7) since the rewrite is more
+    # invasive — only act on high-confidence verdicts.
+    soft_completion_stream_rewrite_threshold: float = 0.85
+    # MCP tool name for the synthetic call. Codex's MCP namespace
+    # dispatcher exposes advisor as `mcp__advisor__ask_advisor`. If a
+    # codex version returns "unsupported call" for that, override here.
+    soft_completion_stream_rewrite_tool_name: str = "mcp__advisor__ask_advisor"
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`
