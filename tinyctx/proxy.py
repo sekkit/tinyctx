@@ -70,6 +70,14 @@ from .trace import RequestTrace
 CFG: Config = load_config()
 APP = FastAPI(title="tinyctx", version="0.1.0")
 
+# Mount the live dashboard at /dashboard. Five endpoints; vanilla HTML+JS;
+# zero new deps. See tinyctx/dashboard.py.
+try:
+    from . import dashboard as _dashboard
+    _dashboard.register(APP, CFG.log_dir)
+except Exception as _e:  # noqa: BLE001 — dashboard must never block proxy boot
+    sys.stderr.write(f"tinyctx dashboard register failed: {_e}\n")
+
 # Per-session error streak counter for cascade escalation.
 _SESSION_ERROR_STREAK: dict[str, int] = defaultdict(int)
 
