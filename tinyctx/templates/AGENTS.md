@@ -45,6 +45,12 @@
   - 输出"完成 / 全部搞定 / Final summary / All done / 任务结束"等收工性总结之前，必须先逐条 enumerate 当前 progress tracker（含 update_plan / TodoWrite / "进度"面板等）的所有项；每项要么标为 completed（附 commit hash、构建/测试结果、或其他可验证证据），要么明确写 `de-scoped: <原因>`。未到这一步禁止生成任何收工性总结。
   - 用户原始目标里的可验证收尾步骤（例如 "Final build and verify"、"跑测试"、"启动服务确认"）属于硬要求；跳过必须显式 de-scope 并说明为何当前会话无法执行。
   - 不要因为已经做了多步、已经产出多个 commit、或已经生成很多内容就主观判断"够了"。继续与否取决于 tracker 是否清空，不取决于工作量。
+  - **非平凡任务的 advisor 完成闸门 (mandatory advisor gate)**：满足以下任一条件时，在 enumerate tracker 之后、输出收工总结之前，必须先调用一次 advisor 做独立"完成审阅"（具体调用模式见末节 "完成审阅 advisor 模式"），并把 advisor 的 verdict 落进总结里：
+      - progress tracker 曾有 ≥3 项
+      - 本会话累计 ≥3 个 commit
+      - 累计修改 ≥5 个文件
+      - 用户目标含构建 / 测试 / 部署 / 启动 / 验收等可验证收尾步骤
+    收到 `fix: ...` 必须先处理再继续；收到 `ship: ...` 才能输出 Final summary。
 
 ## 5. 风险与优先级
 - L1：生产数据变更/删除、敏感信息泄露、不可逆操作。必须先说明影响、风险、回滚，再二次确认。
@@ -100,6 +106,7 @@ You have a `spawn_agent(role="advisor", task=...)` sub-agent backed by a frontie
 - You've **tried and failed at the same problem twice** and need a fresh angle — not another exec_command, but a different perspective.
 - You're about to make a **non-trivial security / correctness decision** (auth flow, schema migration, transaction boundary).
 - The user's **intent is ambiguous** and the wrong interpretation will waste significant work.
+- You're **about to declare a non-trivial task DONE** — see 完成审阅 advisor 模式 below. This is the strongest signal in practice: a frontier reviewer catches premature-completion bias the executor cannot see in itself.
 
 Do NOT use it for routine edits, syntax lookups, scanning files, or padding answers. The advisor is for HARD decisions only.
 
@@ -116,6 +123,41 @@ wait_agent(...)
 ```
 
 Each call costs ~5-10K frontier tokens. Budget ~3 advisor calls per task. The advisor sees ONLY what you put in `task`, not your conversation — pack the context tight.
+
+### 完成审阅 advisor 模式 (Completion Review Pattern)
+
+For the §4 收工纪律 advisor gate, use this exact shape:
+
+```
+spawn_agent(role="advisor",
+    task="""
+Verify whether this task is actually complete.
+
+Original user goal: <one-sentence restatement of what the user asked for>
+
+Progress tracker (every item must be either completed-with-evidence or explicitly de-scoped):
+  1. <item>  — completed (evidence: <commit hash / test name+result / file path / build log line>)
+  2. <item>  — de-scoped (reason: <one-sentence reason>)
+  …
+
+Hard verifications I claim done (build / test / deploy / smoke / start):
+  - <step>  — evidence: <log snippet, exit code, screenshot path>
+
+What I am about to write as the Final summary:
+<draft 1-3 sentences>
+
+Reply with EXACTLY one of:
+  - ship: <one-line confirmation> — task is genuinely done; safe to summarize.
+  - fix: <bullet list of missing / insufficient / mis-claimed items> — must address before summarizing.
+""")
+wait_agent(...)
+```
+
+Rules:
+- If reply starts with `fix:`, do NOT summarize. Address each item, then re-call this gate. (The gate may legitimately fire 2× per task; >2 is a smell — re-read the original goal.)
+- If reply starts with `ship:`, proceed with the Final summary and cite the advisor verdict in one line ("Advisor: ship — <reason>").
+- Pack evidence specifically. "Built successfully" without a build log line is insufficient; "ran `./gradlew build` → BUILD SUCCESSFUL in 27s, exit 0" is sufficient.
+- The advisor sees nothing of your conversation, so the tracker enumeration in the task body must be self-contained.
 
 ## Routing visibility
 
