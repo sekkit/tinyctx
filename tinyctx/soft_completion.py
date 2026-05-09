@@ -308,13 +308,21 @@ async def classify_at_stream_end_diag(
         api_key: str | None = None,
         timeout_s: float = 30.0,
         threshold: float = 0.7,
+        raw_buffer: str | None = None,
 ) -> ClassifyDiag:
     """Same as `classify_at_stream_end` but returns a `ClassifyDiag`
     capturing why the call returned None (for logging in the proxy
-    integration). Never raises."""
+    integration). Never raises.
+
+    `raw_buffer` parameter: when supplied, classify against this
+    snapshot instead of reading from the per-session module dict. The
+    proxy passes its own snapshot at task-SPAWN time to avoid a race
+    where the bg task was delayed by event-loop pressure (next stream
+    serving) and ended up reading a buffer the next stream had already
+    `reset_stream`'d. None falls back to dict read for test/dev paths."""
     diag = ClassifyDiag()
 
-    raw = _OUTPUT_BUFFER.get(proj_sid, "")
+    raw = raw_buffer if raw_buffer is not None else _OUTPUT_BUFFER.get(proj_sid, "")
     diag.raw_buffer_chars = len(raw)
     if raw:
         # Capture head + tail to debug "raw non-empty but extracted 0"

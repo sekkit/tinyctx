@@ -1237,8 +1237,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 from . import soft_completion as _sc
                 api_key = (os.environ.get(CFG.local.api_key_env)
                            if CFG.local.api_key_env else None)
+                # Snapshot the buffer at SPAWN time, not at task-run time.
+                # Without this, asyncio scheduling delay (event loop busy
+                # serving the next stream) could cause the bg task to read
+                # a buffer that the next stream had already `reset_stream`
+                # and not yet refilled — leading to spurious "no_buffer"
+                # / "short_text text_chars=0" skips. Closure-capture the
+                # snapshot so the dict isn't consulted later.
+                buffer_snapshot = _sc._OUTPUT_BUFFER.get(sid, "")
                 async def _bg_classify():
-                    _log("soft_completion_classify_started", session=sid)
+                    _log("soft_completion_classify_started", session=sid,
+                         buffer_chars_at_spawn=len(buffer_snapshot))
                     try:
                         diag = await _sc.classify_at_stream_end_diag(
                             sid,
@@ -1247,6 +1256,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             api_key=api_key,
                             timeout_s=CFG.self_classify_timeout_s,
                             threshold=CFG.self_classify_threshold,
+                            raw_buffer=buffer_snapshot,
                         )
                         # Always log the outcome — even None paths, so
                         # silent-skip cases are diagnosable. One of the
