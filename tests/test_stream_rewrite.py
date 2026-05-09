@@ -146,12 +146,40 @@ def test_build_task_body_caps_excerpt_at_1500_chars():
 # ─── default config + flag wiring ─────────────────────────────────────────
 
 
-def test_config_default_disabled():
-    """Stream rewrite is OFF by default — opt-in via config.toml."""
+def test_config_default_enabled_codex_native():
+    """Stream rewrite is ON by default after the user's directive
+    "默认就激活". Tool name uses codex 0.128+'s native spawn_agent
+    primitive (the MCP path hits a dispatcher bug on this version)."""
     from tinyctx.config import Config
     cfg = Config()
-    assert cfg.soft_completion_stream_rewrite_enabled is False
+    assert cfg.soft_completion_stream_rewrite_enabled is True
     # Threshold sane (between 0.7 gate threshold and 1.0)
     assert 0.7 < cfg.soft_completion_stream_rewrite_threshold <= 1.0
-    # Tool name default is the standard MCP advisor binding
-    assert "advisor" in cfg.soft_completion_stream_rewrite_tool_name
+    # Default tool: codex native sub-agent dispatcher
+    assert cfg.soft_completion_stream_rewrite_tool_name == "spawn_agent"
+    # Extra args: spawn_agent needs role=advisor
+    assert cfg.soft_completion_stream_rewrite_extra_args == {"role": "advisor"}
+
+
+def test_synthetic_events_with_extra_args_includes_role():
+    """spawn_agent path: extra_args={"role":"advisor"} must appear in
+    the arguments JSON. Args are JSON-encoded into a string, then
+    embedded inside the SSE data: payload's own JSON — so role/advisor
+    appear as backslash-escaped substrings."""
+    from tinyctx.stream_rewrite import synthetic_advisor_call_events
+    events = synthetic_advisor_call_events(
+        task="my task", extra_args={"role": "advisor"})
+    # Decode the args JSON from the .done event (cleaner inspection
+    # than scanning the stringly-encoded SSE bytes).
+    done_blob = events[-1].decode("utf-8")
+    # Find data: line, parse, navigate to item.arguments, parse THAT JSON
+    import json as _j
+    for line in done_blob.splitlines():
+        if line.startswith("data: "):
+            outer = _j.loads(line[len("data: "):])
+            args_str = outer["item"]["arguments"]
+            args_obj = _j.loads(args_str)
+            assert args_obj["task"] == "my task"
+            assert args_obj["role"] == "advisor"
+            return
+    raise AssertionError("no data: line in synthetic event")

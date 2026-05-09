@@ -116,22 +116,35 @@ def build_task_body(
 
 def synthetic_advisor_call_events(
         task: str,
-        tool_name: str = "mcp__advisor__ask_advisor",
+        tool_name: str = "spawn_agent",
         output_index: int = 99,
+        extra_args: dict[str, Any] | None = None,
 ) -> list[bytes]:
     """Synthesize the SSE event sequence that codex parses as a
-    function_call to the advisor MCP tool. Sequence (Responses-API):
+    function_call to advisor. Sequence (Responses-API):
 
       1. response.output_item.added         — item is a function_call
       2. response.function_call_arguments.delta  — streams the args JSON
       3. response.function_call_arguments.done   — finalizes args
       4. response.output_item.done          — item complete
 
-    Codex's tool dispatcher reads name + arguments and routes to MCP.
+    `tool_name` defaults to `spawn_agent` (codex's native sub-agent
+    dispatcher; routes via `[agents.advisor]` config when role=advisor).
+    Override to `mcp__advisor__ask_advisor` for codex < 0.128 / MCP-only
+    setups.
+
+    `extra_args` is merged into the call's arguments JSON alongside
+    `task` — e.g. `{"role": "advisor"}` for spawn_agent. None defaults
+    to no extra args (caller's task is the sole arg).
+
     `output_index` defaults to 99 to avoid colliding with upstream's
     own indexed items (which start at 0)."""
     item_id = "fc_tinyctx_" + uuid4().hex[:16]
     args_obj: dict[str, Any] = {"task": task}
+    if extra_args:
+        # Caller's keys take precedence over `task` if collision (rare).
+        args_obj = {**args_obj, **extra_args}
+        args_obj["task"] = task  # ensure task always present
     args_json = json.dumps(args_obj, ensure_ascii=False)
 
     item_skeleton: dict[str, Any] = {

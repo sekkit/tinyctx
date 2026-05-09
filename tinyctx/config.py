@@ -376,15 +376,23 @@ class Config:
     # the codex 0.128 "unsupported call" issue noted in
     # ~/.codex/config.toml), the rewrite would surface as an error in
     # codex chat. Default OFF until validated against live codex.
-    soft_completion_stream_rewrite_enabled: bool = False
+    soft_completion_stream_rewrite_enabled: bool = True
     # Confidence required for the synthetic function_call rewrite.
     # Higher than the gate threshold (0.7) since the rewrite is more
     # invasive — only act on high-confidence verdicts.
     soft_completion_stream_rewrite_threshold: float = 0.85
-    # MCP tool name for the synthetic call. Codex's MCP namespace
-    # dispatcher exposes advisor as `mcp__advisor__ask_advisor`. If a
-    # codex version returns "unsupported call" for that, override here.
-    soft_completion_stream_rewrite_tool_name: str = "mcp__advisor__ask_advisor"
+    # Function name for the synthetic call. Codex 0.128+ supports the
+    # native sub-agent primitive `spawn_agent` — `~/.codex/config.toml`
+    # `[agents.advisor]` registration makes `role="advisor"` route to
+    # the configured advisor agent. The legacy `mcp__advisor__ask_advisor`
+    # MCP tool hits codex's namespace dispatcher bug on 0.128 and
+    # returns "unsupported call". Override here for older codex.
+    soft_completion_stream_rewrite_tool_name: str = "spawn_agent"
+    # Extra arguments merged into the synthetic call's `arguments` JSON
+    # alongside `task`. For `spawn_agent` codex requires `role` to pick
+    # which sub-agent to dispatch to.
+    soft_completion_stream_rewrite_extra_args: dict[str, str] = field(
+        default_factory=lambda: {"role": "advisor"})
 
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many

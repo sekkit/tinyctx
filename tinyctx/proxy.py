@@ -1236,7 +1236,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 diag.result.p)
                             for evt in _sr.synthetic_advisor_call_events(
                                     task_body,
-                                    tool_name=CFG.soft_completion_stream_rewrite_tool_name):
+                                    tool_name=CFG.soft_completion_stream_rewrite_tool_name,
+                                    extra_args=dict(CFG.soft_completion_stream_rewrite_extra_args)):
                                 yield evt
                             _log("soft_completion_stream_rewrite_injected",
                                  session=sid,
