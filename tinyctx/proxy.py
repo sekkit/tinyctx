@@ -1238,8 +1238,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 api_key = (os.environ.get(CFG.local.api_key_env)
                            if CFG.local.api_key_env else None)
                 async def _bg_classify():
+                    _log("soft_completion_classify_started", session=sid)
                     try:
-                        result = await _sc.classify_at_stream_end(
+                        diag = await _sc.classify_at_stream_end_diag(
                             sid,
                             local_base_url=CFG.local.base_url,
                             local_model=CFG.local.model,
@@ -1247,12 +1248,35 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             timeout_s=CFG.self_classify_timeout_s,
                             threshold=CFG.self_classify_threshold,
                         )
-                        if result is not None:
+                        # Always log the outcome — even None paths, so
+                        # silent-skip cases are diagnosable. One of the
+                        # following branches always fires:
+                        if diag.result is not None:
                             _log("soft_completion_classified",
                                  session=sid,
-                                 soft_punt=result.soft_punt,
-                                 p=result.p,
-                                 reason=result.reason)
+                                 soft_punt=diag.result.soft_punt,
+                                 p=diag.result.p,
+                                 reason=diag.result.reason,
+                                 extracted_text_chars=diag.extracted_text_chars)
+                        elif diag.skipped_reason:
+                            _log("soft_completion_classify_skipped",
+                                 session=sid,
+                                 reason=diag.skipped_reason,
+                                 extracted_text_chars=diag.extracted_text_chars)
+                        elif diag.backend_error:
+                            _log("soft_completion_classify_backend_error",
+                                 session=sid,
+                                 error=diag.backend_error,
+                                 status=diag.backend_status,
+                                 extracted_text_chars=diag.extracted_text_chars)
+                        else:
+                            # Parse failure — backend returned 200 but
+                            # content didn't yield a verdict.
+                            _log("soft_completion_classify_parse_failed",
+                                 session=sid,
+                                 status=diag.backend_status,
+                                 raw_preview=diag.raw_content_preview,
+                                 extracted_text_chars=diag.extracted_text_chars)
                     except Exception as e:  # noqa: BLE001
                         _log("soft_completion_classify_error",
                              session=sid, error=str(e))

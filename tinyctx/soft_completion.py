@@ -211,7 +211,10 @@ def _extract_text_from_buffer(buf: str) -> str:
             pieces.append(raw)
     text = "".join(pieces)
     # Last 4KB — soft-punt signals are in the closing portion of the
-    # response, not the body.
+    # response, not the body. The configured local backends (DeepSeek
+    # 1M, qwen3 256K+ builds) all comfortably fit this plus the
+    # classifier system prompt; we don't optimize for tiny-context
+    # builds.
     return text[-4000:]
 
 
@@ -250,6 +253,20 @@ def get_flag(proj_sid: str) -> dict[str, Any] | None:
 # ─── stream-end classifier (async) ─────────────────────────────────────────
 
 
+@dataclass
+class ClassifyDiag:
+    """Outcome breakdown for a classify_at_stream_end call. Used by the
+    proxy to log which path the function took (success / short-text /
+    backend-error / parse-failed) so silent-None failures aren't a
+    black box. Only `result` is non-None on a successful classification."""
+    result: ClassifyResult | None = None
+    skipped_reason: str = ""        # "short_text" / "no_buffer" / ""
+    backend_error: str = ""         # str(exception) on backend failure
+    backend_status: int = 0         # http status if response received
+    raw_content_preview: str = ""   # first 200 chars of upstream content
+    extracted_text_chars: int = 0   # how much text the classifier saw
+
+
 async def classify_at_stream_end(
         proj_sid: str,
         local_base_url: str,
@@ -264,15 +281,45 @@ async def classify_at_stream_end(
     `soft_punt: true && p >= threshold`. Returns the result for trace
     logging (or None on early-skip / failure).
 
+    For richer diagnostics use `classify_at_stream_end_diag` — this
+    function is the thin wrapper that just returns the result, kept for
+    backward-compatible callers / tests.
+
     Designed to be spawned as `asyncio.create_task(...)` from the
     stream-end finally block — it should not block the request return.
     Never raises — silent fallback (no flag set) on backend error."""
+    diag = await classify_at_stream_end_diag(
+        proj_sid, local_base_url, local_model,
+        api_key=api_key, timeout_s=timeout_s, threshold=threshold)
+    return diag.result
+
+
+async def classify_at_stream_end_diag(
+        proj_sid: str,
+        local_base_url: str,
+        local_model: str,
+        *,
+        api_key: str | None = None,
+        timeout_s: float = 30.0,
+        threshold: float = 0.7,
+) -> ClassifyDiag:
+    """Same as `classify_at_stream_end` but returns a `ClassifyDiag`
+    capturing why the call returned None (for logging in the proxy
+    integration). Never raises."""
+    diag = ClassifyDiag()
+
     raw = _OUTPUT_BUFFER.get(proj_sid, "")
+    if not raw:
+        diag.skipped_reason = "no_buffer"
+        return diag
+
     text = _extract_text_from_buffer(raw)
+    diag.extracted_text_chars = len(text)
     # Skip very short outputs — likely tool-call-only turns where the
     # classifier has nothing meaningful to judge.
     if len(text) < 200:
-        return None
+        diag.skipped_reason = "short_text"
+        return diag
 
     payload = {
         "model": local_model,
@@ -295,15 +342,22 @@ async def classify_at_stream_end(
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout_s)) as client:
             r = await client.post(url, json=payload, headers=headers)
+        diag.backend_status = r.status_code
         r.raise_for_status()
         data = r.json()
         out = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except Exception:  # noqa: BLE001
-        return None
+        diag.raw_content_preview = (out or "")[:200]
+    except Exception as exc:  # noqa: BLE001
+        diag.backend_error = f"{type(exc).__name__}: {exc!s}"[:200]
+        return diag
 
     result = _parse_response(out)
     if result is None:
-        return None
+        # Parse failed — leave the raw_content_preview populated for
+        # debug. Proxy integration will log it.
+        return diag
+
+    diag.result = result
     if result.soft_punt and result.p >= threshold:
         _SOFT_COMPLETION_FLAG[proj_sid] = {
             "active": True,
@@ -311,7 +365,7 @@ async def classify_at_stream_end(
             "p": result.p,
             "ts": time.time(),
         }
-    return result
+    return diag
 
 
 # ─── gate injection ────────────────────────────────────────────────────────

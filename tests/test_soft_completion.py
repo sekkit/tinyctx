@@ -117,8 +117,9 @@ def test_extract_text_no_match_returns_tail():
     from tinyctx.soft_completion import _extract_text_from_buffer
     raw = "x" * 5000 + "tail content"
     text = _extract_text_from_buffer(raw)
-    # tail content is at the very end, within last 4KB
+    # tail content is at the very end, within the cap
     assert "tail content" in text
+    assert len(text) <= 4000
 
 
 # ─── accumulator ──────────────────────────────────────────────────────────
@@ -271,6 +272,79 @@ def test_classify_below_threshold_no_flag():
         assert result.soft_punt is True
         assert result.p == 0.5
         assert soft_completion.get_flag("p1") is None  # below threshold
+    finally:
+        httpd.shutdown()
+
+
+def test_classify_diag_short_text_returns_skipped_reason():
+    """Diag path: short text → skipped_reason='short_text', no backend call."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    soft_completion.accumulate_chunk("p1", b"hi")  # < 200 chars
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",  # would fail if reached
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7))
+    assert diag.result is None
+    assert diag.skipped_reason == "short_text"
+    assert diag.backend_error == ""
+
+
+def test_classify_diag_no_buffer_returns_no_buffer():
+    """Diag path: empty buffer → skipped_reason='no_buffer'."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "never_seen",
+            local_base_url="http://127.0.0.1:1/v1",
+            local_model="fake",
+            timeout_s=0.5))
+    assert diag.result is None
+    assert diag.skipped_reason == "no_buffer"
+
+
+def test_classify_diag_backend_error_captured():
+    """Diag path: backend unreachable → backend_error populated."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",
+            local_model="fake",
+            timeout_s=0.5))
+    assert diag.result is None
+    assert diag.backend_error  # non-empty
+    assert diag.skipped_reason == ""
+    # Extracted text was captured even though backend failed
+    assert diag.extracted_text_chars > 0
+
+
+def test_classify_diag_parse_failed_captures_raw():
+    """Diag path: backend returns garbage → raw_content_preview populated."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    httpd, port = _spawn_fake_backend("just prose, no JSON at all")
+    try:
+        diag = asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7))
+        assert diag.result is None
+        assert diag.backend_error == ""
+        assert diag.skipped_reason == ""
+        assert "just prose" in diag.raw_content_preview
+        assert diag.backend_status == 200
     finally:
         httpd.shutdown()
 
