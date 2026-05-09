@@ -145,6 +145,14 @@ class RequestTrace:
     global_agent_rules_injected: bool = False
     global_agent_rules_chars: int = 0
 
+    # Number of SSE keepalive `: tinyctx keepalive\n\n` comment lines
+    # emitted during this stream while waiting for upstream chunks. >0
+    # means the upstream went silent for at least
+    # `stream_keepalive_interval_s` seconds at least once. Each
+    # keepalive is ~24 bytes — negligible cost, prevents idle timeouts
+    # on slow model thinking turns.
+    keepalives_emitted: int = 0
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

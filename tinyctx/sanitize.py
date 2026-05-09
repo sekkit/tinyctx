@@ -400,7 +400,12 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "model": body.get("model"),
         "messages": [],
-        "stream": body.get("stream", True),
+        # Default to non-stream to match _run_forward's is_stream default of
+        # False. Mismatched defaults caused upstream to return SSE while the
+        # non-stream forward path tried to parse it as JSON (clients like
+        # Vercel AI SDK's generateObject hit /v1/responses without a stream
+        # field).
+        "stream": body.get("stream", False),
     }
     # carry over a few common knobs if present
     for k in ("temperature", "top_p", "max_tokens", "tool_choice", "stop"):

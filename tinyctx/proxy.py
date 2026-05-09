@@ -176,6 +176,73 @@ def _get_dotted(d: dict[str, Any], path: str) -> Any:
     return cur
 
 
+def _chat_to_responses_payload(chat: dict[str, Any]) -> dict[str, Any]:
+    """Convert a non-streaming OpenAI chat-completions response JSON into
+    a Responses-API response JSON. Mirrors what ChatToResponsesTranslator
+    does for the streaming path. DeepSeek-style `reasoning_content` is
+    surfaced as a Responses-API reasoning item before the assistant
+    message; tool calls are surfaced as function_call items.
+    """
+    rid = "resp_" + uuid4().hex[:24]
+    msg = (chat.get("choices") or [{}])[0].get("message") or {}
+    output: list[dict[str, Any]] = []
+
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str) and rc.strip():
+        output.append({
+            "id": "rs_" + uuid4().hex[:24],
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": rc}],
+        })
+
+    tool_calls = msg.get("tool_calls") or []
+    for tc in tool_calls:
+        if not isinstance(tc, dict) or tc.get("type") != "function":
+            continue
+        fn = tc.get("function") or {}
+        output.append({
+            "id": "fc_" + uuid4().hex[:24],
+            "type": "function_call",
+            "call_id": tc.get("id") or "call_" + uuid4().hex[:16],
+            "name": fn.get("name") or "",
+            "arguments": fn.get("arguments") or "",
+            "status": "completed",
+        })
+
+    text = msg.get("content")
+    if isinstance(text, str) and text:
+        output.append({
+            "id": "msg_" + uuid4().hex[:24],
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        })
+
+    usage = chat.get("usage") or {}
+    out_usage = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens",
+                                  usage.get("prompt_tokens", 0) +
+                                  usage.get("completion_tokens", 0)),
+    }
+    if isinstance(usage.get("completion_tokens_details"), dict):
+        rt = usage["completion_tokens_details"].get("reasoning_tokens")
+        if isinstance(rt, int):
+            out_usage["output_tokens_details"] = {"reasoning_tokens": rt}
+
+    return {
+        "id": rid,
+        "object": "response",
+        "created_at": chat.get("created", int(time.time())),
+        "status": "completed",
+        "model": chat.get("model") or "",
+        "output": output,
+        "usage": out_usage,
+    }
+
+
 def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
     if backend.api_key_env:
         v = os.environ.get(backend.api_key_env)
@@ -747,6 +814,14 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
         _SESSION_ERROR_STREAK[sid] = 0
         payload = _safe_json(r)
         translated_calls = 0
+        # Non-streaming chat→responses translation. The streaming path in
+        # _stream_proxy uses ChatToResponsesTranslator; this is the
+        # equivalent for one-shot JSON responses (Vercel AI SDK's
+        # generateObject hits the proxy with stream=false and expects a
+        # Responses-API-shaped body back, even when the upstream is a
+        # chat-completions backend like DeepSeek).
+        if chat_to_responses and isinstance(payload, dict) and "choices" in payload:
+            payload = _chat_to_responses_payload(payload)
         if translate_tool_calls and isinstance(payload, dict):
             new_payload = rebuild_response(payload)
             if new_payload is not payload:
@@ -804,6 +879,15 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         }
         return f"event: response.completed\ndata: {json.dumps(payload)}\n\n".encode()
 
+    # SSE keepalive: when upstream goes silent during streaming, emit
+    # `: tinyctx keepalive` SSE comment lines every
+    # CFG.stream_keepalive_interval_s seconds so codex.app's stream
+    # parser sees ongoing bytes (preventing idle-timeout disconnects)
+    # and any TCP middlebox keeps the connection alive. SSE comments
+    # (lines starting with `:`) are ignored by spec-compliant clients.
+    keepalive_interval = CFG.stream_keepalive_interval_s
+    keepalives_emitted = 0
+
     upstream_failed = False
     upstream_failure_msg = ""
     try:
@@ -820,13 +904,59 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     upstream_failure_msg = f"upstream {r.status_code}: {text[:200]}"
                 else:
                     _SESSION_ERROR_STREAK[sid] = 0
-                    async for chunk in r.aiter_raw():
-                        bytes_out += len(chunk)
-                        if translator is None:
-                            yield chunk
-                        else:
-                            for out in translator.feed(chunk):
-                                yield out
+                    # Producer/consumer pattern: a background task drains
+                    # r.aiter_raw() into a queue; the main coroutine pulls
+                    # from the queue with a timeout, emitting keepalives
+                    # when the upstream is idle. Avoids cancelling httpx's
+                    # internal __anext__ mid-flight (which can leave the
+                    # response state corrupted).
+                    if keepalive_interval > 0:
+                        chunk_q: asyncio.Queue = asyncio.Queue()
+                        _SENTINEL = object()
+                        _ERR = object()
+
+                        async def _producer():
+                            try:
+                                async for chunk in r.aiter_raw():
+                                    await chunk_q.put((None, chunk))
+                            except Exception as exc:  # noqa: BLE001
+                                await chunk_q.put((_ERR, exc))
+                            else:
+                                await chunk_q.put((_SENTINEL, None))
+
+                        producer = asyncio.create_task(_producer())
+                        try:
+                            while True:
+                                try:
+                                    tag, payload = await asyncio.wait_for(
+                                        chunk_q.get(), timeout=keepalive_interval)
+                                except asyncio.TimeoutError:
+                                    yield b": tinyctx keepalive\n\n"
+                                    keepalives_emitted += 1
+                                    continue
+                                if tag is _SENTINEL:
+                                    break
+                                if tag is _ERR:
+                                    raise payload  # type: ignore[misc]
+                                # tag is None → real chunk
+                                bytes_out += len(payload)
+                                if translator is None:
+                                    yield payload
+                                else:
+                                    for out in translator.feed(payload):
+                                        yield out
+                        finally:
+                            if not producer.done():
+                                producer.cancel()
+                    else:
+                        # keepalive disabled — original simple loop
+                        async for chunk in r.aiter_raw():
+                            bytes_out += len(chunk)
+                            if translator is None:
+                                yield chunk
+                            else:
+                                for out in translator.feed(chunk):
+                                    yield out
                     if translator is not None:
                         for out in translator.flush():
                             yield out
@@ -851,7 +981,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         elapsed = round(time.time() - started, 3)
         _log("stream_done", session=sid, route=decision.route, bytes=bytes_out,
              translated=bool(translator),
-             elapsed_s=elapsed)
+             elapsed_s=elapsed,
+             keepalives=keepalives_emitted)
         if trace is not None:
             trace.status = status
             trace.bytes_out = bytes_out
@@ -859,6 +990,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.translated_calls = (translator._emitted_calls
                                        if translator is not None else 0)
             trace.elapsed_s = elapsed
+            trace.keepalives_emitted = keepalives_emitted
             trace.emit(CFG.log_dir)
 
 

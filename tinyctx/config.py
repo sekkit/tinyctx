@@ -277,6 +277,19 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
+    # SSE keepalive injector for long-running upstream streams. When the
+    # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
+    # seconds during streaming, the proxy emits a `: tinyctx keepalive`
+    # SSE comment line so codex.app's stream parser sees ongoing bytes
+    # and doesn't trip its idle timeout (or any TCP middlebox / firewall
+    # idle disconnection). SSE comments (lines starting with `:`) are
+    # ignored by spec-compliant clients.
+    #
+    # Default 15s — well below codex's `stream_idle_timeout_ms = 300000`
+    # (5 min). Set to 0 to disable. Cap should be < client's idle
+    # timeout / 2 to leave safety margin.
+    stream_keepalive_interval_s: float = 15.0
+
     # Inject the bundled global agent rules (tinyctx/templates/AGENTS.md)
     # into every request's `body.instructions`. Idempotent — skipped
     # automatically if codex.app already loaded `~/.codex/AGENTS.md`
