@@ -276,6 +276,127 @@ def test_classify_below_threshold_no_flag():
         httpd.shutdown()
 
 
+# ─── context extraction (semantic classifier inputs) ──────────────────────
+
+
+def test_extract_user_goal_string_content():
+    from tinyctx.soft_completion import extract_user_goal
+    body_input = [
+        {"role": "user", "content": "do task A"},
+        {"type": "function_call", "name": "shell", "arguments": "{}"},
+        {"role": "user", "content": "actually, do task B instead"},
+    ]
+    # Returns the most recent user message
+    assert extract_user_goal(body_input) == "actually, do task B instead"
+
+
+def test_extract_user_goal_typed_content():
+    from tinyctx.soft_completion import extract_user_goal
+    body_input = [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "extract this"},
+            {"type": "input_text", "text": "and this"},
+        ]},
+    ]
+    out = extract_user_goal(body_input)
+    assert "extract this" in out and "and this" in out
+
+
+def test_extract_user_goal_empty_when_no_user():
+    from tinyctx.soft_completion import extract_user_goal
+    assert extract_user_goal([]) == ""
+    assert extract_user_goal(None) == ""
+    assert extract_user_goal([{"type": "function_call", "name": "x"}]) == ""
+
+
+def test_extract_user_goal_caps_chars():
+    from tinyctx.soft_completion import extract_user_goal
+    body_input = [{"role": "user", "content": "x" * 5000}]
+    out = extract_user_goal(body_input, max_chars=200)
+    assert len(out) <= 200
+
+
+def test_extract_progress_tracker_from_function_call():
+    from tinyctx.soft_completion import extract_progress_tracker
+    args = _json.dumps({
+        "explanation": "step plan",
+        "plan": [
+            {"step": "create model", "status": "completed"},
+            {"step": "run tests", "status": "in_progress"},
+            {"step": "deploy", "status": "pending"},
+        ],
+    })
+    body_input = [
+        {"role": "user", "content": "do plan"},
+        {"type": "function_call", "name": "update_plan", "arguments": args,
+         "call_id": "c1"},
+        {"type": "function_call_output", "call_id": "c1",
+         "output": "Updated plan"},
+    ]
+    out = extract_progress_tracker(body_input)
+    assert "create model" in out
+    assert "completed" in out
+    assert "in_progress" in out
+    assert "deploy" in out
+
+
+def test_extract_progress_tracker_uses_latest():
+    """When multiple update_plan calls exist, return the LATEST state."""
+    from tinyctx.soft_completion import extract_progress_tracker
+    a1 = _json.dumps({"plan": [{"step": "X", "status": "pending"}]})
+    a2 = _json.dumps({"plan": [{"step": "X", "status": "completed"}]})
+    body_input = [
+        {"type": "function_call", "name": "update_plan", "arguments": a1,
+         "call_id": "c1"},
+        {"type": "function_call", "name": "update_plan", "arguments": a2,
+         "call_id": "c2"},
+    ]
+    out = extract_progress_tracker(body_input)
+    assert "completed" in out  # latest status, not pending
+
+
+def test_extract_progress_tracker_empty_when_no_plan():
+    from tinyctx.soft_completion import extract_progress_tracker
+    body_input = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "shell", "arguments": "{}"},
+    ]
+    assert extract_progress_tracker(body_input) == ""
+
+
+def test_extract_tool_summary_counts_and_lists_recent():
+    from tinyctx.soft_completion import extract_tool_summary
+    body_input = [
+        {"type": "function_call", "name": "shell", "arguments": "{}"},
+        {"type": "function_call", "name": "apply_patch", "arguments": "{}"},
+        {"type": "function_call", "name": "shell", "arguments": "{}"},
+    ]
+    out = extract_tool_summary(body_input)
+    assert "total_tool_calls=3" in out
+    assert "shell" in out
+    assert "apply_patch" in out
+
+
+def test_extract_tool_summary_empty_when_no_tools():
+    from tinyctx.soft_completion import extract_tool_summary
+    assert extract_tool_summary([]) == "no_tool_calls"
+    assert extract_tool_summary(None) == "no_tool_calls"
+    assert extract_tool_summary(
+        [{"role": "user", "content": "hi"}]) == "no_tool_calls"
+
+
+def test_extract_tool_summary_caps_at_last_n():
+    from tinyctx.soft_completion import extract_tool_summary
+    body_input = [
+        {"type": "function_call", "name": f"tool_{i}", "arguments": "{}"}
+        for i in range(50)
+    ]
+    out = extract_tool_summary(body_input, last_n=5)
+    assert "total_tool_calls=50" in out
+    # Last 5 should be in summary
+    assert "tool_45" in out and "tool_49" in out
+
+
 # ─── finish_reason extraction & short-circuits ─────────────────────────────
 
 
@@ -420,10 +541,17 @@ def test_classify_user_content_includes_finish_reason_metadata():
                 threshold=0.7))
         assert diag.result is not None
         assert diag.result.soft_punt is True
-        # The LLM saw the finish_reason in its user message
+        # The LLM saw the structured context in its user message —
+        # post-semantic-redesign the format is `finish_reason: stop` /
+        # `text_chars: N` / sections for user_goal / tracker / tools
         body_str = captured.get("body", b"").decode("utf-8", "replace")
-        assert "finish_reason=stop" in body_str
-        assert "text_chars=" in body_str
+        assert "finish_reason: stop" in body_str
+        assert "text_chars:" in body_str
+        # New semantic context sections
+        assert "user_goal:" in body_str
+        assert "progress_tracker:" in body_str
+        assert "tool_summary:" in body_str
+        assert "assistant_text:" in body_str
     finally:
         httpd.shutdown()
 

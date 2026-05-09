@@ -82,54 +82,61 @@ _BUFFER_MAX = 65536
 
 # ─── LLM behavioral classifier ─────────────────────────────────────────────
 
-_CLASSIFIER_SYSTEM_PROMPT = """You are a behavioral classifier inside an LLM proxy. Read an assistant's final response from a coding/agent task, and decide whether it ended by SOFT-PUNTING to the user — i.e. handing the next decision back to the user instead of acting on the task.
+_CLASSIFIER_SYSTEM_PROMPT = """You are a completion auditor inside an agent gateway. The agent just finished a turn. Decide whether the agent has ACTUALLY COMPLETED the user's stated goal, or whether it stopped while material work the user expects is still undone.
 
-The user message gives you TWO things:
-  1. `finish_reason`: how the upstream stream ended (`stop`, `tool_calls`, `length`, etc.)
-  2. The visible text the assistant wrote.
+You will receive structured context:
+  - `user_goal` — what the user asked for (their most recent or canonical request).
+  - `progress_tracker` — items the agent itself enumerated as the task plan (from update_plan / TodoWrite). Each item has a status. May be empty if the agent never set up a tracker.
+  - `tool_summary` — count + last names of function_calls the agent made this session (commits, file edits, tests, builds).
+  - `finish_reason` — how the stream ended: `tool_calls` (still acting), `stop` (response ended), `length` (truncated).
+  - `assistant_text` — the visible text of the agent's final response.
 
 Output EXACTLY one JSON object on a single line. No prose, no markdown:
-{"soft_punt": true|false, "p": 0.0-1.0, "reason": "<≤8 words>"}
+{"soft_punt": true|false, "p": 0.0-1.0, "reason": "<≤10 words>"}
 
-═══ NOT SOFT-PUNT — early decisions based on finish_reason ═══
+═══ Quick short-circuits (no semantic analysis needed) ═══
 
-  - `finish_reason=tool_calls` → ALWAYS soft_punt:false (agent is calling a tool, still acting). p≥0.95.
-  - `finish_reason=stop` AND text < 50 chars → soft_punt:false (brief confirmation, low stakes).
+  - `finish_reason=tool_calls` → soft_punt:false p=0.95 (agent is acting, not stopping).
+  - `assistant_text` < 50 chars AND `finish_reason=stop` → soft_punt:false p=0.9 (brief confirmation between tool calls, low signal).
 
-═══ SOFT-PUNT (true, p ≥ 0.7) when finish_reason=stop and text is substantive ═══
+═══ Core question (when finish_reason=stop and assistant_text is substantive) ═══
 
-  A. **Meta-question** to the user:
-     - "what next / what should I do / what would you like / which option / shall I continue / 接下来做什么" / any meta-question handing the decision back
+Compare the agent's claimed completion vs. what the user asked for:
 
-  B. **Options-and-wait**:
-     - lists options ("Some options: A / B / C — let me know") and stops
+**SOFT-PUNT (true, p ≥ 0.7)** — the agent stopped while material work for the user's goal is undone:
+  • Meta-question to user — "what next / which option / shall I" — handing decision back instead of acting.
+  • Options-and-wait — lists 2+ alternatives and stops.
+  • Premature claim of done — says "all done / final summary" but the progress_tracker has unchecked items, OR the user's stated verification (build/test/deploy/run) wasn't executed.
+  • Plan without action — states a multi-step plan but `finish_reason=stop` and tool_summary shows no recent tool calls executing the plan.
+  • **Implicit de-scope** — declares partial completion while saying remaining work is "follow-up / for later / when needed / can be done if you want / optional / left as exercise". Agent is unilaterally trimming scope without the user's agreement.
+  • Soft hand-back — "let me know if you want me to ...", "happy to expand on ...", "feel free to ask if ..." — these signal "I'm done, you decide" without explicit "what next?" framing.
+  • Natural-stopping framing — "I think we're at a good stopping point", "this seems like a reasonable place to pause" — agent self-deciding to stop.
 
-  C. **Premature done**:
-     - declares "all done / wrapped up / final summary" while user-stated verification (build / run / test / deploy) was NOT actually executed
-
-  D. **Plan without action** ⚠️ (commonly missed by humans):
-     - states a multi-step plan ("I'll do X, then Y, then Z") with NO tool call following → finish_reason=stop means agent stopped instead of executing plan. The plan exists ON paper only; codex pauses for user input. This IS a soft-punt — the agent is requiring the user to say "go" before the plan happens.
-
-═══ NOT SOFT-PUNT (false, p ≥ 0.7) when finish_reason=stop and text is substantive ═══
-
-  - **Load-bearing clarification**: question genuinely needs user input that the executor cannot answer (ambiguous spec, conflicting requirements, missing credentials, irreversible-action confirmation).
-  - **Substantive technical answer**: complete code / direct answer / analysis IS the deliverable; no further work is implied.
-  - **Hard failure report**: specific blocker ("build failed: <log>; need user to fix env X").
-  - **Status update mid-progress**: short note explaining what the agent did, no plan/question, more tool calls coming next turn.
+**NOT SOFT-PUNT (false, p ≥ 0.7)** — the agent stopped legitimately:
+  • Deliverable IS the response — user asked a question, agent answered substantively. No further work implied.
+  • Hard failure with a specific blocker — build failed / missing credential / ambiguous spec — and the agent reports concretely what the user must do.
+  • Load-bearing clarification — the question genuinely cannot be answered from the executor's own scope (irreversible-action confirmation, conflicting requirements).
+  • All progress_tracker items are completed-with-evidence (commits / test pass / build success), AND user-stated verification was executed.
+  • Mid-progress status note — short text between tool calls, agent is clearly going to keep working.
 
 ═══ Calibration ═══
 
-Be CONSERVATIVE on false positives (cost: one extra advisor call ~5K tokens) but NEVER miss a stop+plan_without_action case (cost: user sees incomplete task and has to manually continue — the original problem).
+The cost asymmetry: a false positive runs one extra advisor call (~5K tokens). A false negative makes the user see an incomplete task and manually nudge — that's the original problem we're fixing. Lean toward true on borderline cases.
 
-Reason field: ≤8 words, noun-phrase fragment. Examples:
-  "asks user what to do next"            ← punt:true
-  "lists options without committing"     ← punt:true
-  "declares done but verification not run" ← punt:true
-  "plan without tool call following"     ← punt:true (D)
-  "running tool, still progressing"      ← punt:false (finish=tool_calls)
-  "load-bearing clarifying question"     ← punt:false
-  "substantive technical answer"         ← punt:false
-  "brief progress note"                  ← punt:false (short text)"""
+Use ALL signals jointly: don't just judge `assistant_text` in isolation. If the user asked for X and X has explicit verification step Y, and tool_summary doesn't show Y was run, and assistant_text says "all done" — that's a punt regardless of how confidently the agent phrased it. Conversely, if tracker is empty and tool_summary shows recent edits + commits, and assistant_text is a brief status, it's not a punt.
+
+Reason field: ≤10 words, noun-phrase fragment. Be specific about WHICH signal triggered the verdict.
+
+Examples:
+  "tracker has 4 unchecked, agent declared done"      ← punt:true
+  "verification step not in tool_summary"             ← punt:true
+  "remaining work declared follow-up by agent"        ← punt:true
+  "asks user which option"                            ← punt:true
+  "plan stated, no tool calls in summary"             ← punt:true
+  "user asked Q, agent gave full A"                   ← punt:false
+  "all 5 tracker items completed-with-evidence"       ← punt:false
+  "build failed, agent named specific blocker"        ← punt:false (legit)
+  "tool_calls finish, mid-progress"                   ← punt:false (short-circuit)"""
 
 
 @dataclass
@@ -264,6 +271,148 @@ def _extract_text_from_buffer(buf: str) -> str:
     return text[-4000:]
 
 
+# ─── context extraction (user goal / progress tracker / tool summary) ─────
+# Codex sends the entire conversation history in body.input each turn, so
+# we can mine it for the completion signals the LLM classifier needs.
+
+
+def extract_user_goal(body_input: list[Any] | None, max_chars: int = 1500) -> str:
+    """Pull the user's most recent message from body.input. This is the
+    "did the agent actually finish what was asked" anchor for the
+    semantic classifier. Returns empty string if no user message found.
+
+    Falls back to scanning ALL user messages for the LAST one (most
+    recent intent). Caps at `max_chars` so the classifier prompt
+    stays bounded."""
+    if not isinstance(body_input, list):
+        return ""
+    last_user = ""
+    for it in reversed(body_input):
+        if not isinstance(it, dict):
+            continue
+        role = it.get("role")
+        t = it.get("type")
+        if role != "user" and not (t == "message" and role == "user"):
+            continue
+        content = it.get("content")
+        if isinstance(content, str):
+            last_user = content
+            break
+        if isinstance(content, list):
+            parts: list[str] = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") in ("text", "input_text", "output_text"):
+                    txt = c.get("text") or ""
+                    if isinstance(txt, str):
+                        parts.append(txt)
+            joined = "\n".join(p for p in parts if p)
+            if joined:
+                last_user = joined
+                break
+    return last_user[:max_chars].strip()
+
+
+def extract_progress_tracker(body_input: list[Any] | None,
+                              max_chars: int = 1500) -> str:
+    """Mine the conversation for `update_plan` / `TodoWrite` tool-call
+    outputs. Returns a compact text representation of the latest plan
+    state (each item with status), or empty string if no tracker found.
+
+    Codex codex tracks progress via `update_plan` MCP-style calls. The
+    tool_call_output for these contains the plan items. We scan from
+    the END of body.input backward so we get the most recent state."""
+    if not isinstance(body_input, list):
+        return ""
+    # Walk backwards looking for the latest update_plan tool call result
+    for it in reversed(body_input):
+        if not isinstance(it, dict):
+            continue
+        t = it.get("type")
+        # Codex's two formats: function_call_output (paired with a
+        # function_call) or a direct call/result item.
+        name = it.get("name", "") or ""
+        if t == "function_call" and name in ("update_plan", "TodoWrite"):
+            # The arguments string contains the plan items
+            args_str = it.get("arguments", "") or ""
+            if isinstance(args_str, str) and args_str.strip():
+                rendered = _render_plan_args(args_str, max_chars)
+                if rendered:
+                    return rendered
+        if t == "function_call_output":
+            call_id = it.get("call_id", "")
+            if not call_id:
+                continue
+            # Find the paired function_call to check its name
+            for prev in reversed(body_input):
+                if not isinstance(prev, dict):
+                    continue
+                if (prev.get("type") == "function_call"
+                        and prev.get("call_id") == call_id):
+                    pname = prev.get("name", "")
+                    if pname in ("update_plan", "TodoWrite"):
+                        args_str = prev.get("arguments", "") or ""
+                        rendered = _render_plan_args(args_str, max_chars)
+                        if rendered:
+                            return rendered
+                    break
+    return ""
+
+
+def _render_plan_args(args_str: str, max_chars: int) -> str:
+    """Parse update_plan's arguments JSON and render as a compact
+    per-item bullet list. Falls back to truncated raw args on parse
+    failure."""
+    try:
+        args = json.loads(args_str)
+    except (json.JSONDecodeError, ValueError):
+        return args_str[:max_chars]
+    if not isinstance(args, dict):
+        return args_str[:max_chars]
+    # codex update_plan typically: {"explanation": "...", "plan": [{"step": "...", "status": "pending|in_progress|completed"}, ...]}
+    plan = args.get("plan") or args.get("todos") or args.get("items") or []
+    if not isinstance(plan, list):
+        return args_str[:max_chars]
+    lines: list[str] = []
+    for i, item in enumerate(plan, start=1):
+        if not isinstance(item, dict):
+            continue
+        step = (item.get("step") or item.get("content")
+                or item.get("text") or item.get("description") or "?")
+        status = (item.get("status") or item.get("state") or "?")
+        lines.append(f"  {i}. [{status}] {str(step)[:200]}")
+    if not lines:
+        return args_str[:max_chars]
+    rendered = "\n".join(lines)
+    return rendered[:max_chars]
+
+
+def extract_tool_summary(body_input: list[Any] | None,
+                          last_n: int = 12,
+                          max_chars: int = 800) -> str:
+    """Summarize recent function_call activity in the conversation.
+    Returns "no_tool_calls" when nothing found, else a count + the
+    last `last_n` tool names. The classifier uses this to verify
+    whether the agent actually executed work or just talked about it."""
+    if not isinstance(body_input, list):
+        return "no_tool_calls"
+    names: list[str] = []
+    for it in body_input:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") != "function_call":
+            continue
+        n = it.get("name", "") or "?"
+        names.append(str(n))
+    if not names:
+        return "no_tool_calls"
+    total = len(names)
+    tail = names[-last_n:]
+    summary = f"total_tool_calls={total}; last={tail}"
+    return summary[:max_chars]
+
+
 # ─── streaming buffer ──────────────────────────────────────────────────────
 
 
@@ -360,6 +509,9 @@ async def classify_at_stream_end_diag(
         timeout_s: float = 30.0,
         threshold: float = 0.7,
         raw_buffer: str | None = None,
+        user_goal: str = "",
+        progress_tracker: str = "",
+        tool_summary: str = "",
 ) -> ClassifyDiag:
     """Same as `classify_at_stream_end` but returns a `ClassifyDiag`
     capturing why the call returned None (for logging in the proxy
@@ -407,16 +559,26 @@ async def classify_at_stream_end_diag(
         diag.skipped_reason = "short_text"
         return diag
 
-    # Compose user content: explicit metadata header + the text. The
-    # classifier prompt instructs the LLM to use both signals, with
-    # the plan-without-action D-case being the new addition that the
-    # finish_reason=stop signal helps catch.
-    user_content = (
-        f"finish_reason={finish or 'unknown'}\n"
-        f"text_chars={len(text)}\n"
-        f"---\n"
-        f"{text}"
-    )
+    # Compose user content: structured context the semantic classifier
+    # uses to decide "did the agent actually finish the user's goal".
+    # Each section is bounded so total prompt stays ~5KB.
+    sections = [
+        f"finish_reason: {finish or 'unknown'}",
+        f"text_chars: {len(text)}",
+        "",
+        "user_goal:",
+        (user_goal or "(not available)"),
+        "",
+        "progress_tracker:",
+        (progress_tracker or "(no tracker found in conversation)"),
+        "",
+        "tool_summary:",
+        (tool_summary or "no_tool_calls"),
+        "",
+        "assistant_text:",
+        text,
+    ]
+    user_content = "\n".join(sections)
 
     payload = {
         "model": local_model,

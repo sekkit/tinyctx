@@ -1213,6 +1213,11 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         api_key = (os.environ.get(CFG.local.api_key_env)
                                    if CFG.local.api_key_env else None)
                         buffer_snapshot = _sc._OUTPUT_BUFFER.get(sid, "")
+                        body_input = (body.get("input")
+                                       if isinstance(body, dict) else None)
+                        user_goal = _sc.extract_user_goal(body_input)
+                        tracker = _sc.extract_progress_tracker(body_input)
+                        tool_summary = _sc.extract_tool_summary(body_input)
                         # Synchronous classification — we're at stream
                         # end, no other bytes flowing. Bounded by
                         # self_classify_timeout_s (default 30s).
@@ -1224,6 +1229,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             timeout_s=CFG.self_classify_timeout_s,
                             threshold=CFG.self_classify_threshold,
                             raw_buffer=buffer_snapshot,
+                            user_goal=user_goal,
+                            progress_tracker=tracker,
+                            tool_summary=tool_summary,
                         )
                         if (diag.result is not None
                                 and diag.result.soft_punt
@@ -1357,9 +1365,23 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 # / "short_text text_chars=0" skips. Closure-capture the
                 # snapshot so the dict isn't consulted later.
                 buffer_snapshot = _sc._OUTPUT_BUFFER.get(sid, "")
+                # Extract semantic context from the request body for
+                # the new classifier. The body has the entire
+                # conversation history; mine it for user goal +
+                # progress tracker + tool summary so classifier can
+                # judge "did the agent finish the user's actual goal"
+                # rather than just pattern-match the response shape.
+                body_input = body.get("input") if isinstance(body, dict) else None
+                user_goal_snapshot = _sc.extract_user_goal(body_input)
+                tracker_snapshot = _sc.extract_progress_tracker(body_input)
+                tool_summary_snapshot = _sc.extract_tool_summary(body_input)
+
                 async def _bg_classify():
                     _log("soft_completion_classify_started", session=sid,
-                         buffer_chars_at_spawn=len(buffer_snapshot))
+                         buffer_chars_at_spawn=len(buffer_snapshot),
+                         user_goal_chars=len(user_goal_snapshot),
+                         tracker_chars=len(tracker_snapshot),
+                         tool_summary=tool_summary_snapshot[:120])
                     try:
                         diag = await _sc.classify_at_stream_end_diag(
                             sid,
@@ -1369,6 +1391,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             timeout_s=CFG.self_classify_timeout_s,
                             threshold=CFG.self_classify_threshold,
                             raw_buffer=buffer_snapshot,
+                            user_goal=user_goal_snapshot,
+                            progress_tracker=tracker_snapshot,
+                            tool_summary=tool_summary_snapshot,
                         )
                         # Always log the outcome — even None paths, so
                         # silent-skip cases are diagnosable. One of the
