@@ -125,6 +125,24 @@ def test_patch_codex_config_uses_start_mcp_server_not_mode_codex(isolated):
         f"args line still has broken --mode flag: {args_line!r}"
 
 
+def test_patch_codex_config_includes_codex_context_and_project_from_cwd(isolated):
+    """Without --context codex + --project-from-cwd, serena boots into
+    'no active project' state and its dashboard at :24282 stays empty
+    forever (model would need to call activate_project tool manually).
+    Both flags are designed by upstream specifically for codex/claude-code
+    and the bootstrap must opt into them."""
+    _, codex = isolated
+    state = sb.State(serena_path="/u/b/serena")
+    sb.patch_codex_config(state, config_path=codex)
+    txt = codex.read_text()
+    args_line = next((ln for ln in txt.splitlines()
+                      if ln.lstrip().startswith("args ")), "")
+    assert "--context" in args_line and '"codex"' in args_line, \
+        "missing --context codex (serena's codex-optimized prompt mode)"
+    assert "--project-from-cwd" in args_line, \
+        "missing --project-from-cwd (auto-activate project from codex cwd)"
+
+
 def test_patch_codex_config_creates(isolated):
     _, codex = isolated
     state = sb.State(serena_path="/u/b/serena-mcp-server")

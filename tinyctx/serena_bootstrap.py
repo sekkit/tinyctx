@@ -50,13 +50,26 @@ _SERENA_CONFIG_BLOCK_TEMPLATE = """
 # Added by tinyctx (serena_bootstrap). Safe to delete or edit.
 # Serena: LSP-backed symbolic code-operations MCP server.
 # Source: https://github.com/oraios/serena
-# Spawn shape verified live 2026-05-10: `serena start-mcp-server` returns
-# init in < 1s with caps=tools. The bare `serena` CLI rejects `--mode codex`
-# (no such option), so don't fall back to that.
+#
+# Spawn flags (verified live 2026-05-10):
+#   --context codex          codex-optimized prompt mode (built-in;
+#                            without it, serena defaults to "desktop-app"
+#                            which has too-verbose tool descriptions for
+#                            codex's prompt budget)
+#   --project-from-cwd       auto-detect project from codex session's cwd
+#                            (Path-search: .serena/project.yml → .git → cwd
+#                            fallback). Without this, serena boots into
+#                            "no active project" state, the model would
+#                            need to call `activate_project` first, and
+#                            the dashboard at :24282 stays empty.
+#
+# The bare `serena` CLI also has `--mode codex` — that's a DIFFERENT
+# option than `--context codex` and the bootstrap MUST NOT use it
+# (verified: rejected as "No such option").
 {marker}
 type = "stdio"
 command = "{cmd}"
-args = ["start-mcp-server"]
+args = ["start-mcp-server", "--context", "codex", "--project-from-cwd"]
 startup_timeout_sec = 30.0
 """
 
