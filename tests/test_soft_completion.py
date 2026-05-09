@@ -276,6 +276,158 @@ def test_classify_below_threshold_no_flag():
         httpd.shutdown()
 
 
+# ─── finish_reason extraction & short-circuits ─────────────────────────────
+
+
+def test_extract_finish_reason_tool_calls():
+    """The most common case: agent ended with finish_reason=tool_calls."""
+    from tinyctx.soft_completion import _extract_finish_reason
+    buf = (
+        'data: {"choices":[{"delta":{},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[...]}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}\n\n'
+        'data: [DONE]\n\n'
+    )
+    assert _extract_finish_reason(buf) == "tool_calls"
+
+
+def test_extract_finish_reason_stop():
+    from tinyctx.soft_completion import _extract_finish_reason
+    buf = (
+        'data: {"choices":[{"delta":{"content":"plan"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+    )
+    assert _extract_finish_reason(buf) == "stop"
+
+
+def test_extract_finish_reason_length_truncated():
+    from tinyctx.soft_completion import _extract_finish_reason
+    buf = 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+    assert _extract_finish_reason(buf) == "length"
+
+
+def test_extract_finish_reason_none_when_only_null():
+    """All events show null finish_reason → return None."""
+    from tinyctx.soft_completion import _extract_finish_reason
+    buf = (
+        'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"y"},"finish_reason":null}]}\n\n'
+    )
+    assert _extract_finish_reason(buf) is None
+
+
+def test_extract_finish_reason_none_when_no_field():
+    from tinyctx.soft_completion import _extract_finish_reason
+    assert _extract_finish_reason("") is None
+    assert _extract_finish_reason('data: not even json\n\n') is None
+
+
+def test_classify_short_circuits_tool_calls_without_llm():
+    """finish_reason=tool_calls → skip with reason `tool_calls_finish`,
+    NEVER call the LLM. Saves cost on every tool-call turn (the
+    overwhelming majority of agent turns)."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":'
+        '{"arguments":"{\\"file\\":\\"x.py\\"}"}}]},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}\n\n'
+    )
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    # Pass an unreachable URL — if LLM is called, this would raise / time out.
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",  # unreachable
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7))
+    assert diag.result is None
+    assert diag.skipped_reason == "tool_calls_finish"
+    assert diag.finish_reason == "tool_calls"
+    assert diag.backend_error == ""  # didn't reach backend
+
+
+def test_classify_short_text_threshold_50():
+    """Short text + finish=stop → skip without LLM (brief confirmation)."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    # 30 chars of text + finish=stop (< 50 threshold)
+    sse = (
+        'data: {"choices":[{"delta":{"content":"OK done."},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+    )
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7))
+    assert diag.skipped_reason == "short_text"
+    assert diag.finish_reason == "stop"
+    assert diag.extracted_text_chars < 50
+
+
+def test_classify_user_content_includes_finish_reason_metadata():
+    """Verify the LLM gets finish_reason as part of its input — not just
+    text. Without this, the prompt's plan-without-action rule would have
+    no signal to fire on (since the text alone is just a plan)."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    # Long plan text + finish=stop (the case the user hit at turn 1425)
+    plan = ("Here's my plan: 1. Re-confirm sample current commit. "
+            "2. Trace the XR session blank screencap chain. "
+            "3. Locate the minimum fix point. "
+            "4. Rebuild APK and verify with logcat + screencap. ") * 5
+    sse = (
+        f'data: {{"choices":[{{"delta":{{"content":"{plan}"}},"finish_reason":null}}]}}\n\n'
+        f'data: {{"choices":[{{"delta":{{"content":""}},"finish_reason":"stop"}}]}}\n\n'
+    )
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    # Capture what payload is sent to the backend
+    captured = {}
+
+    class _CapturingHandler(BaseHTTPRequestHandler):
+        def log_message(self, *a, **k): pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(n) if n else b""
+            captured["body"] = body
+            payload = _json.dumps({
+                "choices": [{"message": {"content":
+                    '{"soft_punt": true, "p": 0.9, "reason": "plan without action"}'
+                }}]
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    port = _free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _CapturingHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        diag = asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7))
+        assert diag.result is not None
+        assert diag.result.soft_punt is True
+        # The LLM saw the finish_reason in its user message
+        body_str = captured.get("body", b"").decode("utf-8", "replace")
+        assert "finish_reason=stop" in body_str
+        assert "text_chars=" in body_str
+    finally:
+        httpd.shutdown()
+
+
 def test_classify_diag_short_text_returns_skipped_reason():
     """Diag path: short text → skipped_reason='short_text', no backend call."""
     from tinyctx import soft_completion

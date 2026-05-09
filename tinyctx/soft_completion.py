@@ -82,38 +82,54 @@ _BUFFER_MAX = 65536
 
 # ─── LLM behavioral classifier ─────────────────────────────────────────────
 
-_CLASSIFIER_SYSTEM_PROMPT = """You are a behavioral classifier inside an LLM proxy. Read an assistant's final response from a coding/agent task, and decide whether it ended by SOFT-PUNTING to the user — i.e. asking a meta-question instead of completing the work or running its stated verifications.
+_CLASSIFIER_SYSTEM_PROMPT = """You are a behavioral classifier inside an LLM proxy. Read an assistant's final response from a coding/agent task, and decide whether it ended by SOFT-PUNTING to the user — i.e. handing the next decision back to the user instead of acting on the task.
+
+The user message gives you TWO things:
+  1. `finish_reason`: how the upstream stream ended (`stop`, `tool_calls`, `length`, etc.)
+  2. The visible text the assistant wrote.
 
 Output EXACTLY one JSON object on a single line. No prose, no markdown:
 {"soft_punt": true|false, "p": 0.0-1.0, "reason": "<≤8 words>"}
 
-═══ SOFT-PUNT (true, p ≥ 0.7) ═══
+═══ NOT SOFT-PUNT — early decisions based on finish_reason ═══
 
-The assistant ends the turn by:
-  - asking the user "what next / what should I do / what would you like / which option / shall I continue / 接下来做什么" or any equivalent meta-question that hands the next decision back to the user
-  - listing options ("Some options: A / B / C — let me know") and stopping
-  - declaring "all done / wrapped up / final summary" while user-stated verification (build / run / test / deploy) was NOT actually executed
-  - phrasing in any language with the same semantic shape
+  - `finish_reason=tool_calls` → ALWAYS soft_punt:false (agent is calling a tool, still acting). p≥0.95.
+  - `finish_reason=stop` AND text < 50 chars → soft_punt:false (brief confirmation, low stakes).
 
-═══ NOT SOFT-PUNT (false, p ≥ 0.7) ═══
+═══ SOFT-PUNT (true, p ≥ 0.7) when finish_reason=stop and text is substantive ═══
 
-  - The response IS a tool call (function_call) — agent is still making progress.
-  - Asking a load-bearing clarifying question that genuinely needs user input (ambiguous spec, conflicting requirements, missing credentials, irreversible-action confirmation).
-  - Submitting a substantive technical answer / code / analysis as the answer itself.
-  - Reporting a hard failure with specific blocking reason (e.g. "build failed: <log>; need user to fix env X before I can continue").
-  - Mid-thought streaming text without any closing question.
+  A. **Meta-question** to the user:
+     - "what next / what should I do / what would you like / which option / shall I continue / 接下来做什么" / any meta-question handing the decision back
+
+  B. **Options-and-wait**:
+     - lists options ("Some options: A / B / C — let me know") and stops
+
+  C. **Premature done**:
+     - declares "all done / wrapped up / final summary" while user-stated verification (build / run / test / deploy) was NOT actually executed
+
+  D. **Plan without action** ⚠️ (commonly missed by humans):
+     - states a multi-step plan ("I'll do X, then Y, then Z") with NO tool call following → finish_reason=stop means agent stopped instead of executing plan. The plan exists ON paper only; codex pauses for user input. This IS a soft-punt — the agent is requiring the user to say "go" before the plan happens.
+
+═══ NOT SOFT-PUNT (false, p ≥ 0.7) when finish_reason=stop and text is substantive ═══
+
+  - **Load-bearing clarification**: question genuinely needs user input that the executor cannot answer (ambiguous spec, conflicting requirements, missing credentials, irreversible-action confirmation).
+  - **Substantive technical answer**: complete code / direct answer / analysis IS the deliverable; no further work is implied.
+  - **Hard failure report**: specific blocker ("build failed: <log>; need user to fix env X").
+  - **Status update mid-progress**: short note explaining what the agent did, no plan/question, more tool calls coming next turn.
 
 ═══ Calibration ═══
 
-Be CONSERVATIVE. False positives cost ~5K frontier tokens (one extra advisor call). False negatives mean the user sees an incomplete task — the original problem we are trying to fix.
+Be CONSERVATIVE on false positives (cost: one extra advisor call ~5K tokens) but NEVER miss a stop+plan_without_action case (cost: user sees incomplete task and has to manually continue — the original problem).
 
 Reason field: ≤8 words, noun-phrase fragment. Examples:
-  "asks user what to do next"          ← soft_punt:true
-  "lists options without committing"   ← soft_punt:true
-  "declares done but verification not run" ← soft_punt:true
-  "running tool, still progressing"    ← soft_punt:false
-  "load-bearing clarifying question"   ← soft_punt:false
-  "substantive technical answer"       ← soft_punt:false"""
+  "asks user what to do next"            ← punt:true
+  "lists options without committing"     ← punt:true
+  "declares done but verification not run" ← punt:true
+  "plan without tool call following"     ← punt:true (D)
+  "running tool, still progressing"      ← punt:false (finish=tool_calls)
+  "load-bearing clarifying question"     ← punt:false
+  "substantive technical answer"         ← punt:false
+  "brief progress note"                  ← punt:false (short text)"""
 
 
 @dataclass
@@ -175,6 +191,36 @@ def _parse_response(text: str) -> ClassifyResult | None:
     m_r = _REASON_RE.search(text)
     reason = (m_r.group(1) if m_r else "[salvaged]")[:200]
     return ClassifyResult(soft_punt=sp, p=p, reason=reason)
+
+
+# ─── finish_reason extraction ──────────────────────────────────────────────
+# Both Responses-API and Chat-Completions emit `"finish_reason":"<value>"` in
+# the last few SSE events of a stream. We scan from the buffer TAIL because
+# the field appears once near the end. Values: `"stop"` (clean text end),
+# `"tool_calls"` (agent emitted function call(s) — still progressing),
+# `"length"` (max_tokens hit — truncated), or null/missing for in-progress
+# events. The last non-null value wins.
+
+_FINISH_REASON_RE = re.compile(
+    r'"finish_reason"\s*:\s*"([^"]+)"')
+
+
+def _extract_finish_reason(buf: str) -> str | None:
+    """Find the LAST non-null `finish_reason` value in the buffer. None
+    if no terminal finish_reason event was captured (e.g., truncated
+    buffer, stream still in flight, or the event hadn't reached the
+    captured tail yet). Most streams emit finish_reason in the very
+    last `data:` event, so the tail check is reliable."""
+    if not buf:
+        return None
+    matches = _FINISH_REASON_RE.findall(buf)
+    if not matches:
+        return None
+    # Last non-empty/non-null match wins
+    for v in reversed(matches):
+        if v and v != "null":
+            return v
+    return None
 
 
 # ─── delta extraction from SSE-wrapped buffer ──────────────────────────────
@@ -257,10 +303,11 @@ def get_flag(proj_sid: str) -> dict[str, Any] | None:
 class ClassifyDiag:
     """Outcome breakdown for a classify_at_stream_end call. Used by the
     proxy to log which path the function took (success / short-text /
-    backend-error / parse-failed) so silent-None failures aren't a
-    black box. Only `result` is non-None on a successful classification."""
+    backend-error / parse-failed / finish-tool-calls / finish-stop-short)
+    so silent-None failures aren't a black box. Only `result` is non-None
+    on a successful LLM classification."""
     result: ClassifyResult | None = None
-    skipped_reason: str = ""        # "short_text" / "no_buffer" / ""
+    skipped_reason: str = ""        # "short_text" / "no_buffer" / "tool_calls_finish" / ""
     backend_error: str = ""         # str(exception) on backend failure
     backend_status: int = 0         # http status if response received
     raw_content_preview: str = ""   # first 200 chars of upstream content
@@ -271,6 +318,10 @@ class ClassifyDiag:
     raw_buffer_chars: int = 0
     raw_buffer_head: str = ""
     raw_buffer_tail: str = ""
+    # Stream's terminal `finish_reason`. Used both as a short-circuit
+    # (tool_calls → never classify; saves the LLM call) AND as input
+    # to the LLM prompt (so it can flag plan-without-action correctly).
+    finish_reason: str = ""
 
 
 async def classify_at_stream_end(
@@ -335,19 +386,43 @@ async def classify_at_stream_end_diag(
         diag.skipped_reason = "no_buffer"
         return diag
 
+    # finish_reason short-circuit: streams that ended with tool_calls
+    # are agent-still-acting (never a punt). Saves an LLM call per
+    # tool-call turn — major cost reduction since most agent turns are
+    # tool calls.
+    finish = _extract_finish_reason(raw) or ""
+    diag.finish_reason = finish
+    if finish == "tool_calls":
+        diag.skipped_reason = "tool_calls_finish"
+        return diag
+
     text = _extract_text_from_buffer(raw)
     diag.extracted_text_chars = len(text)
-    # Skip very short outputs — likely tool-call-only turns where the
-    # classifier has nothing meaningful to judge.
-    if len(text) < 200:
+    # Short-text short-circuit: brief progress notes / acknowledgments
+    # don't carry enough signal for the classifier. 50-char threshold
+    # (lowered from 200 since we're now also using finish_reason as
+    # signal — short text + finish=stop is a brief confirmation, not
+    # a punt).
+    if len(text) < 50:
         diag.skipped_reason = "short_text"
         return diag
+
+    # Compose user content: explicit metadata header + the text. The
+    # classifier prompt instructs the LLM to use both signals, with
+    # the plan-without-action D-case being the new addition that the
+    # finish_reason=stop signal helps catch.
+    user_content = (
+        f"finish_reason={finish or 'unknown'}\n"
+        f"text_chars={len(text)}\n"
+        f"---\n"
+        f"{text}"
+    )
 
     payload = {
         "model": local_model,
         "messages": [
             {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0.1,
         # Same headroom as self_classify — reasoning-class local models
