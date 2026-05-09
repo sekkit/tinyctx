@@ -813,7 +813,12 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                    *, translate_tool_calls: bool = False,
                    chat_to_responses: bool = False,
                    trace: RequestTrace | None = None) -> Any:
-    timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+    # write=180s gives headroom for multi-megabyte request bodies on
+    # slow uplinks. With a 2MB body and a stalled TCP send-window, the
+    # old write=60s would fire before any keepalive could rescue the
+    # client. read=600s tolerates the upstream taking up to 10 minutes
+    # to start streaming (large-context inference cold-start).
+    timeout = httpx.Timeout(connect=10.0, read=600.0, write=180.0, pool=10.0)
     # Transport-level retry. httpx retries ONLY on connection-level
     # failures (DNS, TCP connect, ConnectError, ConnectTimeout) and
     # NEVER on HTTP responses (200/4xx/5xx). Exactly the semantics we
@@ -933,65 +938,122 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     upstream_failed = False
     upstream_failure_msg = ""
     try:
-        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-            async with client.stream("POST", url, headers=headers, json=body) as r:
-                status = r.status_code
-                if r.status_code >= 400:
-                    _SESSION_ERROR_STREAK[sid] += 1
-                    text = (await r.aread()).decode("utf-8", "replace")
-                    _log("upstream_error", session=sid, status=r.status_code,
-                         url=url, body=text[:2000])
-                    yield f"event: error\ndata: {json.dumps({'status': r.status_code, 'body': text[:2000]})}\n\n".encode()
-                    upstream_failed = True
-                    upstream_failure_msg = f"upstream {r.status_code}: {text[:200]}"
-                else:
-                    _SESSION_ERROR_STREAK[sid] = 0
-                    # Producer/consumer pattern: a background task drains
-                    # r.aiter_raw() into a queue; the main coroutine pulls
-                    # from the queue with a timeout, emitting keepalives
-                    # when the upstream is idle. Avoids cancelling httpx's
-                    # internal __anext__ mid-flight (which can leave the
-                    # response state corrupted).
-                    if keepalive_interval > 0:
-                        chunk_q: asyncio.Queue = asyncio.Queue()
-                        _SENTINEL = object()
-                        _ERR = object()
+        if keepalive_interval > 0:
+            # Producer/consumer with keepalive across BOTH phases:
+            #  Phase 1 — request upload + wait for upstream response headers
+            #  Phase 2 — stream response body
+            # Codex.app's stream parser disconnects after ~60s of zero
+            # bytes from the proxy. With a 2MB request body and slow
+            # upstream (e.g. DeepSeek loading a 500K-token context),
+            # phase 1 alone can exceed 60s — and the OLD code's keepalive
+            # only fired in phase 2, so the client gave up before any
+            # bytes flowed. Now the producer task runs the ENTIRE upstream
+            # interaction (open + upload + read headers + stream body),
+            # and the main coroutine yields keepalives whenever the queue
+            # is silent for keepalive_interval seconds.
+            chunk_q: asyncio.Queue = asyncio.Queue()
+            _STATUS = object()
+            _SENTINEL = object()
+            _ERR = object()
 
-                        async def _producer():
-                            try:
+            async def _producer():
+                try:
+                    async with httpx.AsyncClient(
+                            timeout=timeout, transport=transport) as client:
+                        async with client.stream(
+                                "POST", url, headers=headers, json=body) as r:
+                            if r.status_code >= 400:
+                                err_body = (await r.aread()).decode(
+                                    "utf-8", "replace")
+                                await chunk_q.put(
+                                    (_STATUS, (r.status_code, err_body)))
+                                # NOTE: fall through (no early return). The
+                                # try/except/else's `else:` puts SENTINEL
+                                # only when the try-block runs to completion;
+                                # an early return would skip it and the
+                                # consumer would hang waiting for sentinel.
+                            else:
+                                await chunk_q.put(
+                                    (_STATUS, (r.status_code, None)))
                                 async for chunk in r.aiter_raw():
                                     await chunk_q.put((None, chunk))
-                            except Exception as exc:  # noqa: BLE001
-                                await chunk_q.put((_ERR, exc))
-                            else:
-                                await chunk_q.put((_SENTINEL, None))
+                except Exception as exc:  # noqa: BLE001
+                    await chunk_q.put((_ERR, exc))
+                else:
+                    await chunk_q.put((_SENTINEL, None))
 
-                        producer = asyncio.create_task(_producer())
-                        try:
-                            while True:
-                                try:
-                                    tag, payload = await asyncio.wait_for(
-                                        chunk_q.get(), timeout=keepalive_interval)
-                                except asyncio.TimeoutError:
-                                    yield b": tinyctx keepalive\n\n"
-                                    keepalives_emitted += 1
-                                    continue
-                                if tag is _SENTINEL:
-                                    break
-                                if tag is _ERR:
-                                    raise payload  # type: ignore[misc]
-                                # tag is None → real chunk
-                                bytes_out += len(payload)
-                                if translator is None:
-                                    yield payload
-                                else:
-                                    for out in translator.feed(payload):
-                                        yield out
-                        finally:
-                            if not producer.done():
-                                producer.cancel()
+            producer = asyncio.create_task(_producer())
+            try:
+                while True:
+                    try:
+                        tag, payload = await asyncio.wait_for(
+                            chunk_q.get(), timeout=keepalive_interval)
+                    except asyncio.TimeoutError:
+                        yield b": tinyctx keepalive\n\n"
+                        keepalives_emitted += 1
+                        continue
+                    if tag is _SENTINEL:
+                        break
+                    if tag is _ERR:
+                        raise payload  # type: ignore[misc]
+                    if tag is _STATUS:
+                        status_code, err_body = payload
+                        status = status_code
+                        if err_body is not None:
+                            _SESSION_ERROR_STREAK[sid] += 1
+                            _log("upstream_error", session=sid,
+                                 status=status_code, url=url,
+                                 body=err_body[:2000])
+                            yield (
+                                f"event: error\ndata: "
+                                f"{json.dumps({'status': status_code, 'body': err_body[:2000]})}"
+                                f"\n\n").encode()
+                            upstream_failed = True
+                            upstream_failure_msg = (
+                                f"upstream {status_code}: {err_body[:200]}")
+                            # Don't break — wait for SENTINEL so producer
+                            # cleanly closes its async-with stack.
+                        else:
+                            _SESSION_ERROR_STREAK[sid] = 0
+                        continue
+                    # tag is None → real response-body chunk
+                    bytes_out += len(payload)
+                    if translator is None:
+                        yield payload
                     else:
-                        # keepalive disabled — original simple loop
+                        for out in translator.feed(payload):
+                            yield out
+                if translator is not None and not upstream_failed:
+                    for out in translator.flush():
+                        yield out
+            finally:
+                if not producer.done():
+                    producer.cancel()
+                    try:
+                        await producer
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+        else:
+            # keepalive disabled — original simple loop, no extra task overhead
+            async with httpx.AsyncClient(
+                    timeout=timeout, transport=transport) as client:
+                async with client.stream(
+                        "POST", url, headers=headers, json=body) as r:
+                    status = r.status_code
+                    if r.status_code >= 400:
+                        _SESSION_ERROR_STREAK[sid] += 1
+                        text = (await r.aread()).decode("utf-8", "replace")
+                        _log("upstream_error", session=sid,
+                             status=r.status_code, url=url, body=text[:2000])
+                        yield (
+                            f"event: error\ndata: "
+                            f"{json.dumps({'status': r.status_code, 'body': text[:2000]})}"
+                            f"\n\n").encode()
+                        upstream_failed = True
+                        upstream_failure_msg = (
+                            f"upstream {r.status_code}: {text[:200]}")
+                    else:
+                        _SESSION_ERROR_STREAK[sid] = 0
                         async for chunk in r.aiter_raw():
                             bytes_out += len(chunk)
                             if translator is None:
@@ -999,9 +1061,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             else:
                                 for out in translator.feed(chunk):
                                     yield out
-                    if translator is not None:
-                        for out in translator.flush():
-                            yield out
+                        if translator is not None:
+                            for out in translator.flush():
+                                yield out
     except httpx.HTTPError as e:
         _SESSION_ERROR_STREAK[sid] += 1
         _log("stream_error", session=sid, error=str(e))
@@ -1105,7 +1167,7 @@ async def _compactor_response(body: dict[str, Any], backend: BackendCfg,
                                               if backend.wire_api == "responses"
                                               else "/chat/completions")
         forward_body = body if backend.wire_api == "responses" else normalize_for_chat(body)
-        timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=600.0, write=180.0, pool=10.0)
         return await _forward(url, {"Content-Type": "application/json"},
                               forward_body, is_stream, sid,
                               Decision("local", "compactor_fallback"),

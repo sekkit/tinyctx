@@ -265,6 +265,128 @@ def test_stream_proxy_emits_keepalive_with_slow_backend():
         httpd.shutdown()
 
 
+def test_stream_proxy_emits_keepalive_during_header_wait():
+    """Regression: codex.app's stream parser disconnects after ~60s of
+    zero bytes from the proxy. With a slow upstream (e.g. DeepSeek
+    loading a 500K-token context) the upstream may take many seconds
+    just to send response HEADERS — with NO chunks yet. The proxy must
+    emit keepalives during this header-wait phase, not only during the
+    body-streaming phase.
+
+    Backend below sleeps before sending status/headers (simulating slow
+    inference cold-start) and verifies keepalive bytes flow to the
+    client during that gap."""
+    import json as _json
+
+    class _SlowStartBackend(BaseHTTPRequestHandler):
+        # delay BEFORE sending response status/headers
+        header_delay = 1.5
+
+        def log_message(self, *a, **k): pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            if n: self.rfile.read(n)
+            # Sleep BEFORE sending any response bytes
+            time.sleep(self.header_delay)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            # Then immediately send a single chunk
+            msg = b"data: ok\n\n"
+            self.wfile.write(f"{len(msg):x}\r\n".encode())
+            self.wfile.write(msg)
+            self.wfile.write(b"\r\n0\r\n\r\n")
+
+    port = _free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _SlowStartBackend)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        import os, sys
+        os.environ["TINYCTX_LOCAL_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
+        os.environ["TINYCTX_LOCAL_WIRE_API"] = "responses"
+        os.environ["TINYCTX_LOCAL_MODEL"] = "fake"
+        os.environ["TINYCTX_VERBOSE"] = "0"
+        os.environ["TINYCTX_CONFIG"] = "/dev/null"
+        os.environ.pop("TINYCTX_FORCE_ROUTE", None)
+
+        for m in list(sys.modules):
+            if m.startswith("tinyctx"):
+                del sys.modules[m]
+        import tinyctx.proxy as proxy_mod
+
+        # Tight keepalive (0.4s) vs server header_delay (1.5s):
+        # we should see at least 2-3 keepalives BEFORE the chunk arrives.
+        proxy_mod.CFG.stream_keepalive_interval_s = 0.4
+
+        import uvicorn
+        proxy_port = _free_port()
+        cfg = uvicorn.Config(proxy_mod.APP, host="127.0.0.1",
+                             port=proxy_port, log_level="error")
+        server = uvicorn.Server(cfg)
+        threading.Thread(target=lambda: asyncio.run(server.serve()),
+                         daemon=True).start()
+
+        from urllib.request import Request, urlopen
+        for _ in range(50):
+            try:
+                urlopen(f"http://127.0.0.1:{proxy_port}/", timeout=1).read()
+                break
+            except Exception:
+                time.sleep(0.1)
+
+        body = {"model": "tinyctx-local", "instructions": "x",
+                "input": [{"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True}
+        req = Request(
+            f"http://127.0.0.1:{proxy_port}/v1/responses",
+            data=_json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "text/event-stream"},
+            method="POST",
+        )
+        # Stream and observe arrival timing of bytes
+        first_byte_t: float | None = None
+        keepalive_bytes_t: list[float] = []
+        chunk_arrived_t: float | None = None
+        start = time.time()
+        with urlopen(req, timeout=10) as r:
+            buf = b""
+            while True:
+                ch = r.read(64)
+                if not ch:
+                    break
+                if first_byte_t is None:
+                    first_byte_t = time.time() - start
+                buf += ch
+                # Track keepalive bytes
+                if b": tinyctx keepalive" in buf and not keepalive_bytes_t:
+                    keepalive_bytes_t.append(time.time() - start)
+                if b"data: ok" in buf:
+                    chunk_arrived_t = time.time() - start
+                    # keep reading to drain
+        raw = buf.decode("utf-8", "replace")
+
+        # Real chunk eventually arrived
+        assert "data: ok" in raw, f"expected response chunk; got:\n{raw!r}"
+        # Keepalives MUST appear in the stream
+        assert ": tinyctx keepalive" in raw, (
+            "expected keepalive(s) during header-wait phase; got:\n" + raw
+        )
+        # And the first keepalive must arrive BEFORE the chunk
+        assert keepalive_bytes_t, "keepalive bytes never observed"
+        assert chunk_arrived_t is not None, "chunk never arrived"
+        assert keepalive_bytes_t[0] < chunk_arrived_t, (
+            f"keepalive arrived at t={keepalive_bytes_t[0]:.2f}s but chunk "
+            f"arrived earlier at t={chunk_arrived_t:.2f}s — phase-1 "
+            f"keepalive is not firing"
+        )
+    finally:
+        httpd.shutdown()
+
+
 def test_stream_proxy_zero_interval_disables_keepalive():
     """With stream_keepalive_interval_s = 0, no keepalive lines should
     be injected even on a slow backend. Lets users opt out."""
