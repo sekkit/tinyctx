@@ -219,13 +219,37 @@ _JSON_RE = re.compile(
     r'\{[^{}]*"escalate"\s*:\s*(?:true|false)[^{}]*\}',
     re.DOTALL,
 )
+# Some reasoning models (qwen3-think, R1 derivatives) emit their CoT
+# inline as `<think>…</think>` in `content` rather than splitting into
+# `reasoning_content`. Strip closed think-blocks before parsing. We
+# also tolerate an unclosed leading `<think>` (CoT cut off by the token
+# cap with no JSON yet) — in that case the body is empty post-strip
+# and the parser falls through to None.
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_OPEN_THINK_RE = re.compile(r"^\s*<think>.*$", re.DOTALL | re.IGNORECASE)
 # Fallback for truncated JSON (response cut off mid-reason): salvage
 # escalate + p directly from the raw text without requiring a closing
-# brace. Live trace showed DeepSeek occasionally bleeds past the
-# token cap on verbose-mode runs.
+# brace. Live trace showed verbose models occasionally bleed past the
+# token cap.
 _ESC_RE = re.compile(r'"escalate"\s*:\s*(true|false)')
 _P_RE = re.compile(r'"p"\s*:\s*(-?\d+(?:\.\d+)?)')
 _REASON_RE = re.compile(r'"reason"\s*:\s*"([^"]*)"')
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove `<think>…</think>` blocks that some reasoning-class
+    backends leak into the content field. Handles both closed blocks
+    and an unclosed leading think tag (truncated CoT)."""
+    if not isinstance(text, str) or not text:
+        return text
+    # Remove all closed <think>…</think> blocks
+    cleaned = _THINK_RE.sub("", text)
+    # If what remains is just an unclosed <think>… (no JSON ever
+    # emitted), drop it. The fallback parser will then return None
+    # rather than scan think-content for spurious "escalate" matches.
+    if _OPEN_THINK_RE.match(cleaned):
+        return ""
+    return cleaned
 
 
 def _parse_response(text: str) -> ClassifyResult | None:
@@ -236,6 +260,9 @@ def _parse_response(text: str) -> ClassifyResult | None:
     truncated mid-reason by the token cap. Returns None if neither
     path can extract a verdict."""
     if not isinstance(text, str) or not text:
+        return None
+    text = _strip_thinking(text)
+    if not text:
         return None
     m = _JSON_RE.search(text)
     if m:
@@ -314,12 +341,18 @@ async def classify(body: dict[str, Any],
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
-        # 200 tokens is comfortably above the JSON object the prompt
-        # requests (esc + p + ≤12-word reason ≈ 30-40 tokens) but
-        # leaves headroom if the model ignores the brevity directive.
-        # Bumped from 120 after a live trace showed truncation on
-        # verbose models.
-        "max_tokens": 200,
+        # 2048 is the right shape for reasoning-class local models
+        # (qwen3.6, DeepSeek-R1 family). They burn 150-250 tokens on
+        # hidden chain-of-thought (`reasoning_content`) BEFORE emitting
+        # any visible content — at the old 120/200 cap, all budget went
+        # to reasoning and `content` came back empty with
+        # finish_reason=length. The JSON answer itself only needs
+        # ~40 tokens; the headroom is for the CoT phase.
+        # No frontier cost — this is a single local call cached 60s.
+        # Hint flags below are best-effort: backends that don't honour
+        # them ignore them silently.
+        "max_tokens": 2048,
+        "reasoning_effort": "low",
         "stream": False,
     }
     headers = {"Content-Type": "application/json"}

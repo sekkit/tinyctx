@@ -299,17 +299,21 @@ class Config:
     # decides, not infrastructure-by-bytes. See tinyctx/self_classify.py
     # for the prompt and contract.
     #
-    # Default ON. Adds ~200ms and ~$0.000035 per fresh user query
-    # (tool-result roundtrips skipped). Cached 60s by per-project key
-    # so codex retries don't re-classify.
+    # Default ON. Cost depends on local backend speed; cached 60s by
+    # per-project key so codex retries don't re-classify. Tool-result
+    # roundtrips are skipped, so this only fires on fresh user queries.
     self_classify_enabled: bool = True
     # P(escalate) >= this → frontier. 0.7 matches the existing trained-
     # classifier threshold. Lower = more aggressive escalation.
     self_classify_threshold: float = 0.7
-    # Time budget for the classifier call. If the local model is slow,
-    # we want to fail fast and let the heuristic take over rather than
-    # adding seconds of latency to every turn.
-    self_classify_timeout_s: float = 5.0
+    # Time budget for the classifier call. Reasoning-class local models
+    # (qwen3.x-think, DeepSeek-R1 family) burn 200-1500 tokens on hidden
+    # chain-of-thought before emitting the JSON verdict; at 50 tok/s that
+    # is 4-30s wall-clock. 30s default lets most cases complete and falls
+    # back gracefully (returns None → router uses other signals) on the
+    # truly slow ones. If your local model is non-reasoning, you can drop
+    # this to 5s without losing accuracy.
+    self_classify_timeout_s: float = 30.0
 
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many

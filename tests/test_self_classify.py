@@ -126,6 +126,41 @@ def test_parse_response_returns_none_for_garbage():
     assert _parse_response("{not valid json}") is None
 
 
+def test_parse_response_strips_closed_think_blocks():
+    """Some reasoning-class local models (qwen3-think, R1 derivatives)
+    leak their chain-of-thought as `<think>...</think>` inline in the
+    `content` field instead of the separate `reasoning_content` field.
+    The parser must strip those before extracting JSON, otherwise the
+    JSON-finding regex matches inside the CoT and gets wrong values."""
+    from tinyctx.self_classify import _parse_response
+    text = (
+        "<think>The user wants to escalate this. Looking at the rules, "
+        'maybe "escalate": true could fit, but actually no.</think>\n\n'
+        '{"escalate": false, "p": 0.8, "reason": "routine"}'
+    )
+    r = _parse_response(text)
+    assert r is not None
+    # Must take the JSON OUTSIDE the think block, not the spurious
+    # match inside it.
+    assert r.escalate is False
+    assert r.p == 0.8
+    assert r.reason == "routine"
+
+
+def test_parse_response_returns_none_for_unclosed_think_only():
+    """When the model's CoT is cut off mid-think (no JSON ever emitted,
+    no closing </think>), parser returns None — better to fall back to
+    routing heuristics than salvage 'escalate' words from inside the
+    CoT."""
+    from tinyctx.self_classify import _parse_response
+    text = (
+        "<think>I need to decide whether to escalate. Looking at "
+        "the rules: this might be 'escalate: true' if the work is..."
+    )
+    r = _parse_response(text)
+    assert r is None
+
+
 def test_parse_response_handles_missing_optional_fields():
     """If reason / p are missing, defaults are used and result is still
     valid (don't drop the whole response over a missing optional)."""
