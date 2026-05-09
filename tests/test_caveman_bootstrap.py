@@ -135,6 +135,80 @@ def test_patch_codex_config_creates(isolated):
     assert '"/u/b/node"' in txt
 
 
+def test_default_install_does_not_register_standalone_mcp_block(monkeypatch,
+                                                                  isolated):
+    """caveman-shrink is middleware that wraps another MCP server, NOT a
+    standalone server. Auto-registering [mcp_servers.caveman-shrink] with
+    no upstream args produces a server that crashes immediately on spawn
+    ("missing upstream command"). Default install must NOT write that
+    block."""
+    _, vendor, codex = isolated
+    (vendor / ".git").mkdir(parents=True, exist_ok=True)
+    entry = vendor / cb.SHRINK_REL_PATH
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("// fake")
+    monkeypatch.setattr(cb, "_which",
+                        lambda c: f"/u/b/{c}" if c in ("git", "node", "npm") else "")
+    monkeypatch.setattr(cb, "_run", lambda *a, **kw: (True, "ok"))
+    cb.bootstrap(vendor_dir=vendor, codex_config=codex)
+    if codex.is_file():
+        assert "[mcp_servers.caveman-shrink]" not in codex.read_text()
+
+
+def test_default_install_strips_existing_broken_block(monkeypatch, isolated):
+    """If a previous version of this bootstrap (or anything else) wrote
+    a standalone [mcp_servers.caveman-shrink] block that codex can't
+    actually start, the new default install must remove it on next run."""
+    _, vendor, codex = isolated
+    (vendor / ".git").mkdir(parents=True, exist_ok=True)
+    entry = vendor / cb.SHRINK_REL_PATH
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("// fake")
+    codex.parent.mkdir(parents=True, exist_ok=True)
+    codex.write_text(
+        "[mcp_servers.advisor]\n"
+        'cmd = "x"\n\n'
+        "# Added by tinyctx (caveman_bootstrap). [legacy broken]\n"
+        "[mcp_servers.caveman-shrink]\n"
+        'type = "stdio"\n'
+        'command = "/u/b/node"\n'
+        'args = ["/path/to/index.js"]\n'
+    )
+    monkeypatch.setattr(cb, "_which",
+                        lambda c: f"/u/b/{c}" if c in ("git", "node", "npm") else "")
+    monkeypatch.setattr(cb, "_run", lambda *a, **kw: (True, "ok"))
+    report = cb.bootstrap(vendor_dir=vendor, codex_config=codex)
+    final = codex.read_text()
+    assert "[mcp_servers.caveman-shrink]" not in final
+    assert "[mcp_servers.advisor]" in final
+    assert any("stripped broken" in a for a in report.actions)
+
+
+def test_npm_install_invoked_during_vendor(monkeypatch, isolated):
+    """After git clone the bootstrap must run `npm install` in
+    mcp-servers/caveman-shrink/ so caveman-shrink's runtime deps are
+    present. Without this the server crashes with 'Cannot find module'."""
+    _, vendor, codex = isolated
+    (vendor / "mcp-servers" / "caveman-shrink").mkdir(parents=True)
+    captured: list = []
+
+    def _fake_run(cmd, *, timeout=300, cwd=None):
+        captured.append((cmd, cwd))
+        return True, "ok"
+
+    monkeypatch.setattr(cb, "_run", _fake_run)
+    monkeypatch.setattr(cb, "_which",
+                        lambda c: f"/u/b/{c}" if c in ("git", "node", "npm") else "")
+    state = cb.detect_state(vendor=vendor, codex_config=codex)
+    cb.npm_install_shrink(state, vendor_dir=vendor)
+    npm_calls = [c for c in captured
+                 if c[0] and c[0][0].endswith("npm")]
+    assert npm_calls
+    cmd, cwd = npm_calls[0]
+    assert "install" in cmd
+    assert cwd and cwd.endswith("caveman-shrink")
+
+
 def test_patch_codex_config_idempotent(isolated):
     _, vendor, codex = isolated
     state = cb.State(entry_present=True, node_path="/u/b/node",

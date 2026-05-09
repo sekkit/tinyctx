@@ -106,6 +106,25 @@ def test_install_chain_dry_run(monkeypatch, isolated):
     assert called == []
 
 
+def test_patch_codex_config_uses_start_mcp_server_not_mode_codex(isolated):
+    """Serena CLI rejects `--mode codex` ("No such option") — earlier
+    bootstrap versions wrote that and codex's MCP spawn timed out at 15s.
+    Correct invocation is `serena start-mcp-server` (verified live
+    2026-05-10: returns init in ~1s with caps=tools)."""
+    _, codex = isolated
+    state = sb.State(serena_path="/u/b/serena")
+    sb.patch_codex_config(state, config_path=codex)
+    txt = codex.read_text()
+    # Look at only the `args = [...]` line (not comments which legitimately
+    # mention the broken --mode codex form for documentation).
+    args_line = next((ln for ln in txt.splitlines()
+                      if ln.lstrip().startswith("args ")), "")
+    assert args_line, "args = [...] line missing"
+    assert "start-mcp-server" in args_line
+    assert "--mode" not in args_line, \
+        f"args line still has broken --mode flag: {args_line!r}"
+
+
 def test_patch_codex_config_creates(isolated):
     _, codex = isolated
     state = sb.State(serena_path="/u/b/serena-mcp-server")

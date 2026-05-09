@@ -50,10 +50,13 @@ _SERENA_CONFIG_BLOCK_TEMPLATE = """
 # Added by tinyctx (serena_bootstrap). Safe to delete or edit.
 # Serena: LSP-backed symbolic code-operations MCP server.
 # Source: https://github.com/oraios/serena
+# Spawn shape verified live 2026-05-10: `serena start-mcp-server` returns
+# init in < 1s with caps=tools. The bare `serena` CLI rejects `--mode codex`
+# (no such option), so don't fall back to that.
 {marker}
 type = "stdio"
 command = "{cmd}"
-args = ["--mode", "codex"]
+args = ["start-mcp-server"]
 startup_timeout_sec = 30.0
 """
 
