@@ -270,6 +270,15 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
+    # Auto-register external MCP servers (graphify, gitnexus) into
+    # ~/.codex/config.toml on proxy startup. The registration is
+    # idempotent (managed block between BEGIN/END markers, replaced
+    # byte-for-byte on subsequent runs) and skipped entirely when the
+    # tools aren't on PATH. See tinyctx/mcp_registry.py for the full
+    # contract — what gets touched, what doesn't, and license notes
+    # (gitnexus is PolyForm Noncommercial, logged on detection).
+    auto_register_mcp_servers: bool = True
+
     # Auto-scout: zero-config project context bootstrap.
     # When True, the proxy reads `x-codex-cwd` from each request and
     # ensures ~/.tinyctx/cache/<repo-hash>/scout.md exists for that

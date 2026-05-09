@@ -195,6 +195,22 @@ def _session_id(request: Request, body: dict[str, Any]) -> str:
     return sid or "global"
 
 
+@APP.on_event("startup")
+def _auto_register_mcp_servers_on_startup() -> None:
+    """One-shot: detect graphify/gitnexus, register them into
+    ~/.codex/config.toml. Idempotent across restarts. See mcp_registry
+    module for the full contract. Toggle off via
+    CFG.auto_register_mcp_servers = False (or env-equivalent)."""
+    if not CFG.auto_register_mcp_servers:
+        return
+    try:
+        from . import mcp_registry
+        result = mcp_registry.bootstrap(log_fn=lambda ev, **fields: _log(ev, **fields))
+        _log("mcp_registry_bootstrap_done", **result)
+    except Exception as e:  # noqa: BLE001 — never let startup hook crash the proxy
+        _log("mcp_registry_bootstrap_failed", error=str(e))
+
+
 @APP.get("/")
 def root() -> dict[str, Any]:
     return {
