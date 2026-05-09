@@ -270,6 +270,20 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
+    # Auto-scout: zero-config project context bootstrap.
+    # When True, the proxy reads `x-codex-cwd` from each request and
+    # ensures ~/.tinyctx/cache/<repo-hash>/scout.md exists for that
+    # project — building it asynchronously the first time, injecting it
+    # into request.instructions on subsequent requests. See
+    # tinyctx/auto_scout.py for the full pipeline.
+    auto_scout: bool = True
+    # When True AND `graphify` is missing on PATH, attempt a one-shot
+    # `pipx install graphifyy` during the first project bootstrap. False
+    # by default — auto-installing OS-level packages is intrusive even
+    # if the user opted into "transparent" mode. The fallback in-tree
+    # scanner works without this.
+    auto_scout_install_graphify: bool = False
+
     # If set, force every request through one of {"local", "frontier", "auto"}.
     # Useful for debugging.
     force_route: str = field(default_factory=lambda: _env("TINYCTX_FORCE_ROUTE", "auto") or "auto")

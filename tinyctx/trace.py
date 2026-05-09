@@ -125,6 +125,13 @@ class RequestTrace:
     tools_trimmed_after: int = 0
     tools_trimmed_dropped: list = field(default_factory=list)
 
+    # Auto-scout: project-context summary auto-injected into instructions.
+    # `scout_injected` is True when the cached scout.md was read AND
+    # prepended to body.instructions on this request. `scout_chars` is
+    # the cached file's size for cost accounting.
+    scout_injected: bool = False
+    scout_chars: int = 0
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

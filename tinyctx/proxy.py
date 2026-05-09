@@ -35,6 +35,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from . import auto_scout
 from .compactor import (
     build_responses_api_payload,
     build_responses_api_sse,
@@ -383,6 +384,28 @@ async def responses(request: Request) -> Any:
             if decision.route == "local" and CFG.proactive_compact_only_on_frontier
             else "disabled_or_compaction"
         )
+
+    # Auto-scout: zero-config project context bootstrap. Reads
+    # `x-codex-cwd` header (codex sends it), looks up
+    # ~/.tinyctx/cache/<repo-hash>/scout.md, prepends it to instructions
+    # if present. If absent, schedules a background build (graphify if
+    # available, else in-tree fallback scanner) so the NEXT request gets
+    # the context. Never blocks. Silent on failure. See auto_scout.py.
+    if CFG.auto_scout:
+        try:
+            cwd_hdr = request.headers.get("x-codex-cwd")
+            auto_scout.schedule_bootstrap(
+                cwd_hdr,
+                install_graphify=CFG.auto_scout_install_graphify,
+            )
+            scout_md = auto_scout.get_scout(cwd_hdr)
+            if scout_md:
+                body, was_injected = auto_scout.inject_into_body(body, scout_md)
+                trace.scout_injected = was_injected
+                if was_injected:
+                    trace.scout_chars = len(scout_md)
+        except Exception as e:  # noqa: BLE001 — auto-scout must never fail forward
+            _log("auto_scout_error", session=sid, error=str(e))
 
     # Inject the advisor sub-agent usage hint into instructions BEFORE
     # rewrite_model — the inject function reads body.model to skip the
