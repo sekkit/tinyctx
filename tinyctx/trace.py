@@ -37,6 +37,11 @@ class RequestTrace:
     stream errors, etc.)."""
     request_id: str = field(default_factory=lambda: "rq_" + uuid4().hex[:20])
     session_id: str = ""
+    # Composite key (cwd_hash + session_id) used for per-conversation
+    # state so multi-project users don't suffer cross-project pollution
+    # in proactive_compact cache, error_streak escalation, and
+    # mutation-gate timing. See proxy._project_session_key.
+    project_session_key: str = ""
     started_at: float = field(default_factory=time.time)
 
     # routing decision

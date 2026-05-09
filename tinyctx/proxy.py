@@ -195,6 +195,30 @@ def _session_id(request: Request, body: dict[str, Any]) -> str:
     return sid or "global"
 
 
+def _project_session_key(request: Request, sid: str) -> str:
+    """Composite key scoping per-session state to per-project as well.
+
+    codex.app currently does NOT send `x-codex-session-id`, so almost
+    all traces end up with sid="global" — if we keyed proactive_compact
+    cache, error_streak, and mutation-gate timing on sid alone, projects
+    would cross-contaminate (project A's summary injected into project B,
+    A's failure escalating B to frontier, etc.).
+
+    This combines sid with a hash of `x-codex-cwd` (which codex DOES
+    send and auto_scout already uses) to get true per-project isolation
+    even when the upstream collapses sessions to "global".
+
+    Falls back to plain `sid` when cwd header is absent (no regression
+    for existing callers; the behavior is just unscoped same as before).
+    """
+    import hashlib
+    cwd = request.headers.get("x-codex-cwd") or ""
+    if not cwd:
+        return sid
+    cwd_hash = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:8]
+    return f"{cwd_hash}:{sid}"
+
+
 @APP.on_event("startup")
 def _auto_register_mcp_servers_on_startup() -> None:
     """One-shot: detect graphify/gitnexus, register them into
@@ -255,8 +279,17 @@ async def responses(request: Request) -> Any:
     raw_body = json.loads(json.dumps(body))
 
     sid = _session_id(request, body)
+    # State that's per-conversation must scope to per-project too — otherwise
+    # all "global" sessions across different repos cross-contaminate. See
+    # `_project_session_key` for the rationale. We pass `proj_sid` to anything
+    # that holds per-session state (proactive_compact cache, error_streak,
+    # mutation gate timing); plain `sid` stays in trace records and logs so
+    # the user-visible session id is the codex one (not the prefix-hashed
+    # composite).
+    proj_sid = _project_session_key(request, sid)
     trace = RequestTrace(session_id=sid)
-    streak = _SESSION_ERROR_STREAK[sid]
+    trace.project_session_key = proj_sid
+    streak = _SESSION_ERROR_STREAK[proj_sid]
     decision = decide(body, CFG, error_streak=streak)
     backend = _select_backend(decision)
 
@@ -297,7 +330,7 @@ async def responses(request: Request) -> Any:
     trace.mutation_wanted = want_mutation
     if want_mutation:
         fire, gate_reason = _MUTATOR.should_apply(
-            sid,
+            proj_sid,
             est_tokens=decision.est_input_tokens,
             max_tokens=int(body.get("metadata", {}).get("context_window")
                            or CFG.default_context_window),
@@ -324,7 +357,7 @@ async def responses(request: Request) -> Any:
                 if "<tinyctx-historian-digest" in json.dumps(body) and \
                    "<tinyctx-historian-digest" not in pre_sub:
                     trace.historian_substituted = True
-            _MUTATOR.mark_applied(sid)
+            _MUTATOR.mark_applied(proj_sid)
 
     # Async background: run the Historian update if enabled. We hand it the
     # ORIGINAL request body (pre-mutation) so it sees pristine history, in
@@ -379,7 +412,7 @@ async def responses(request: Request) -> Any:
         body, pc_info = await asyncio.to_thread(
             proactive_compact,
             body,
-            session_id=sid,
+            session_id=proj_sid,  # composite key — see _project_session_key
             est_tokens=decision.est_input_tokens,
             threshold_tokens=pc_threshold,
             recent_keep=CFG.proactive_compact_recent_keep,
@@ -543,7 +576,7 @@ async def responses(request: Request) -> Any:
             and CFG.compactor_debate
             and decision.est_input_tokens >= CFG.compactor_min_history_tokens):
         trace.compactor_used = True
-        return await _compactor_response(body, backend, is_stream, sid,
+        return await _compactor_response(body, backend, is_stream, proj_sid,
                                          project_root=request.headers.get("x-codex-cwd"),
                                          trace=trace)
 
@@ -585,7 +618,7 @@ async def responses(request: Request) -> Any:
     except Exception:  # noqa: BLE001 — instrumentation must never fail forward
         pass
 
-    return await _forward(url, headers, forward_body, is_stream, sid, decision,
+    return await _forward(url, headers, forward_body, is_stream, proj_sid, decision,
                           translate_tool_calls=backend.translate_tool_calls,
                           chat_to_responses=(backend.wire_api != "responses"),
                           trace=trace)
@@ -603,20 +636,22 @@ async def chat_completions(request: Request) -> Any:
         raise HTTPException(400, f"invalid JSON: {e}")
 
     sid = _session_id(request, body)
-    streak = _SESSION_ERROR_STREAK[sid]
+    proj_sid = _project_session_key(request, sid)
+    streak = _SESSION_ERROR_STREAK[proj_sid]
     decision = decide(body, CFG, error_streak=streak)
     backend = _select_backend(decision)
 
     if backend.model:
         body["model"] = backend.model
 
-    _log("route_chat", session=sid, decision=decision.route, reason=decision.reason,
+    _log("route_chat", session=sid, project_session=proj_sid,
+         decision=decision.route, reason=decision.reason,
          target=backend.base_url, model=backend.model)
 
     headers = _forward_headers(request, backend)
     url = backend.base_url.rstrip("/") + "/chat/completions"
     return await _forward(url, headers, body, bool(body.get("stream", False)),
-                          sid, decision,
+                          proj_sid, decision,
                           translate_tool_calls=backend.translate_tool_calls)
 
 
