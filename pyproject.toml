@@ -1,6 +1,6 @@
 [project]
 name = "tinyctx"
-version = "0.1.0"
+version = "0.7.0"
 description = "Codex CLI Responses-API context-routing proxy: local cheap by default, frontier on demand"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -26,6 +26,12 @@ tinyctx-keypin = "tinyctx.keypin:main"
 tinyctx-mem = "tinyctx.memory:main"
 tinyctx-dreamer = "tinyctx.dreamer:main"
 tinyctx-trace = "tinyctx.trace:main"
+tinyctx-gitnexus = "tinyctx.gitnexus_bootstrap:main"
+tinyctx-graphify = "tinyctx.graphify_bootstrap:main"
+tinyctx-serena = "tinyctx.serena_bootstrap:main"
+tinyctx-caveman = "tinyctx.caveman_bootstrap:main"
+tinyctx-scout-hook = "tinyctx.scout_hook_bootstrap:main"
+tinyctx-lingua = "tinyctx.lingua:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -44,6 +44,8 @@ from .compactor import (
 from .config import BackendCfg, Config, effective_proactive_compact_threshold, load_config
 from .continuity import save_compaction
 from . import historian
+from . import lingua
+from .read_delta import collapse_repeated_reads
 from .router import Decision, decide
 from .sanitize import (
     CacheAwareMutator,
@@ -498,11 +500,12 @@ async def responses(request: Request) -> Any:
         body = strip_encrypted_content(body)
 
     # Cache-aware gate for history mutations: only fire dedup/purge/historian
-    # substitution when the cache prefix is likely stale anyway (TTL elapsed)
-    # or we're heading into a forced compaction (context-usage threshold).
-    # Otherwise leave history untouched so prompt-cache reads stay cheap.
+    # substitution / read_delta when the cache prefix is likely stale anyway
+    # (TTL elapsed) or we're heading into a forced compaction (context-usage
+    # threshold). Otherwise leave history untouched so prompt-cache reads
+    # stay cheap.
     want_mutation = (CFG.dedup_tool_calls or CFG.purge_failed_tool_inputs
-                     or CFG.historian_substitute)
+                     or CFG.historian_substitute or CFG.read_delta_enabled)
     trace.mutation_wanted = want_mutation
     if want_mutation:
         fire, gate_reason = _MUTATOR.should_apply(
@@ -515,6 +518,31 @@ async def responses(request: Request) -> Any:
         trace.mutation_gate_reason = gate_reason
         _log("mutation_gate", session=sid, fire=fire, reason=gate_reason)
         if fire:
+            # Order matters: read_delta MUST run before dedup_tool_calls.
+            # dedup hashes by (name, arguments) and two Reads of the same
+            # path have identical arguments — so dedup collapses the
+            # earlier read's args+output to a placeholder, leaving
+            # read_delta with only 1 candidate (no repeat detected).
+            # read_delta is strictly better for re-reads because it
+            # preserves the diff; dedup just throws old content away.
+            # After read_delta runs, dedup still fires for non-Read
+            # tools (shell, ls, etc.) where dedup is the right tool.
+            if CFG.read_delta_enabled:
+                body, rd_info = collapse_repeated_reads(
+                    body,
+                    min_bytes=CFG.read_delta_min_bytes,
+                    max_diff_budget=CFG.read_delta_max_diff_budget,
+                )
+                trace.read_delta_applied = rd_info["applied"]
+                trace.read_delta_candidates = rd_info["candidates"]
+                trace.read_delta_replacements = rd_info["replacements"]
+                trace.read_delta_bytes_saved = rd_info["bytes_saved"]
+                trace.read_delta_paths = rd_info["paths"][:20]
+                if rd_info["applied"]:
+                    _log("read_delta", session=sid,
+                         replacements=rd_info["replacements"],
+                         bytes_saved=rd_info["bytes_saved"],
+                         paths=rd_info["paths"][:20])
             if CFG.dedup_tool_calls:
                 pre_dedup = json.dumps(body)
                 body = dedup_tool_calls(body)
@@ -719,6 +747,32 @@ async def responses(request: Request) -> Any:
             _log("cap_fields", session=sid,
                  capped={p: {"from": before_caps[p], "to": after_caps[p]}
                          for p in capped})
+
+    # Frontier-only: LLMLingua-2 pre-escalation compression of bulky
+    # tool-result payloads. Default off; gated by `frontier_lingua_enabled`.
+    # Targets only function_call_output / tool_result items (skips
+    # instructions / tools / user / assistant messages — all cache-critical).
+    # Cache-aware: only fires when CacheAwareMutator already opened the gate
+    # for THIS request (we reuse the same `fire` decision computed earlier).
+    if (decision.route == "frontier"
+            and CFG.frontier_lingua_enabled
+            and lingua.is_available()):
+        lingua_fire = trace.mutation_fired or want_mutation
+        if lingua_fire:
+            body, lg_info = lingua.compress_for_frontier(
+                body,
+                ratio=CFG.frontier_lingua_ratio,
+                model_name=lingua.DEFAULT_MODEL,
+            )
+            trace.lingua_applied = lg_info["applied"]
+            trace.lingua_items_compressed = lg_info["items_compressed"]
+            trace.lingua_chars_before = lg_info["chars_before"]
+            trace.lingua_chars_after = lg_info["chars_after"]
+            if lg_info["applied"]:
+                _log("lingua", session=sid,
+                     items=lg_info["items_compressed"],
+                     bytes_before=lg_info["chars_before"],
+                     bytes_after=lg_info["chars_after"])
 
     # Frontier-only: trim the tools array to what was actually used in
     # the recent window + an essentials allowlist. Codex sends ~50 tools

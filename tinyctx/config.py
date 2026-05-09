@@ -216,6 +216,22 @@ class Config:
     mutation_threshold: float = 0.65   # context usage trigger (0..1)
     default_context_window: int = 1_000_000  # used when request doesn't say
 
+    # Repeat-Read delta compression (alexgreensh/token-optimizer-style).
+    # When the executor re-reads the same file across turns, replace
+    # later occurrences in body.input with a unified diff against the
+    # first read. Cuts a per-turn 5–50 KB stable-bytes payload down to
+    # a few hundred bytes when the file barely changed (or to "unchanged"
+    # when it didn't change at all). Gated by the same CacheAwareMutator
+    # as dedup/purge — only fires when the cache prefix is likely stale.
+    read_delta_enabled: bool = True
+    # Outputs below this many chars are skipped (placeholder overhead
+    # would dominate). 400 ≈ 100 tokens.
+    read_delta_min_bytes: int = 400
+    # If the diff would be larger than (original × this fraction), keep
+    # the original — a re-write doesn't compress and we'd just churn
+    # cache. 0.85 leaves a meaningful win required.
+    read_delta_max_diff_budget: float = 0.85
+
     # Proactive history truncation (proxy-side defense against "Codex ran
     # out of room"). When est_input_tokens reaches this threshold AND the
     # request is NOT codex's own compaction request, the proxy rewrites
@@ -371,11 +387,10 @@ class Config:
 
     # Auto-register external MCP servers (graphify, gitnexus) into
     # ~/.codex/config.toml on proxy startup. The registration is
-    # idempotent (managed block between BEGIN/END markers, replaced
-    # byte-for-byte on subsequent runs) and skipped entirely when the
-    # tools aren't on PATH. See tinyctx/mcp_registry.py for the full
-    # contract — what gets touched, what doesn't, and license notes
-    # (gitnexus is PolyForm Noncommercial, logged on detection).
+    # idempotent (delegates to _codex_toml.append_mcp_block — line-exact
+    # marker check + fcntl.flock to prevent races with the explicit
+    # bootstrap modules below) and skipped entirely when the tools
+    # aren't on PATH. See tinyctx/mcp_registry.py for the full contract.
     auto_register_mcp_servers: bool = True
 
     # Auto-scout: zero-config project context bootstrap.
@@ -391,6 +406,27 @@ class Config:
     # if the user opted into "transparent" mode. The fallback in-tree
     # scanner works without this.
     auto_scout_install_graphify: bool = False
+
+    # LLMLingua-2 pre-escalation prompt compression for the frontier path.
+    # Microsoft's LLMLingua-2 (microsoft/LLMLingua, MIT) compresses tool-
+    # result payloads before forwarding to the frontier model. Empirically
+    # 2-5× compression on long contexts with no quality loss on coding/QA.
+    #
+    # Default OFF because:
+    #   1. Heavy first-load (downloads ~hundreds of MB of model weights)
+    #   2. Mutates wire bytes — must be cache-aware-gated like
+    #      dedup/purge/read_delta to preserve prompt-cache hits
+    #   3. Requires `pip install 'tinyctx[compress]'` (optional dep)
+    #
+    # Opt-in path: install dep + flip this flag in config.toml. The hook
+    # will lazy-import llmlingua and gracefully no-op if missing.
+    frontier_lingua_enabled: bool = False
+    # Compression aggressiveness. 0.5 = keep ~50% of tokens. Conservative
+    # 0.6-0.7 gives 1.5-2× shrink without quality loss. Below 0.4 starts
+    # losing detail.
+    frontier_lingua_ratio: float = 0.5
+    # Items below this many chars aren't worth compressing.
+    frontier_lingua_min_bytes: int = 800
 
     # If set, force every request through one of {"local", "frontier", "auto"}.
     # Useful for debugging.
@@ -433,6 +469,9 @@ def load_config() -> Config:
       3. TINYCTX_* env vars (env overrides file)
     """
     cfg = Config()
+    log_override = _env("TINYCTX_LOG_DIR")
+    if log_override:
+        cfg.log_dir = Path(log_override).expanduser()
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 2 — file

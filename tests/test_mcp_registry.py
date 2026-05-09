@@ -9,6 +9,9 @@ write their codex-config blocks. Tests guard the contract:
   - re-running adds/removes tools without touching the rest of the file
   - missing config file → graceful no-op
   - backup is made before the first write of the day
+  - coexists with explicit per-section bootstraps (gitnexus_bootstrap, etc.):
+    if a `[mcp_servers.<name>]` already exists OUTSIDE the BEGIN/END managed
+    block, mcp_registry skips it instead of producing a duplicate key
 """
 from __future__ import annotations
 
@@ -285,3 +288,86 @@ def test_auto_register_mcp_defaults_to_enabled():
     from tinyctx.config import Config
     cfg = Config()
     assert cfg.auto_register_mcp_servers is True
+
+
+# ─── coexistence with explicit per-section bootstraps ─────────────────────
+
+
+def test_register_skips_tool_when_already_in_outside_section(tmp_path):
+    """When tinyctx-gitnexus install (or some other tool) has already
+    written `[mcp_servers.gitnexus]` outside the BEGIN/END managed block,
+    mcp_registry must DETECT and SKIP it. Otherwise codex's TOML parser
+    rejects the file with `duplicate key`. This is the exact bug we hit
+    in production on 2026-05-10."""
+    from tinyctx import mcp_registry
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "model = 'x'\n\n"
+        "# Added by tinyctx (gitnexus_bootstrap)\n"
+        "[mcp_servers.gitnexus]\n"
+        'type = "stdio"\n'
+        'command = "/u/g"\n',
+        encoding="utf-8",
+    )
+    snap_before = cfg.read_text()
+    changed, msg = mcp_registry.register_in_codex_config(
+        [_fake_tool("gitnexus", "/u/g")], config_path=cfg)
+    assert changed is False
+    assert "already registered outside the managed block" in msg
+    # NO managed block introduced (would have caused duplicate)
+    assert mcp_registry.MANAGED_BEGIN not in cfg.read_text()
+    assert cfg.read_text() == snap_before
+    # Exactly one [mcp_servers.gitnexus] in the file
+    assert sum(1 for ln in cfg.read_text().splitlines()
+               if ln.strip() == "[mcp_servers.gitnexus]") == 1
+
+
+def test_register_partial_skip_keeps_other_tools(tmp_path):
+    """If we have 2 detected tools and one is already pre-registered
+    outside the block, the other one still goes into the managed block."""
+    from tinyctx import mcp_registry
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[mcp_servers.gitnexus]\n"
+        'type = "stdio"\n'
+        'command = "/u/g"\n',
+        encoding="utf-8",
+    )
+    changed, msg = mcp_registry.register_in_codex_config(
+        [_fake_tool("gitnexus", "/u/g"),
+         _fake_tool("othersrv", "/u/o")],
+        config_path=cfg,
+    )
+    assert changed is True
+    final = cfg.read_text()
+    assert "skipped 1" in msg
+    assert "gitnexus" in msg
+    # Only one [mcp_servers.gitnexus] (preserved from outside)
+    assert sum(1 for ln in final.splitlines()
+               if ln.strip() == "[mcp_servers.gitnexus]") == 1
+    # The new tool DID land in managed block
+    assert "[mcp_servers.othersrv]" in final
+    assert mcp_registry.MANAGED_BEGIN in final
+
+
+def test_register_does_not_match_marker_inside_comment(tmp_path):
+    """A comment that mentions `[mcp_servers.gitnexus]` (e.g. user
+    documentation) must NOT cause mcp_registry to skip writing the
+    real section. Line-exact check, not substring."""
+    from tinyctx import mcp_registry
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "# documentation: see [mcp_servers.gitnexus] format docs at ...\n"
+        "model = 'x'\n",
+        encoding="utf-8",
+    )
+    changed, _ = mcp_registry.register_in_codex_config(
+        [_fake_tool("gitnexus", "/u/g")], config_path=cfg)
+    assert changed is True
+    final = cfg.read_text()
+    # The real section was added (inside managed block)
+    real_lines = [ln for ln in final.splitlines()
+                  if ln.strip() == "[mcp_servers.gitnexus]"]
+    assert len(real_lines) == 1
+    # Doc comment preserved
+    assert "see [mcp_servers.gitnexus] format docs" in final

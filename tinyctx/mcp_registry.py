@@ -202,8 +202,32 @@ def register_in_codex_config(
     except OSError as e:
         return False, f"could not read {config_path}: {e}"
 
+    # Coexist with explicit per-section bootstrap modules
+    # (gitnexus_bootstrap / serena_bootstrap / etc.) which write
+    # `[mcp_servers.<name>]` outside our BEGIN/END managed block. Both
+    # paths target the same TOML keys, and codex rejects duplicates.
+    # We use _codex_toml's line-exact match (NOT substring — comments
+    # mentioning the marker must not trigger false positives) on the
+    # text WITH our managed block stripped, so a section we previously
+    # wrote ourselves doesn't false-positive.
+    from . import _codex_toml as _ct
+    text_outside_block = _strip_existing_block(original)
+    skipped_already: list[str] = []
+    final_tools: list[DetectedTool] = []
+    for t in tools_list:
+        marker = f"[mcp_servers.{t.name}]"
+        if _ct._marker_present(text_outside_block, marker):
+            skipped_already.append(t.name)
+            continue
+        final_tools.append(t)
+    if not final_tools:
+        return False, (
+            f"all detected tools already registered outside the managed "
+            f"block ({','.join(skipped_already)}); leaving alone"
+        )
+
     cleaned = _strip_existing_block(original)
-    new_block = _build_managed_block(tools_list)
+    new_block = _build_managed_block(final_tools)
     # Place block at end of file, with one separating blank line
     if cleaned and not cleaned.endswith("\n"):
         cleaned += "\n"
@@ -213,7 +237,7 @@ def register_in_codex_config(
 
     if new_text == original:
         return False, (
-            f"managed MCP block already in sync ({len(tools_list)} tool(s))"
+            f"managed MCP block already in sync ({len(final_tools)} tool(s))"
         )
 
     # Backup before write
@@ -223,11 +247,13 @@ def register_in_codex_config(
     except OSError as e:
         return False, f"could not write {config_path}: {e}"
 
+    skipped_note = (f" (skipped {len(skipped_already)} already-registered: "
+                    f"{','.join(skipped_already)})") if skipped_already else ""
     return True, (
-        f"updated {config_path} with {len(tools_list)} MCP server(s); "
+        f"updated {config_path} with {len(final_tools)} MCP server(s){skipped_note}; "
         f"backup at {bak}"
         if bak else
-        f"updated {config_path} with {len(tools_list)} MCP server(s) (no backup)"
+        f"updated {config_path} with {len(final_tools)} MCP server(s){skipped_note} (no backup)"
     )
 
 
