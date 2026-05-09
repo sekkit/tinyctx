@@ -5,10 +5,11 @@
 # Steps:
 #   1) Python venv + install proxy deps.
 #   2) Copy a starter config to ~/.tinyctx/config.toml if absent.
-#   3) Install the recommended MCP servers (graphify, serena) via pipx/uv if missing.
-#   4) Print a config block for ~/.codex/config.toml that enables the proxy
-#      and registers the MCP servers. We do NOT auto-edit the codex config —
-#      we print it and let the user paste it (or pipe into a hook).
+#   3) Install the recommended MCP servers (graphify, serena, etc.) and
+#      register them in ~/.codex/config.toml via per-server bootstrap modules.
+#   4) Auto-write [model_providers.tinyctx] + [profiles.tinyctx] to
+#      ~/.codex/config.toml so `codex --profile tinyctx` just works after
+#      install with no manual paste step. Each block is idempotent.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -72,6 +73,11 @@ echo "  - bootstrapping caveman-shrink (output compression MCP)"
 "$ROOT/.venv/bin/python" -m tinyctx.caveman_bootstrap install --quiet \
   || echo "    (caveman bootstrap had warnings — run tinyctx-caveman status)"
 
+# --- 3g. advisor: built-in frontier-consultation MCP (Anthropic Advisor Strategy).
+echo "  - registering advisor MCP in ~/.codex/config.toml"
+"$ROOT/.venv/bin/python" -m tinyctx.advisor_bootstrap install --quiet \
+  || echo "    (advisor bootstrap had warnings — run python -m tinyctx.advisor_bootstrap status)"
+
 # --- 3d. mem0: cross-session project memory (optional dep).
 echo "  - bootstrapping mem0 (cross-session memory, optional)"
 if [ "${TINYCTX_MEM0_DISABLE:-0}" = "1" ]; then
@@ -99,52 +105,27 @@ fi
 
 # (caveman handled by step 3c above via tinyctx.caveman_bootstrap)
 
-# --- 4. Print codex config snippet ------------------------------------------
+# --- 4. Auto-write [model_providers.tinyctx] + [profiles.tinyctx] -----------
+# Without these two blocks `codex --profile tinyctx` errors with "profile
+# not found" — meaning the proxy is up but codex never reaches it. Each
+# bootstrap is idempotent (uses _codex_toml.append_mcp_block) so re-running
+# install.sh is safe.
+echo "  - registering [model_providers.tinyctx] + [profiles.tinyctx] in ~/.codex/config.toml"
+"$ROOT/.venv/bin/python" -m tinyctx.codex_profile_bootstrap install --quiet \
+  || echo "    (codex profile registration had warnings — run python -m tinyctx.codex_profile_bootstrap status)"
+
 cat <<'EOF'
 
-[tinyctx] All done. To wire codex CLI to the proxy, append this to ~/.codex/config.toml:
-
-    [model_providers.tinyctx]
-    name = "tinyctx local-first router"
-    base_url = "http://127.0.0.1:4141/v1"
-    wire_api = "responses"
-    request_max_retries = 4
-    stream_max_retries = 10
-    stream_idle_timeout_ms = 300000
-    # No env_key -> codex's existing Authorization header is forwarded.
-
-    [profiles.tinyctx]
-    model_provider = "tinyctx"
-    model = "tinyctx-auto"
-    model_context_window = 400000
-    model_auto_compact_token_limit = 64000
-
-Then start the proxy and use codex with the profile:
+[tinyctx] All done. Start the proxy and use codex with the profile:
 
     ./scripts/start.sh           # in another terminal
     codex --profile tinyctx      # everything routes through tinyctx now
 
-To wire the MCP servers (only the ones you installed):
-
-    [mcp_servers.graphify]
-    type = "stdio"
-    command = "graphify"
-    args = ["mcp", "graphify-out/graph.json"]
-
-    [mcp_servers.serena]
-    type = "stdio"
-    command = "serena-mcp"
-
-    # Output / tool-description compression (~65% token savings).
-    # See $TINYCTX_HOME/vendor/caveman/mcp-servers/caveman-shrink for setup.
-    # [mcp_servers.caveman-shrink]
-    # type = "stdio"
-    # command = "node"
-    # args = ["$TINYCTX_HOME/vendor/caveman/mcp-servers/caveman-shrink/index.js"]
-
-    # Compression-biased PageRank ranker (consumes graphify's graph.json).
-    # Paper: arxiv 2603.20396 §5.1.
-    # Use as a CLI:
-    #   .venv/bin/python -m tinyctx.interest graphify-out/graph.json "auth token"
+Disable any of the auto-wiring at install time:
+    TINYCTX_CODEX_PROFILE_DISABLE=1   # don't write [model_providers.tinyctx] / [profiles.tinyctx]
+    TINYCTX_ADVISOR_DISABLE=1         # don't register [mcp_servers.advisor]
+    TINYCTX_GITNEXUS_DISABLE=1        # don't install/register gitnexus
+    TINYCTX_SCOUT_HOOK_DISABLE=1      # don't register scout SessionStart hook
+    (see each tinyctx/*_bootstrap.py for the full list)
 
 EOF

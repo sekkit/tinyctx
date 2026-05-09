@@ -23,7 +23,19 @@
 set -u
 
 KIND="${1:-unknown}"
-CM_BIN="${CM_BIN:-/Users/sekkit/.local/node/bin/context-mode}"
+# Resolve context-mode binary in this priority order:
+#   1) explicit CM_BIN env override
+#   2) $HOME/.local/node/bin/context-mode (default tinyctx layout)
+#   3) anything named context-mode on PATH (npm/yarn/global installs)
+# Falls back to the unresolved name; the [-x] check below short-circuits
+# cleanly if no executable exists.
+if [ -z "${CM_BIN:-}" ]; then
+  if [ -x "$HOME/.local/node/bin/context-mode" ]; then
+    CM_BIN="$HOME/.local/node/bin/context-mode"
+  else
+    CM_BIN="$(command -v context-mode 2>/dev/null || echo context-mode)"
+  fi
+fi
 
 # Drain stdin into a temp file (codex sends a JSON event); pass to context-mode
 # in the background. Keep the temp file path stable per-process so we can

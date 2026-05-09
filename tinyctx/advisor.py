@@ -31,11 +31,19 @@ which means:
   - every advisor call is logged in tinyctx-trace alongside normal traffic
   - the request shows up in the trace log with `forced_by_client_model=true`
 
-Configure in ~/.codex/config.toml:
+Configuration is auto-wired by `tinyctx.advisor_bootstrap` (run from
+`scripts/install.sh`), which writes a `[mcp_servers.advisor]` block to
+`~/.codex/config.toml` with `command` resolved from `sys.executable` so
+it's correct on every machine. Override per-host via:
+
+    TINYCTX_ADVISOR_PYTHON   absolute path to alternate venv python
+    TINYCTX_ADVISOR_DISABLE=1   skip registration entirely
+
+The block written by the bootstrap looks like:
 
     [mcp_servers.advisor]
     type = "stdio"
-    command = "/Users/sekkit/dev/tinyctx/.venv/bin/python"
+    command = "<auto-detected venv python>"
     args = ["-m", "tinyctx.advisor"]
 
     [mcp_servers.advisor.env]
