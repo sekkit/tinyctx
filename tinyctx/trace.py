@@ -157,6 +157,14 @@ class RequestTrace:
     self_classify_cached: bool = False
     self_classify_overrode: bool = False
 
+    # Stuck-loop watchdog. True on the turn we injected the reminder.
+    # `stuck_turn_count_at_inject` records the turn_count at injection
+    # so we can correlate effectiveness in post-hoc trace analysis (did
+    # the next 50 turns produce a different tool-call signature, or did
+    # the model just keep looping?). See stuck_loop.py.
+    stuck_reminder_injected: bool = False
+    stuck_turn_count_at_inject: int = 0
+
     # Number of SSE keepalive `: tinyctx keepalive\n\n` comment lines
     # emitted during this stream while waiting for upstream chunks. >0
     # means the upstream went silent for at least

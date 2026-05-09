@@ -388,6 +388,14 @@ async def responses(request: Request) -> Any:
                             est_input_tokens=decision.est_input_tokens,
                             turn_count=decision.turn_count)
         trace.forced_by_client_model = True
+        # The agent invoked advisor — note timestamp so the stuck-loop
+        # watchdog skips its grace window and doesn't nudge the parent
+        # session right after the agent already escalated.
+        try:
+            from . import stuck_loop
+            stuck_loop.mark_advisor_call(proj_sid)
+        except Exception:  # noqa: BLE001 — instrumentation only
+            pass
 
     # Model-driven escalation (Anthropic Advisor Strategy alignment):
     # ask the LOCAL model itself whether this turn deserves the advisor.
@@ -437,6 +445,31 @@ async def responses(request: Request) -> Any:
     trace.est_input_tokens = decision.est_input_tokens
     trace.turn_count = decision.turn_count
     trace.error_streak = streak
+
+    # Stuck-loop watchdog: when turn_count climbs past the trigger
+    # without a recent advisor call, append a `<system-reminder>` to
+    # the input tail asking the agent to either consult advisor or
+    # surface its blocker. See tinyctx/stuck_loop.py for rationale.
+    # Only fires for non-compaction main turns (advisor sub-threads
+    # carry forced_by_client_model and don't need their own watchdog).
+    if (CFG.stuck_loop_watchdog_enabled
+            and not decision.is_compaction
+            and not trace.forced_by_client_model):
+        try:
+            from . import stuck_loop
+            body, was_injected = stuck_loop.maybe_inject_stuck_reminder(
+                body, proj_sid, decision.turn_count,
+                turn_trigger=CFG.stuck_loop_turn_trigger,
+                turn_gap=CFG.stuck_loop_turn_gap,
+                advisor_grace_s=CFG.stuck_loop_advisor_grace_s,
+            )
+            if was_injected:
+                trace.stuck_reminder_injected = True
+                trace.stuck_turn_count_at_inject = decision.turn_count
+                _log("stuck_reminder_injected", session=sid,
+                     proj_sid=proj_sid, turn_count=decision.turn_count)
+        except Exception as e:  # noqa: BLE001 — watchdog must never block
+            _log("stuck_loop_error", session=sid, error=str(e))
 
     # Sanitize before any model swap.
     if CFG.sanitize_encrypted_content:

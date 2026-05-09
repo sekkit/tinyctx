@@ -315,6 +315,26 @@ class Config:
     # this to 5s without losing accuracy.
     self_classify_timeout_s: float = 30.0
 
+    # Stuck-loop watchdog: after the agent has run N+ turns without
+    # convergence (defined as: tracker not advancing, no advisor call
+    # in the recent past), inject a `<system-reminder>` into the next
+    # request's input asking the agent to either consult advisor or
+    # surface its blocker to the user. See tinyctx/stuck_loop.py.
+    #
+    # Triggered by live trace 2026-05-10 where a single codex session
+    # ran 1323 turns on the same sub-problem before being terminated
+    # by codex.app's own context limits.
+    stuck_loop_watchdog_enabled: bool = True
+    # Minimum turn_count before considering a session stuck. Healthy
+    # tasks usually finish < 80 turns; >150 is a strong stuck signal.
+    stuck_loop_turn_trigger: int = 80
+    # Min turns between consecutive reminders. Don't nag every turn —
+    # give the model 50 turns to act on the previous nudge.
+    stuck_loop_turn_gap: int = 50
+    # If the agent already called advisor within this many seconds,
+    # skip the watchdog nudge (it's already doing the right thing).
+    stuck_loop_advisor_grace_s: float = 600.0
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`
