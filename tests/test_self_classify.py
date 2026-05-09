@@ -99,6 +99,25 @@ def test_parse_response_clamps_p_to_unit_range():
     assert r.p == 0.0
 
 
+def test_parse_response_salvages_from_truncated_json():
+    """Regression: live trace showed DeepSeek occasionally returns a
+    JSON response truncated mid-`reason` field (max_tokens cap hit
+    despite the system-prompt brevity directive). The parser must
+    salvage `escalate` and `p` from the partial text rather than
+    drop the whole verdict on the floor."""
+    from tinyctx.self_classify import _parse_response
+    truncated = (
+        '{"escalate": true, "p": 0.95, "reason": "Design choice with '
+        'correctness-critical retry semantics and'  # ← cut off here
+    )
+    r = _parse_response(truncated)
+    assert r is not None, "must salvage from truncated input"
+    assert r.escalate is True
+    assert abs(r.p - 0.95) < 1e-6
+    # The reason field will be empty / placeholder since it didn't close
+    assert r.reason  # non-empty (placeholder marker)
+
+
 def test_parse_response_returns_none_for_garbage():
     from tinyctx.self_classify import _parse_response
     assert _parse_response("") is None

@@ -47,7 +47,9 @@ import httpx
 _SYSTEM_PROMPT = """You are a routing classifier embedded in a coding agent. Your only job: decide whether the next turn should escalate to a stronger advisor model (Opus-class) OR be handled by the local executor model.
 
 Output ONLY a single JSON object on one line. No prose, no markdown fence:
-{"escalate": true|false, "p": 0.0-1.0, "reason": "<≤25 words>"}
+{"escalate": true|false, "p": 0.0-1.0, "reason": "<≤12 words>"}
+
+Critical: keep "reason" SHORT (≤12 words). Long reasons get truncated by the token cap and the JSON becomes invalid.
 
 Escalate when ANY of these apply:
 - 2+ valid architectural approaches with real trade-offs (data shape, API contract, retry semantics, concurrency, lock ordering)
@@ -161,30 +163,58 @@ _JSON_RE = re.compile(
     r'\{[^{}]*"escalate"\s*:\s*(?:true|false)[^{}]*\}',
     re.DOTALL,
 )
+# Fallback for truncated JSON (response cut off mid-reason): salvage
+# escalate + p directly from the raw text without requiring a closing
+# brace. Live trace showed DeepSeek occasionally bleeds past the
+# token cap on verbose-mode runs.
+_ESC_RE = re.compile(r'"escalate"\s*:\s*(true|false)')
+_P_RE = re.compile(r'"p"\s*:\s*(-?\d+(?:\.\d+)?)')
+_REASON_RE = re.compile(r'"reason"\s*:\s*"([^"]*)"')
 
 
 def _parse_response(text: str) -> ClassifyResult | None:
-    """Lenient parser: finds the first JSON object containing an
-    `escalate` field, even if the model wraps it in markdown fences
-    or surrounding prose. Returns None if nothing matches."""
+    """Lenient parser: first try a complete JSON object containing an
+    `escalate` field (handles markdown fences and surrounding prose).
+    If that fails, fall back to regex-salvage of `escalate` and `p`
+    fields directly — handles the case where the model's response was
+    truncated mid-reason by the token cap. Returns None if neither
+    path can extract a verdict."""
     if not isinstance(text, str) or not text:
         return None
     m = _JSON_RE.search(text)
-    if not m:
+    if m:
+        try:
+            d = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            d = None
+        if isinstance(d, dict):
+            esc = bool(d.get("escalate"))
+            try:
+                p = float(d.get("p", 0.5))
+            except (ValueError, TypeError):
+                p = 0.5
+            p = max(0.0, min(1.0, p))
+            reason = str(d.get("reason", ""))[:200]
+            return ClassifyResult(escalate=esc, p=p, reason=reason)
+    # Fallback: salvage from possibly-truncated text
+    m_esc = _ESC_RE.search(text)
+    if not m_esc:
         return None
-    try:
-        d = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(d, dict):
-        return None
-    esc = bool(d.get("escalate"))
-    try:
-        p = float(d.get("p", 0.5))
-    except (ValueError, TypeError):
-        p = 0.5
-    p = max(0.0, min(1.0, p))
-    reason = str(d.get("reason", ""))[:200]
+    esc = m_esc.group(1) == "true"
+    m_p = _P_RE.search(text)
+    p = 0.5
+    if m_p:
+        try:
+            p = float(m_p.group(1))
+        except (ValueError, TypeError):
+            p = 0.5
+        p = max(0.0, min(1.0, p))
+    m_r = _REASON_RE.search(text)
+    reason = (m_r.group(1) if m_r else "")[:200]
+    if not reason:
+        # If even reason got truncated, leave a marker so trace shows
+        # we salvaged from a partial response.
+        reason = "[salvaged from truncated classifier response]"
     return ClassifyResult(escalate=esc, p=p, reason=reason)
 
 
@@ -228,7 +258,12 @@ async def classify(body: dict[str, Any],
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
-        "max_tokens": 120,
+        # 200 tokens is comfortably above the JSON object the prompt
+        # requests (esc + p + ≤12-word reason ≈ 30-40 tokens) but
+        # leaves headroom if the model ignores the brevity directive.
+        # Bumped from 120 after a live trace showed truncation on
+        # verbose models.
+        "max_tokens": 200,
         "stream": False,
     }
     headers = {"Content-Type": "application/json"}
