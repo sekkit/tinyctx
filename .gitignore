@@ -51,3 +51,9 @@ secrets/
 # at request time (see tinyctx/agent_rules.py); the root copy is a
 # per-developer artifact so it stays out of the repo.
 /AGENTS.md
+
+# serena writes per-project state (project.yml, memories/, cache/) when
+# launched with --project-from-cwd. These are per-developer artifacts —
+# every clone should start fresh; serena auto-bootstraps them on first
+# session. Do NOT commit anyone's local memories/ into the repo.
+.serena/

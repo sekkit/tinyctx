@@ -62,6 +62,13 @@ _SERENA_CONFIG_BLOCK_TEMPLATE = """
 #                            "no active project" state, the model would
 #                            need to call `activate_project` first, and
 #                            the dashboard at :24282 stays empty.
+#   --open-web-dashboard false
+#                            Suppress browser-popup-on-launch. The dashboard
+#                            stays running on :24282 — you can still open it
+#                            manually if you want. Without this flag, every
+#                            codex session spawns a serena that pops a new
+#                            browser tab (codex spawns one MCP per session,
+#                            so this can flood with 3-5 tabs in a busy day).
 #
 # The bare `serena` CLI also has `--mode codex` — that's a DIFFERENT
 # option than `--context codex` and the bootstrap MUST NOT use it
@@ -69,7 +76,8 @@ _SERENA_CONFIG_BLOCK_TEMPLATE = """
 {marker}
 type = "stdio"
 command = "{cmd}"
-args = ["start-mcp-server", "--context", "codex", "--project-from-cwd"]
+args = ["start-mcp-server", "--context", "codex", "--project-from-cwd",
+        "--open-web-dashboard", "false"]
 startup_timeout_sec = 30.0
 """
 

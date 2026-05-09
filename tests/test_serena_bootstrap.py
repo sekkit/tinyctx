@@ -135,12 +135,27 @@ def test_patch_codex_config_includes_codex_context_and_project_from_cwd(isolated
     state = sb.State(serena_path="/u/b/serena")
     sb.patch_codex_config(state, config_path=codex)
     txt = codex.read_text()
-    args_line = next((ln for ln in txt.splitlines()
-                      if ln.lstrip().startswith("args ")), "")
-    assert "--context" in args_line and '"codex"' in args_line, \
+    # args may span multiple lines; collect everything between [ and ]
+    args_block = txt.split("args = [", 1)[1].split("]", 1)[0] if "args = [" in txt else ""
+    assert "--context" in args_block and '"codex"' in args_block, \
         "missing --context codex (serena's codex-optimized prompt mode)"
-    assert "--project-from-cwd" in args_line, \
+    assert "--project-from-cwd" in args_block, \
         "missing --project-from-cwd (auto-activate project from codex cwd)"
+
+
+def test_patch_codex_config_suppresses_browser_popup(isolated):
+    """codex spawns one serena MCP per session. Without
+    --open-web-dashboard false each spawn opens a new browser tab —
+    flooding the user with 3-5 tabs in a busy day. The flag must be set."""
+    _, codex = isolated
+    state = sb.State(serena_path="/u/b/serena")
+    sb.patch_codex_config(state, config_path=codex)
+    txt = codex.read_text()
+    args_block = txt.split("args = [", 1)[1].split("]", 1)[0] if "args = [" in txt else ""
+    assert "--open-web-dashboard" in args_block
+    # The arg's value: should be the literal "false" right after the flag
+    assert '"false"' in args_block, \
+        "missing --open-web-dashboard false (browser popup not suppressed)"
 
 
 def test_patch_codex_config_creates(isolated):
