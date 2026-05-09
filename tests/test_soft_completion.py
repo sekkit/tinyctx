@@ -567,7 +567,10 @@ def test_gate_injects_when_flag_set():
     text = last["content"][0]["text"]
     assert "<system-reminder>" in text
     assert "soft-completion gate" in text
-    assert "spawn_agent(role=\"advisor\"" in text
+    # Three-path gate: A=plan-execute, B=question-via-advisor, C=premature-done
+    assert "PATH A" in text and "LISTED STEPS" in text
+    assert "PATH B" in text and "spawn_agent(role=\"advisor\"" in text
+    assert "PATH C" in text and "tracker" in text.lower()
     assert "ask:" in text and "work:" in text
 
 

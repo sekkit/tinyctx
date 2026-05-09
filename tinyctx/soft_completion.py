@@ -471,36 +471,55 @@ _GATE_TEMPLATE = """\
 <system-reminder>
 [NOT USER INPUT — tinyctx soft-completion gate]
 
-Your previous turn ended by soft-punting back to the user (classifier verdict: `{pattern}`) instead of completing the work and verifying outcomes. Per the user's directive, **any question to the user MUST first be vetted by advisor**.
+Your previous turn ended without taking action (classifier verdict: `{pattern}`). You MUST resume the work in this turn — the next thing you emit must be either tool calls OR a tracker enumeration with evidence. Pick the path that matches what your previous turn actually said:
 
-Before processing this turn's content, you MUST do this — exact shape:
+═══ PATH A — your previous turn LISTED STEPS / GAVE A PLAN ═══
+("I'll do X, then Y, then Z" / numbered plan / bullet list of next actions)
+
+→ Execute ALL the steps in sequence NOW, this turn. Use tools/commands directly.
+→ Do NOT re-state the plan. Do NOT split it across more turns. Do NOT ask the user "should I proceed?".
+→ If a step genuinely cannot be executed (missing credential, ambiguous spec), STOP at that step and report which one and why — but only after you've done every step that CAN be done.
+
+═══ PATH B — your previous turn ASKED THE USER A META-QUESTION ═══
+("what would you like next" / "options:" / "shall I continue" / equivalents)
+
+→ You MAY NOT ask the user without first vetting the question through advisor:
 
 ```
 spawn_agent(role="advisor", task=\"\"\"
-The executor wants to ask the user a meta-question instead of completing the work. Decide whether the question is genuinely needed, or whether the executor should keep working.
+The executor wants to ask the user a meta-question. Decide whether the question is genuinely needed, or whether the executor should keep working.
 
-What I (executor) want to ask the user: <repeat verbatim the question you just asked / were about to ask>
-
-Original user goal: <one-sentence restatement of the user's actual goal>
-
-Progress tracker (every item enumerated):
-  1. <item>  — completed (evidence: <commit hash / test name + result / file path / build log line>)
-  2. <item>  — de-scoped (reason: <one-line reason>)
+Question I want to ask: <repeat verbatim>
+Original user goal: <one-sentence restatement>
+Progress tracker:
+  1. <item> — completed (evidence: <commit hash / test result / file path / build log line>)
+  2. <item> — de-scoped (reason: <reason>)
   …
+Hard verifications done: <list with evidence>
+Hard verifications NOT done: <list>
 
-Hard verifications I claim done: <list with concrete evidence>
-Hard verifications I have NOT done: <list, especially user-stated ones like "build / test / run / verify">
-
-Reply with EXACTLY one of:
-  - ask: <one-line reason the question is genuinely needed and not answerable from the executor's own scope>
-  - work: <bullet list of concrete next steps the executor should do without asking>
+Reply EXACTLY one of:
+  - ask: <one-line reason the question is genuinely needed>
+  - work: <bullet list of concrete steps to do without asking>
 \"\"\")
 wait_agent(...)
 ```
 
-Action on advisor reply:
-- If reply starts with `work:` — DO NOT ask the user. Execute the bullet items, then re-evaluate.
-- If reply starts with `ask:` — proceed with the user-facing question, citing advisor in one line: "Advisor: ask — <reason>".
+→ If advisor replies `work: …`, execute those steps (Path A applies).
+→ If advisor replies `ask: …`, proceed with the question, citing "Advisor: ask — <reason>".
+
+═══ PATH C — your previous turn DECLARED "DONE" / "FINAL SUMMARY" ═══
+(but progress tracker still has unchecked items, or user-stated verification not run)
+
+→ Enumerate every tracker item. Each must be `completed (evidence: …)` or `de-scoped (reason: …)`.
+→ If user-stated verification (build / test / deploy / start) was NOT executed: run it NOW with tool calls.
+→ Only after the tracker is genuinely empty AND verification ran successfully may you re-emit a Final summary.
+
+═══ Universal rules ═══
+
+- Plain-text plan/promise without tool calls = treated as soft-punt by tinyctx classifier; you'll loop here again.
+- Asking the user without going through advisor = treated as soft-punt; same loop.
+- The only exits are: (a) tool calls advancing the work, (b) tracker enumeration with evidence, (c) advisor `ask:` verdict.
 
 This gate fires once per detected soft-completion. It will not nag again until the next detection.
 </system-reminder>"""
