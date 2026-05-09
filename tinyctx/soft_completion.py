@@ -1,144 +1,244 @@
-"""Soft-completion gate: when the agent ends a turn by asking the user
-a meta question ("what would you like to work on next?") instead of
-completing the work and verifying outcomes, force the next turn to
-route the question through advisor first.
+"""Soft-completion gate v2 — LLM-based behavioral classifier.
+
+v1 used regex patterns to catch specific phrasings ("what would you
+like", etc.). That was brittle and language-limited. v2 asks the LOCAL
+model itself "did the agent just soft-punt to the user?" — same
+approach as self_classify, just inverted (post-stream rather than
+pre-flight).
 
 Why this exists
 ───────────────
-Live trace 2026-05-10: the stuck-loop watchdog (`stuck_loop.py`) saved
-a session from a 1300+ turn debugging loop, but the agent then went
-into a different failure mode — wrapped up the bug fix, declared
-"All done" with 6 ✅, and asked "What would you like to work on next?"
-without:
-  - enumerating its progress tracker (4 items still ⭕)
-  - running the user-stated verification step (rebuild APK + logcat
-    + screencap)
-  - calling the advisor completion gate
+Live trace 2026-05-10: stuck_loop watchdog saved the session from a
+1300+ turn loop. The agent then went into a different failure: wrapped
+up the bug fix, declared "All done", and asked "What would you like
+to work on next?" without enumerating tracker / running verification /
+calling advisor. §4 收工纪律 + §3 advisor gate (templates/AGENTS.md)
+target "agent declares done"; neither bound to this *soft punt to
+user* shape. User directive: 如果非要提问，走 advisor 进行回答.
 
-§4 收工纪律 and §3 advisor gate (in templates/AGENTS.md) both target
-"agent declaring done", but neither bound to this *soft punt to user*
-shape. User directive: "如果非要提问，走 advisor 进行回答" — if the
-agent insists on asking, vet the question through advisor first.
+Why LLM (not regex)
+───────────────────
+Regex catches "what would you like" but misses "I think we should
+pause and let you decide" or "Hmm, this is up to you — どうしましょう".
+LLM understands semantic intent: "is this a punt or a load-bearing
+clarifying question?" — agnostic to language and phrasing.
 
 Mechanism
 ─────────
-1. **Sniffer**: as the proxy streams response bytes to the client, a
-   small per-session ring buffer (`_OUTPUT_BUFFER[proj_sid]`, 8KB
-   tail) accumulates the bytes. Pattern regexes scan the buffer
-   incrementally (chunks may split a phrase, so buffering matters).
-2. **Flag**: on first match, `_SOFT_COMPLETION_FLAG[proj_sid]` records
-   `{"active": True, "matched_pattern": <name>, ts: <time>}`. Buffer
-   is reset at next stream start so the flag fires once per turn.
-3. **Gate**: on the *next* request to the same `proj_sid`, the proxy
+1. **Accumulator**: per-session ring buffer (`_OUTPUT_BUFFER[proj_sid]`,
+   capped at `_BUFFER_MAX` raw bytes) collects the streamed response.
+   Reset at start of each stream.
+2. **Stream-end classifier**: when the stream completes successfully,
+   `classify_at_stream_end` is spawned as a background task. It:
+     - extracts the assistant's text deltas from the SSE-wrapped buffer
+     - feeds the last ~4KB of extracted text to the local model with
+       a behavioral classifier prompt
+     - parses the JSON verdict; sets the flag on `soft_punt: true && p ≥ τ`
+3. **Gate**: on the next request to the same `proj_sid`, the proxy
    prepends a `<system-reminder>` to `body.input` requiring the agent
    to spawn_agent(role="advisor") with the would-be user question and
    tracker state, and act on advisor's `ask:`/`work:` verdict.
 
-False positives
-───────────────
-The patterns are biased toward HIGH-PRECISION matches: phrases that
-mostly only appear when the agent is genuinely punting (e.g., "what
-would you like to work on next", "some options:"). One false-positive
-per session costs an extra ~5K frontier tokens via advisor — annoying
-but not broken. False negatives are worse: agent walks past the gate
-and the user sees an incomplete task, which is the original problem.
+Cost / latency
+──────────────
+One extra local-model call per agent response (≈300-token prompt + 30-
+token JSON output ≈ 200ms on DeepSeek-class). Runs ASYNCHRONOUSLY in
+the background — does NOT add to user-perceived latency. Codex.app
+typically waits seconds before the user types a follow-up, so the
+flag is reliably set in time for the next request's gate-check.
+Skipped for short outputs (<200 chars text, likely tool-call only).
 
-Interaction with stuck_loop
-───────────────────────────
-Both modules live alongside each other and share the same `proj_sid`
-keying. They serve different failure modes:
-  - stuck_loop fires on `turn_count > 80` without convergence (loop)
-  - soft_completion fires on user-facing question without tracker
-    completion (premature handoff)
-A single session can hit both gates; that's fine — they nudge in
-different directions.
+Interaction with the rest
+─────────────────────────
+- stuck_loop fires on `turn_count > 80` without convergence (loop)
+- soft_completion fires on user-facing question without completion
+- §4 + advisor gate in AGENTS.md fire on "agent declares done"
+A single session can hit any combination; they nudge in different
+directions.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 
 # ─── per-session state ─────────────────────────────────────────────────────
 
 _SOFT_COMPLETION_FLAG: dict[str, dict[str, Any]] = defaultdict(dict)
 _OUTPUT_BUFFER: dict[str, str] = defaultdict(str)
-
-# Buffer cap. The longest pattern we look for is ~50 chars; 8KB gives
-# plenty of slack for SSE-frame overhead and split-chunk recovery while
-# bounding memory.
-_BUFFER_MAX = 8192
-
-
-# ─── patterns ──────────────────────────────────────────────────────────────
-# Calibrated for HIGH PRECISION. Each pattern should fire only on
-# phrasings that are nearly always "soft punt to user" rather than
-# legitimate technical content. Add patterns conservatively.
-
-_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # English
-    (re.compile(r"what would you like (?:me )?to (?:work|do|tackle|focus)",
-                re.IGNORECASE), "en_what_would_you_like"),
-    (re.compile(r"what (?:do you want|would you prefer|should we do) "
-                r"(?:to do |to work on |next|now)",
-                re.IGNORECASE), "en_what_do_you_want"),
-    (re.compile(r"\n\s*(?:Some\s+)?[Oo]ptions:\s*\n",
-                re.IGNORECASE), "en_options_list"),
-    (re.compile(r"would you like (?:me )?to (?:continue|proceed|move on|"
-                r"go ahead)", re.IGNORECASE), "en_would_you_like_to_proceed"),
-    # Chinese — codex output is sometimes Chinese
-    (re.compile(r"你(?:想|希望)(?:让我)?(?:接下来|继续|下一步)?"
-                r"(?:做|处理|完成|tackle)什么"), "zh_what_next"),
-    (re.compile(r"(?:接下来|下一步)(?:做|要做|想做)?什么"),
-        "zh_next_what_to_do"),
-    (re.compile(r"想(?:要我|让我)?(?:做|处理)(?:什么|哪个|哪一个)"),
-        "zh_want_to_do_what"),
-]
+# Cap raw SSE buffer at 64KB. After SSE+JSON-overhead extraction this
+# yields ~30-50KB of actual text — comfortably above the 4KB tail we
+# feed the classifier.
+_BUFFER_MAX = 65536
 
 
-# ─── streaming sniffer ─────────────────────────────────────────────────────
+# ─── LLM behavioral classifier ─────────────────────────────────────────────
+
+_CLASSIFIER_SYSTEM_PROMPT = """You are a behavioral classifier inside an LLM proxy. Read an assistant's final response from a coding/agent task, and decide whether it ended by SOFT-PUNTING to the user — i.e. asking a meta-question instead of completing the work or running its stated verifications.
+
+Output EXACTLY one JSON object on a single line. No prose, no markdown:
+{"soft_punt": true|false, "p": 0.0-1.0, "reason": "<≤8 words>"}
+
+═══ SOFT-PUNT (true, p ≥ 0.7) ═══
+
+The assistant ends the turn by:
+  - asking the user "what next / what should I do / what would you like / which option / shall I continue / 接下来做什么" or any equivalent meta-question that hands the next decision back to the user
+  - listing options ("Some options: A / B / C — let me know") and stopping
+  - declaring "all done / wrapped up / final summary" while user-stated verification (build / run / test / deploy) was NOT actually executed
+  - phrasing in any language with the same semantic shape
+
+═══ NOT SOFT-PUNT (false, p ≥ 0.7) ═══
+
+  - The response IS a tool call (function_call) — agent is still making progress.
+  - Asking a load-bearing clarifying question that genuinely needs user input (ambiguous spec, conflicting requirements, missing credentials, irreversible-action confirmation).
+  - Submitting a substantive technical answer / code / analysis as the answer itself.
+  - Reporting a hard failure with specific blocking reason (e.g. "build failed: <log>; need user to fix env X before I can continue").
+  - Mid-thought streaming text without any closing question.
+
+═══ Calibration ═══
+
+Be CONSERVATIVE. False positives cost ~5K frontier tokens (one extra advisor call). False negatives mean the user sees an incomplete task — the original problem we are trying to fix.
+
+Reason field: ≤8 words, noun-phrase fragment. Examples:
+  "asks user what to do next"          ← soft_punt:true
+  "lists options without committing"   ← soft_punt:true
+  "declares done but verification not run" ← soft_punt:true
+  "running tool, still progressing"    ← soft_punt:false
+  "load-bearing clarifying question"   ← soft_punt:false
+  "substantive technical answer"       ← soft_punt:false"""
+
+
+@dataclass
+class ClassifyResult:
+    soft_punt: bool
+    p: float
+    reason: str
+
+
+_JSON_RE = re.compile(
+    r'\{[^{}]*"soft_punt"\s*:\s*(?:true|false)[^{}]*\}', re.DOTALL)
+_PUNT_RE = re.compile(r'"soft_punt"\s*:\s*(true|false)')
+_P_RE = re.compile(r'"p"\s*:\s*(-?\d+(?:\.\d+)?)')
+_REASON_RE = re.compile(r'"reason"\s*:\s*"([^"]*)"')
+# Some reasoning-class local models leak <think>…</think> into content.
+# Same handling as self_classify._strip_thinking.
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    return _THINK_RE.sub("", text)
+
+
+def _parse_response(text: str) -> ClassifyResult | None:
+    if not isinstance(text, str) or not text:
+        return None
+    text = _strip_thinking(text)
+    if not text:
+        return None
+    m = _JSON_RE.search(text)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            d = None
+        if isinstance(d, dict):
+            sp = bool(d.get("soft_punt"))
+            try:
+                p = float(d.get("p", 0.5))
+            except (ValueError, TypeError):
+                p = 0.5
+            p = max(0.0, min(1.0, p))
+            reason = str(d.get("reason", ""))[:200]
+            return ClassifyResult(soft_punt=sp, p=p, reason=reason)
+    # Fallback: salvage from possibly-truncated text
+    m_sp = _PUNT_RE.search(text)
+    if not m_sp:
+        return None
+    sp = m_sp.group(1) == "true"
+    m_p = _P_RE.search(text)
+    p = 0.5
+    if m_p:
+        try:
+            p = max(0.0, min(1.0, float(m_p.group(1))))
+        except (ValueError, TypeError):
+            pass
+    m_r = _REASON_RE.search(text)
+    reason = (m_r.group(1) if m_r else "[salvaged]")[:200]
+    return ClassifyResult(soft_punt=sp, p=p, reason=reason)
+
+
+# ─── delta extraction from SSE-wrapped buffer ──────────────────────────────
+# Both Responses-API ({"type":"response.output_text.delta","delta":"..."})
+# and Chat-Completions ({"choices":[{"delta":{"content":"..."}}]}) emit
+# the same JSON-string-escaped content via a `delta`/`content` field.
+# Regex matches the simplest envelope; reasoning-content / tool-call
+# events are skipped (they don't carry the same field shape).
+
+_TEXT_DELTA_RE = re.compile(
+    r'"(?:delta|content)"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
+
+
+def _extract_text_from_buffer(buf: str) -> str:
+    """Pull the assistant's text content out of an SSE-wrapped raw
+    response buffer. Handles JSON string escapes (\\n, \\", \\\\).
+    Falls back to returning the raw buffer if no delta fields match
+    (e.g. the upstream wasn't streaming JSON-shaped events)."""
+    if not buf:
+        return ""
+    matches = _TEXT_DELTA_RE.findall(buf)
+    if not matches:
+        # Probably non-SSE / non-JSON content. Hand it to the LLM raw —
+        # it can read SSE-wrapped or plain text.
+        return buf[-4000:]
+    pieces: list[str] = []
+    for raw in matches:
+        try:
+            # Decode JSON string escapes inside the delta.
+            decoded = json.loads(f'"{raw}"')
+            if isinstance(decoded, str):
+                pieces.append(decoded)
+        except (json.JSONDecodeError, ValueError):
+            pieces.append(raw)
+    text = "".join(pieces)
+    # Last 4KB — soft-punt signals are in the closing portion of the
+    # response, not the body.
+    return text[-4000:]
+
+
+# ─── streaming buffer ──────────────────────────────────────────────────────
 
 
 def reset_stream(proj_sid: str) -> None:
-    """Clear the per-session output buffer at start of a new stream.
-    The flag itself is NOT cleared — it survives across streams until
-    the gate consumes it on the next request."""
+    """Clear per-session output buffer at start of a new stream. Flag
+    is NOT cleared — it survives across streams until the gate
+    consumes it on the next request."""
     _OUTPUT_BUFFER.pop(proj_sid, None)
 
 
-def scan_chunk(proj_sid: str, chunk: bytes) -> str | None:
-    """Accumulate a stream chunk into the per-session buffer and scan
-    for soft-completion patterns. On first match, sets the per-session
-    flag and returns the matched pattern name. Subsequent calls within
-    the same stream are no-ops once the flag is set.
-
-    Never raises — designed to be called from the hot streaming path.
-    Decode errors silently skip; partial-utf8 chunks are tolerated."""
+def accumulate_chunk(proj_sid: str, chunk: bytes) -> None:
+    """Append a chunk to the per-session output buffer (capped tail).
+    Hot-path safe — never raises, no LLM call here. Classification
+    runs once at stream end via `classify_at_stream_end`."""
     if not chunk:
-        return None
-    flag = _SOFT_COMPLETION_FLAG.get(proj_sid) or {}
-    if flag.get("active"):
-        # already matched this stream; don't keep scanning
-        return None
+        return
     try:
         text = chunk.decode("utf-8", errors="ignore")
     except Exception:  # noqa: BLE001
-        return None
+        return
     buf = _OUTPUT_BUFFER[proj_sid] + text
     if len(buf) > _BUFFER_MAX:
         buf = buf[-_BUFFER_MAX:]
     _OUTPUT_BUFFER[proj_sid] = buf
-    for pat, name in _PATTERNS:
-        if pat.search(buf):
-            _SOFT_COMPLETION_FLAG[proj_sid] = {
-                "active": True,
-                "matched_pattern": name,
-                "ts": time.time(),
-            }
-            return name
-    return None
 
 
 def get_flag(proj_sid: str) -> dict[str, Any] | None:
@@ -147,13 +247,80 @@ def get_flag(proj_sid: str) -> dict[str, Any] | None:
     return f if f and f.get("active") else None
 
 
+# ─── stream-end classifier (async) ─────────────────────────────────────────
+
+
+async def classify_at_stream_end(
+        proj_sid: str,
+        local_base_url: str,
+        local_model: str,
+        *,
+        api_key: str | None = None,
+        timeout_s: float = 30.0,
+        threshold: float = 0.7,
+) -> ClassifyResult | None:
+    """Run the LLM behavioral classifier against the accumulated stream
+    buffer for `proj_sid`. Sets the per-session flag if verdict is
+    `soft_punt: true && p >= threshold`. Returns the result for trace
+    logging (or None on early-skip / failure).
+
+    Designed to be spawned as `asyncio.create_task(...)` from the
+    stream-end finally block — it should not block the request return.
+    Never raises — silent fallback (no flag set) on backend error."""
+    raw = _OUTPUT_BUFFER.get(proj_sid, "")
+    text = _extract_text_from_buffer(raw)
+    # Skip very short outputs — likely tool-call-only turns where the
+    # classifier has nothing meaningful to judge.
+    if len(text) < 200:
+        return None
+
+    payload = {
+        "model": local_model,
+        "messages": [
+            {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.1,
+        # Same headroom as self_classify — reasoning-class local models
+        # burn ~200-1500 tokens on hidden CoT before the JSON verdict.
+        "max_tokens": 2048,
+        "reasoning_effort": "low",
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = local_base_url.rstrip("/") + "/chat/completions"
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_s)) as client:
+            r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        out = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:  # noqa: BLE001
+        return None
+
+    result = _parse_response(out)
+    if result is None:
+        return None
+    if result.soft_punt and result.p >= threshold:
+        _SOFT_COMPLETION_FLAG[proj_sid] = {
+            "active": True,
+            "matched_pattern": f"llm: {result.reason}"[:80],
+            "p": result.p,
+            "ts": time.time(),
+        }
+    return result
+
+
 # ─── gate injection ────────────────────────────────────────────────────────
 
 _GATE_TEMPLATE = """\
 <system-reminder>
 [NOT USER INPUT — tinyctx soft-completion gate]
 
-Your previous turn ended by asking the user a question (matched pattern: `{pattern}`) instead of completing the work and verifying outcomes. Per the user's directive, **any question to the user MUST first be vetted by advisor**.
+Your previous turn ended by soft-punting back to the user (classifier verdict: `{pattern}`) instead of completing the work and verifying outcomes. Per the user's directive, **any question to the user MUST first be vetted by advisor**.
 
 Before processing this turn's content, you MUST do this — exact shape:
 
@@ -216,9 +383,8 @@ def maybe_inject_soft_completion_gate(
     })
     out = dict(body)
     out["input"] = new_items
-    # Consume the flag: fire-once until next detection.
+    # Consume the flag.
     _SOFT_COMPLETION_FLAG[proj_sid] = {"active": False}
-    # Also reset buffer so we don't immediately re-trigger from stale tail.
     _OUTPUT_BUFFER.pop(proj_sid, None)
     return out, True, pattern
 
@@ -234,6 +400,15 @@ def reset_state(proj_sid: str | None = None) -> None:
         return
     _SOFT_COMPLETION_FLAG.pop(proj_sid, None)
     _OUTPUT_BUFFER.pop(proj_sid, None)
+
+
+def _set_flag_for_test(proj_sid: str, reason: str = "test", p: float = 1.0) -> None:
+    """Force-set the flag for tests of the gate-injection layer
+    independently of the LLM classifier."""
+    _SOFT_COMPLETION_FLAG[proj_sid] = {
+        "active": True, "matched_pattern": f"llm: {reason}",
+        "p": p, "ts": time.time(),
+    }
 
 
 def state_snapshot(proj_sid: str) -> dict[str, Any]:

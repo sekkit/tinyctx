@@ -1,95 +1,154 @@
-"""Soft-completion gate: stream sniffer detects "soft punt to user"
-patterns; the next request to that session gets a `<system-reminder>`
-forcing the agent to route the would-be question through advisor.
+"""Soft-completion gate v2: LLM-based behavioral classifier.
+
+Tests cover:
+  - JSON parser (clean / fenced / truncated / garbage / missing fields)
+  - delta-text extractor for SSE-wrapped buffers
+  - accumulator + buffer cap
+  - classifier full HTTP flow (fake backend) — positive verdict, negative,
+    short-text skip, backend error
+  - gate injection idempotency + body immutability
+  - per-session isolation
 """
 from __future__ import annotations
+
+import asyncio
+import json as _json
+import socket
+import threading
+from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 
-# ─── pattern detection (chunk-level) ────────────────────────────────────────
+# ─── parser ────────────────────────────────────────────────────────────────
 
 
-def test_detect_what_would_you_like():
-    """Canonical English pattern from live trace."""
+def test_parse_response_clean_json():
+    from tinyctx.soft_completion import _parse_response
+    r = _parse_response('{"soft_punt": true, "p": 0.9, "reason": "asks user"}')
+    assert r is not None
+    assert r.soft_punt is True
+    assert r.p == 0.9
+    assert r.reason == "asks user"
+
+
+def test_parse_response_markdown_fenced():
+    from tinyctx.soft_completion import _parse_response
+    text = "Sure:\n```json\n{\"soft_punt\": false, \"p\": 0.8, \"reason\": \"tool call\"}\n```"
+    r = _parse_response(text)
+    assert r is not None
+    assert r.soft_punt is False
+    assert r.reason == "tool call"
+
+
+def test_parse_response_strips_thinking():
+    """Reasoning-class models leak <think>...</think> into content."""
+    from tinyctx.soft_completion import _parse_response
+    text = '<think>Reading the response...</think>\n{"soft_punt": true, "p": 0.85}'
+    r = _parse_response(text)
+    assert r is not None
+    assert r.soft_punt is True
+
+
+def test_parse_response_clamps_p():
+    from tinyctx.soft_completion import _parse_response
+    r = _parse_response('{"soft_punt": true, "p": 5.0, "reason": "x"}')
+    assert r is not None
+    assert r.p == 1.0
+
+
+def test_parse_response_salvages_truncated():
+    """Reasoning models occasionally get cut off mid-reason."""
+    from tinyctx.soft_completion import _parse_response
+    truncated = '{"soft_punt": true, "p": 0.95, "reason": "asks user without veri'
+    r = _parse_response(truncated)
+    assert r is not None
+    assert r.soft_punt is True
+    assert r.p == 0.95
+
+
+def test_parse_response_garbage_returns_none():
+    from tinyctx.soft_completion import _parse_response
+    assert _parse_response("") is None
+    assert _parse_response("just prose, no JSON") is None
+
+
+# ─── delta-text extractor ─────────────────────────────────────────────────
+
+
+def test_extract_text_from_responses_api_sse():
+    """Responses-API events: {"type":"...delta","delta":"..."}"""
+    from tinyctx.soft_completion import _extract_text_from_buffer
+    buf = (
+        'data: {"type":"response.output_text.delta","delta":"Hello "}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"world!"}\n\n'
+    )
+    text = _extract_text_from_buffer(buf)
+    assert "Hello" in text
+    assert "world" in text
+
+
+def test_extract_text_from_chat_completions_sse():
+    """Chat-completions: {"choices":[{"delta":{"content":"..."}}]}"""
+    from tinyctx.soft_completion import _extract_text_from_buffer
+    buf = (
+        'data: {"choices":[{"delta":{"content":"What "}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"would"}}]}\n\n'
+    )
+    text = _extract_text_from_buffer(buf)
+    assert "What" in text
+    assert "would" in text
+
+
+def test_extract_text_decodes_json_escapes():
+    """Newlines / quotes inside delta strings are JSON-escaped on the
+    wire; extractor must decode them back to real chars."""
+    from tinyctx.soft_completion import _extract_text_from_buffer
+    buf = 'data: {"delta":"line1\\nline2 with \\"quote\\""}\n\n'
+    text = _extract_text_from_buffer(buf)
+    assert "line1\nline2" in text
+    assert '"quote"' in text
+
+
+def test_extract_text_no_match_returns_tail():
+    """If buffer doesn't look like SSE-JSON (e.g. raw text), return
+    the tail directly so the LLM can still read it."""
+    from tinyctx.soft_completion import _extract_text_from_buffer
+    raw = "x" * 5000 + "tail content"
+    text = _extract_text_from_buffer(raw)
+    # tail content is at the very end, within last 4KB
+    assert "tail content" in text
+
+
+# ─── accumulator ──────────────────────────────────────────────────────────
+
+
+def test_accumulate_chunk_buffers_bytes():
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    matched = soft_completion.scan_chunk(
-        "p1", b"...some text...\nWhat would you like to work on next?")
-    assert matched == "en_what_would_you_like"
-    assert soft_completion.get_flag("p1") is not None
+    soft_completion.accumulate_chunk("p1", b"chunk1 ")
+    soft_completion.accumulate_chunk("p1", b"chunk2")
+    snap = soft_completion.state_snapshot("p1")
+    assert snap["buffer_chars"] >= len("chunk1 chunk2")
 
 
-def test_detect_options_list():
-    """`Some options:` followed by newline is a strong soft-punt signal."""
+def test_accumulate_chunk_caps_buffer():
+    """Buffer must cap at _BUFFER_MAX so memory is bounded even on
+    huge streams."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    matched = soft_completion.scan_chunk(
-        "p1", b"...analysis done.\n\nSome options:\n- continue\n- stop")
-    assert matched == "en_options_list"
+    big = b"x" * 100_000  # > _BUFFER_MAX (64KB)
+    soft_completion.accumulate_chunk("p1", big)
+    snap = soft_completion.state_snapshot("p1")
+    assert snap["buffer_chars"] <= soft_completion._BUFFER_MAX
 
 
-def test_detect_zh_what_next():
-    """Chinese soft-completion ("你想接下来做什么")."""
+def test_reset_stream_clears_buffer():
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    matched = soft_completion.scan_chunk(
-        "p1", "总结完成。你想接下来做什么？".encode("utf-8"))
-    assert matched == "zh_what_next"
-
-
-def test_no_match_on_legit_content():
-    """Legitimate technical content must not false-fire."""
-    from tinyctx import soft_completion
-    soft_completion.reset_state()
-    legit = (b"def what_to_do(): return 'process'\n"
-             b"# returns the next step based on input\n"
-             b"queue.peek() to inspect the next item")
-    matched = soft_completion.scan_chunk("p1", legit)
-    assert matched is None
-    assert soft_completion.get_flag("p1") is None
-
-
-def test_pattern_split_across_chunks():
-    """SSE chunks can split a pattern across two `scan_chunk` calls.
-    The per-session ring buffer must survive across calls so the regex
-    sees the full phrase."""
-    from tinyctx import soft_completion
-    soft_completion.reset_state()
-    # Split "What would you like to work on next?" across 3 chunks
-    m1 = soft_completion.scan_chunk("p1", b"...What would")
-    m2 = soft_completion.scan_chunk("p1", b" you like ")
-    m3 = soft_completion.scan_chunk("p1", b"to work on next?")
-    assert m1 is None
-    assert m2 is None
-    assert m3 == "en_what_would_you_like"
-
-
-def test_fires_only_once_per_stream():
-    """Once matched, subsequent chunks in the same stream are no-ops."""
-    from tinyctx import soft_completion
-    soft_completion.reset_state()
-    m1 = soft_completion.scan_chunk(
-        "p1", b"What would you like to work on next?")
-    assert m1 == "en_what_would_you_like"
-    # Another matchable phrase later in the same stream → no re-match
-    m2 = soft_completion.scan_chunk(
-        "p1", b"\n\nWhat would you like to work on next?")
-    assert m2 is None  # already flagged, sniffer short-circuits
-
-
-def test_reset_stream_clears_buffer_not_flag():
-    """`reset_stream` is called at start of each stream — clears the
-    accumulated text buffer but leaves the flag intact (the flag must
-    survive until the gate consumes it on the next request)."""
-    from tinyctx import soft_completion
-    soft_completion.reset_state()
-    soft_completion.scan_chunk(
-        "p1", b"What would you like to work on next?")
-    assert soft_completion.get_flag("p1") is not None
+    soft_completion.accumulate_chunk("p1", b"data")
     soft_completion.reset_stream("p1")
-    # flag still active
-    assert soft_completion.get_flag("p1") is not None
     snap = soft_completion.state_snapshot("p1")
     assert snap["buffer_chars"] == 0
 
@@ -98,13 +157,156 @@ def test_reset_stream_clears_buffer_not_flag():
 
 
 def test_state_isolated_by_proj_sid():
-    """Project A flag must not propagate to project B."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    soft_completion.scan_chunk(
-        "projA", b"What would you like to work on next?")
+    soft_completion.accumulate_chunk("projA", b"A content")
+    soft_completion.accumulate_chunk("projB", b"B content")
+    assert "A content" in soft_completion._OUTPUT_BUFFER["projA"]
+    assert "B content" in soft_completion._OUTPUT_BUFFER["projB"]
+    assert "B" not in soft_completion._OUTPUT_BUFFER["projA"]
+
+
+def test_force_flag_isolated_by_proj_sid():
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    soft_completion._set_flag_for_test("projA", reason="test", p=0.9)
     assert soft_completion.get_flag("projA") is not None
     assert soft_completion.get_flag("projB") is None
+
+
+# ─── classifier full HTTP flow ────────────────────────────────────────────
+
+
+def _free_port() -> int:
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _spawn_fake_backend(scripted: str) -> tuple[ThreadingHTTPServer, int]:
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *a, **k): pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            if n: self.rfile.read(n)
+            payload = _json.dumps({
+                "choices": [{"message": {"content": scripted}}]
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+    port = _free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, port
+
+
+def test_classify_at_stream_end_positive_sets_flag():
+    """LLM verdict soft_punt:true → flag set on session."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    # Buffer some realistic SSE-shaped content
+    sse = ('data: {"type":"response.output_text.delta",'
+           '"delta":"' + 'x' * 250 + '"}\n\n')
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 0.9, "reason": "asks user what next"}')
+    try:
+        result = asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7))
+        assert result is not None
+        assert result.soft_punt is True
+        flag = soft_completion.get_flag("p1")
+        assert flag is not None
+        assert "asks user" in flag["matched_pattern"]
+    finally:
+        httpd.shutdown()
+
+
+def test_classify_at_stream_end_negative_no_flag():
+    """LLM verdict soft_punt:false → flag NOT set."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": false, "p": 0.9, "reason": "tool call"}')
+    try:
+        result = asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7))
+        assert result is not None
+        assert result.soft_punt is False
+        assert soft_completion.get_flag("p1") is None
+    finally:
+        httpd.shutdown()
+
+
+def test_classify_below_threshold_no_flag():
+    """soft_punt:true but p < threshold → flag NOT set (calibration
+    safety: only act on high-confidence verdicts)."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 0.5, "reason": "borderline"}')
+    try:
+        result = asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7))
+        assert result is not None
+        assert result.soft_punt is True
+        assert result.p == 0.5
+        assert soft_completion.get_flag("p1") is None  # below threshold
+    finally:
+        httpd.shutdown()
+
+
+def test_classify_skips_short_text():
+    """Output too short to be meaningful → skip without backend call."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    soft_completion.accumulate_chunk("p1", b"hi")  # way under 200 chars
+    # Backend should not even be reached; pass an unreachable URL
+    result = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",  # unreachable
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7))
+    assert result is None
+    assert soft_completion.get_flag("p1") is None
+
+
+def test_classify_backend_error_silent_fallback():
+    """Backend unreachable → returns None silently, no flag set."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+    result = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",  # unreachable
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7))
+    assert result is None
+    assert soft_completion.get_flag("p1") is None
 
 
 # ─── gate injection ────────────────────────────────────────────────────────
@@ -122,18 +324,17 @@ def test_gate_no_inject_when_flag_unset():
 
 
 def test_gate_injects_when_flag_set():
-    """After detection, the next request gets the advisor-vet reminder
-    appended to body.input."""
+    """When LLM classifier set the flag, the next request gets the
+    advisor-vet reminder appended."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    soft_completion.scan_chunk(
-        "p1", b"What would you like to work on next?")
+    soft_completion._set_flag_for_test("p1", reason="asks user what next", p=0.9)
 
-    body = {"input": [{"role": "user", "content": "thanks for the summary"}]}
+    body = {"input": [{"role": "user", "content": "thanks"}]}
     out, gated, pat = soft_completion.maybe_inject_soft_completion_gate(
         body, "p1")
     assert gated is True
-    assert pat == "en_what_would_you_like"
+    assert "asks user what next" in pat
     assert len(out["input"]) == 2
     last = out["input"][-1]
     assert last["role"] == "user"
@@ -142,36 +343,25 @@ def test_gate_injects_when_flag_set():
     assert "soft-completion gate" in text
     assert "spawn_agent(role=\"advisor\"" in text
     assert "ask:" in text and "work:" in text
-    # pattern is interpolated for traceability
-    assert "en_what_would_you_like" in text
 
 
 def test_gate_fires_once_then_clears_flag():
-    """After injection, the flag is consumed — second call returns no-op."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    soft_completion.scan_chunk(
-        "p1", b"What would you like to work on next?")
+    soft_completion._set_flag_for_test("p1", reason="x", p=1.0)
 
     body = {"input": [{"role": "user", "content": "x"}]}
-    _, gated1, _ = soft_completion.maybe_inject_soft_completion_gate(
-        body, "p1")
-    assert gated1 is True
-
-    # Same body, second call → flag already consumed
+    _, g1, _ = soft_completion.maybe_inject_soft_completion_gate(body, "p1")
+    assert g1 is True
     body2 = {"input": [{"role": "user", "content": "y"}]}
-    _, gated2, _ = soft_completion.maybe_inject_soft_completion_gate(
-        body2, "p1")
-    assert gated2 is False
+    _, g2, _ = soft_completion.maybe_inject_soft_completion_gate(body2, "p1")
+    assert g2 is False
 
 
 def test_gate_does_not_mutate_original_body():
-    """Original body and its input list must remain untouched."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    soft_completion.scan_chunk(
-        "p1", b"What would you like to work on next?")
-
+    soft_completion._set_flag_for_test("p1", reason="x", p=1.0)
     original = {"input": [{"role": "user", "content": "x"}]}
     items_id = id(original["input"])
     out, gated, _ = soft_completion.maybe_inject_soft_completion_gate(
@@ -183,18 +373,16 @@ def test_gate_does_not_mutate_original_body():
 
 
 def test_gate_skips_malformed_body():
-    """Bodies without an input array → no-op without exception."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    soft_completion.scan_chunk(
-        "p1", b"What would you like to work on next?")
+    soft_completion._set_flag_for_test("p1", reason="x", p=1.0)
     body = {"messages": [{"role": "user", "content": "hi"}]}  # chat-style
     out, gated, _ = soft_completion.maybe_inject_soft_completion_gate(
         body, "p1")
     assert gated is False
 
 
-# ─── default config ────────────────────────────────────────────────────────
+# ─── default config + trace fields ────────────────────────────────────────
 
 
 def test_config_default_enabled():
@@ -215,11 +403,8 @@ def test_trace_fields_default_off():
 # ─── error tolerance ──────────────────────────────────────────────────────
 
 
-def test_scan_chunk_tolerates_malformed_utf8():
-    """Partial UTF-8 sequences (mid-codepoint chunks) must not raise."""
+def test_accumulate_tolerates_malformed_utf8():
     from tinyctx import soft_completion
     soft_completion.reset_state()
-    # 0xE4 starts a 3-byte sequence; alone it's malformed
-    m = soft_completion.scan_chunk("p1", b"\xe4 incomplete utf8")
-    # No match (not the pattern), and no exception either
-    assert m is None
+    soft_completion.accumulate_chunk("p1", b"\xe4 incomplete utf8")
+    # Should not raise; chunk is silently coerced via errors='ignore'

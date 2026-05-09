@@ -1137,18 +1137,14 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         continue
                     # tag is None → real response-body chunk
                     bytes_out += len(payload)
-                    # Soft-completion sniffer: scan raw bytes for "soft
-                    # punt to user" patterns. Patterns survive across
-                    # split SSE chunks via per-session ring buffer.
+                    # Soft-completion accumulator: just buffer the bytes,
+                    # the LLM behavioral classifier runs ONCE at stream
+                    # end (see finally block below). We don't decide
+                    # mid-stream — hot-path stays cheap.
                     if CFG.soft_completion_gate_enabled:
                         try:
                             from . import soft_completion as _sc
-                            matched = _sc.scan_chunk(sid, payload)
-                            if matched and trace is not None and not trace.soft_completion_detected:
-                                trace.soft_completion_detected = True
-                                trace.soft_completion_pattern = matched
-                                _log("soft_completion_detected",
-                                     session=sid, pattern=matched)
+                            _sc.accumulate_chunk(sid, payload)
                         except Exception:  # noqa: BLE001
                             pass
                     if translator is None:
@@ -1189,16 +1185,12 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         _SESSION_ERROR_STREAK[sid] = 0
                         async for chunk in r.aiter_raw():
                             bytes_out += len(chunk)
-                            # Soft-completion sniffer (no-keepalive path)
+                            # Soft-completion accumulator (no-keepalive path).
+                            # LLM classifier runs at stream end.
                             if CFG.soft_completion_gate_enabled:
                                 try:
                                     from . import soft_completion as _sc
-                                    matched = _sc.scan_chunk(sid, chunk)
-                                    if matched and trace is not None and not trace.soft_completion_detected:
-                                        trace.soft_completion_detected = True
-                                        trace.soft_completion_pattern = matched
-                                        _log("soft_completion_detected",
-                                             session=sid, pattern=matched)
+                                    _sc.accumulate_chunk(sid, chunk)
                                 except Exception:  # noqa: BLE001
                                     pass
                             if translator is None:
@@ -1232,6 +1224,42 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
              translated=bool(translator),
              elapsed_s=elapsed,
              keepalives=keepalives_emitted)
+        # Soft-completion: spawn LLM behavioral classifier as a fire-
+        # and-forget background task. It judges whether THIS turn's
+        # output was a soft-punt-to-user; result lands as a flag that
+        # the next request's gate check consumes. Never blocks the
+        # stream's return — codex.app gets its bytes immediately.
+        if (CFG.soft_completion_gate_enabled
+                and status == 200
+                and bytes_out > 0
+                and not upstream_failed):
+            try:
+                from . import soft_completion as _sc
+                api_key = (os.environ.get(CFG.local.api_key_env)
+                           if CFG.local.api_key_env else None)
+                async def _bg_classify():
+                    try:
+                        result = await _sc.classify_at_stream_end(
+                            sid,
+                            local_base_url=CFG.local.base_url,
+                            local_model=CFG.local.model,
+                            api_key=api_key,
+                            timeout_s=CFG.self_classify_timeout_s,
+                            threshold=CFG.self_classify_threshold,
+                        )
+                        if result is not None:
+                            _log("soft_completion_classified",
+                                 session=sid,
+                                 soft_punt=result.soft_punt,
+                                 p=result.p,
+                                 reason=result.reason)
+                    except Exception as e:  # noqa: BLE001
+                        _log("soft_completion_classify_error",
+                             session=sid, error=str(e))
+                asyncio.create_task(_bg_classify())
+            except Exception as e:  # noqa: BLE001
+                _log("soft_completion_classify_spawn_error",
+                     session=sid, error=str(e))
         if trace is not None:
             trace.status = status
             trace.bytes_out = bytes_out
