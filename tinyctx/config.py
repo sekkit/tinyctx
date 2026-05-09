@@ -270,6 +270,15 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
+    # Inject the bundled global agent rules (tinyctx/templates/AGENTS.md)
+    # into every request's `body.instructions`. Idempotent — skipped
+    # automatically if codex.app already loaded `~/.codex/AGENTS.md`
+    # (the rules are then already in scope; no duplication). Lets a
+    # fresh `git clone tinyctx` work on a new machine without the user
+    # having to manually copy AGENTS.md into their codex/claude config
+    # dir. See tinyctx/agent_rules.py.
+    inject_global_agent_rules: bool = True
+
     # Auto-register external MCP servers (graphify, gitnexus) into
     # ~/.codex/config.toml on proxy startup. The registration is
     # idempotent (managed block between BEGIN/END markers, replaced

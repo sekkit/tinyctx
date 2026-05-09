@@ -137,6 +137,14 @@ class RequestTrace:
     scout_injected: bool = False
     scout_chars: int = 0
 
+    # Global agent rules (tinyctx/templates/AGENTS.md) injection. True
+    # when the proxy prepended the bundled rules block this request.
+    # False when codex.app's own AGENTS.md load already had it in the
+    # instructions (idempotent skip), the feature is disabled, or the
+    # template couldn't be loaded.
+    global_agent_rules_injected: bool = False
+    global_agent_rules_chars: int = 0
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

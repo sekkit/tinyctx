@@ -456,6 +456,21 @@ async def responses(request: Request) -> Any:
         except Exception as e:  # noqa: BLE001 — auto-scout must never fail forward
             _log("auto_scout_error", session=sid, error=str(e))
 
+    # Inject the bundled global agent rules (tinyctx/templates/AGENTS.md).
+    # Idempotent: if codex.app already loaded ~/.codex/AGENTS.md the title
+    # marker is already in instructions and we skip. Otherwise we prepend
+    # the bundled version so a fresh `git clone tinyctx` on a new machine
+    # gets the same rule baseline without the user manually copying files.
+    if CFG.inject_global_agent_rules:
+        try:
+            from . import agent_rules
+            body, was_injected = agent_rules.inject_into_body(body)
+            trace.global_agent_rules_injected = was_injected
+            if was_injected:
+                trace.global_agent_rules_chars = agent_rules.template_chars()
+        except Exception as e:  # noqa: BLE001
+            _log("agent_rules_inject_error", session=sid, error=str(e))
+
     # Inject the advisor sub-agent usage hint into instructions BEFORE
     # rewrite_model — the inject function reads body.model to skip the
     # advisor's own sub-thread (model="tinyctx-frontier"). After this

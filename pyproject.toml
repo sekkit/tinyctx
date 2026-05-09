@@ -33,3 +33,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["tinyctx*"]
+
+[tool.setuptools.package-data]
+# Ship the bundled prompt templates with the wheel/sdist so a fresh
+# `pip install tinyctx` includes ~/.codex/AGENTS.md content for runtime
+# injection. Without this entry, `tinyctx/templates/*.md` would be left
+# out of distribution builds.
+"tinyctx" = ["templates/*.md"]
