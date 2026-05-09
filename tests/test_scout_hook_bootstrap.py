@@ -153,6 +153,56 @@ def test_unregister_no_op_when_absent(isolated, monkeypatch):
     assert hooks.read_text() == snap
 
 
+def test_resolve_main_repo_strips_worktree_path():
+    """Agent harnesses run inside throwaway worktrees at
+    `<main>/.claude/worktrees/<branch>/`. The bootstrap must NOT pin
+    hook commands to a worktree path — those become dangling refs the
+    moment the worktree is deleted at conversation end. Resolve back
+    to the stable main checkout."""
+    worktree = Path("/Users/x/dev/tinyctx/.claude/worktrees/keen-gates-ec705d")
+    assert shb._resolve_main_repo(worktree) == Path("/Users/x/dev/tinyctx")
+
+
+def test_resolve_main_repo_preserves_normal_path():
+    """For a non-worktree path, just return it unchanged."""
+    main = Path("/Users/x/dev/tinyctx")
+    assert shb._resolve_main_repo(main) == main
+
+
+def test_resolve_main_repo_ignores_unrelated_worktrees_dir():
+    """A directory called 'worktrees' that's NOT under '.claude/' shouldn't
+    be stripped (false positive)."""
+    p = Path("/Users/x/projects/worktrees/myrepo")
+    assert shb._resolve_main_repo(p) == p
+
+
+def test_default_script_path_prefers_main_checkout_over_worktree(monkeypatch,
+                                                                  tmp_path):
+    """When bootstrap is imported from a worktree, _default_script_path
+    must return the main-checkout copy of scout-session-start.sh, not
+    the worktree-local one."""
+    main_repo = tmp_path / "tinyctx-main"
+    worktree = main_repo / ".claude" / "worktrees" / "branch-name"
+    main_scripts = main_repo / "scripts"
+    worktree_scripts = worktree / "scripts"
+    main_scripts.mkdir(parents=True)
+    worktree_scripts.mkdir(parents=True)
+    (main_scripts / "scout-session-start.sh").write_text("#!/bin/bash\n")
+    (worktree_scripts / "scout-session-start.sh").write_text("#!/bin/bash\n")
+
+    # Pretend the bootstrap module lives inside the worktree
+    fake_file = worktree / "tinyctx" / "scout_hook_bootstrap.py"
+    fake_file.parent.mkdir(parents=True)
+    fake_file.touch()
+    monkeypatch.setattr(shb, "__file__", str(fake_file))
+    monkeypatch.delenv("TINYCTX_SCOUT_HOOK_SCRIPT", raising=False)
+
+    out = shb._default_script_path()
+    # Must point to main checkout, NOT to the worktree
+    assert str(main_scripts / "scout-session-start.sh") == out
+    assert ".claude/worktrees" not in out
+
+
 def test_disabled_env_short_circuits_main(isolated, monkeypatch, capsys):
     hooks, _ = isolated
     monkeypatch.setenv("TINYCTX_SCOUT_HOOK_DISABLE", "1")

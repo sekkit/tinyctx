@@ -43,21 +43,51 @@ def _log(msg: str) -> None:
         pass
 
 
+def _resolve_main_repo(repo_root: Path) -> Path:
+    """Return the stable main-checkout root if `repo_root` is a worktree.
+
+    Agent harnesses (claude-code, etc.) commonly run inside throwaway
+    worktrees at `<main>/.claude/worktrees/<branch>/`. Pinning hook
+    commands to a worktree path turns into a dangling reference the
+    moment the worktree is deleted (which happens at conversation end).
+
+    Strip the `.claude/worktrees/<name>/` segment so we always return a
+    path that survives worktree cleanup.
+
+    Example:
+        /Users/x/dev/tinyctx/.claude/worktrees/keen-gates/  →
+        /Users/x/dev/tinyctx/
+    """
+    parts = repo_root.parts
+    try:
+        idx = parts.index("worktrees")
+    except ValueError:
+        return repo_root
+    if idx >= 1 and parts[idx - 1] == ".claude":
+        return Path(*parts[: idx - 1])
+    return repo_root
+
+
 def _default_script_path() -> str:
-    """Locate scripts/scout-session-start.sh shipped with this install."""
+    """Locate scripts/scout-session-start.sh shipped with this install,
+    preferring the stable main checkout over any worktree the bootstrap
+    happens to be running from."""
     forced = os.environ.get("TINYCTX_SCOUT_HOOK_SCRIPT")
     if forced:
         return forced
-    # Walk up from this file: tinyctx/scout_hook_bootstrap.py -> repo root
-    here = Path(__file__).resolve().parent.parent
+    # tinyctx/scout_hook_bootstrap.py -> repo (or worktree) root
+    raw_root = Path(__file__).resolve().parent.parent
+    here = _resolve_main_repo(raw_root)
     cand = here / "scripts" / "scout-session-start.sh"
     if cand.is_file():
         return str(cand)
     # Fall back to ~/dev/tinyctx (typical user layout)
-    cand2 = Path.home() / "dev" / "tinyctx" / "scripts" / "scout-session-start.sh"
+    cand2 = (Path.home() / "dev" / "tinyctx"
+             / "scripts" / "scout-session-start.sh")
     if cand2.is_file():
         return str(cand2)
-    return str(cand)  # may not exist — caller will check
+    # Last resort: worktree-local. Caller will check existence.
+    return str(raw_root / "scripts" / "scout-session-start.sh")
 
 
 @dataclass
