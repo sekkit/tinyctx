@@ -896,6 +896,23 @@ async def responses(request: Request) -> Any:
     except Exception:  # noqa: BLE001 — instrumentation must never fail forward
         pass
 
+    # Capture request snapshot for forensics. When an empty response or
+    # high-confidence PUNT triggers later, write_forensics_dump will pair
+    # this with the response. See tinyctx/forensics.py.
+    if CFG.forensics_enabled:
+        try:
+            from . import forensics as _fx
+            _fx.capture_request_snapshot(
+                proj_sid=proj_sid,
+                request_id=trace.request_id,
+                url=url,
+                body=forward_body,
+                headers=headers,
+                request_started_at=time.time(),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     return await _forward(url, headers, forward_body, is_stream, proj_sid, decision,
                           translate_tool_calls=backend.translate_tool_calls,
                           chat_to_responses=(backend.wire_api != "responses"),
@@ -1487,6 +1504,39 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                          completion_tokens=info.get("completion_tokens"),
                          finish_reason=info.get("finish_reason"),
                          reason=info.get("reason"))
+                    # Forensics dump — capture request + response so
+                    # next-time root cause is recoverable. The 05:07
+                    # turn 1780 empty response had no captured body
+                    # and is forever unrecoverable.
+                    if CFG.forensics_enabled:
+                        try:
+                            from . import forensics as _fx
+                            forensics_dir = CFG.log_dir.parent / "forensics"
+                            path = _fx.write_forensics_dump(
+                                forensics_dir,
+                                sid,
+                                trigger="empty_response",
+                                response_buffer=buf_for_check,
+                                timing={
+                                    "elapsed_s": elapsed,
+                                    "started_at": started,
+                                },
+                                extra={
+                                    "bytes_out": bytes_out,
+                                    "keepalives_emitted": keepalives_emitted,
+                                    "completion_tokens": info.get("completion_tokens"),
+                                    "finish_reason": info.get("finish_reason"),
+                                    "url": url,
+                                },
+                                max_dumps=CFG.forensics_max_dumps,
+                            )
+                            if path:
+                                _log("forensics_dump_written",
+                                     session=sid, trigger="empty_response",
+                                     path=str(path), file=path.name)
+                        except Exception as fe:  # noqa: BLE001
+                            _log("forensics_dump_error",
+                                 session=sid, error=str(fe))
             except Exception as e:  # noqa: BLE001
                 _log("empty_response_guard_error",
                      session=sid, error=str(e))

@@ -691,6 +691,35 @@ def register(app: Any, log_dir: Path) -> None:
             limit = 200
         return JSONResponse(recent_events(log_dir, limit=limit))
 
+    @app.get("/dashboard/forensics")
+    def _dashboard_forensics_list(limit: int = 30) -> JSONResponse:
+        """List recent forensics dumps. Each dump pairs a problematic
+        request with its response + timing for post-mortem analysis."""
+        try:
+            from . import forensics as _fx
+            forensics_dir = log_dir.parent / "forensics"
+            return JSONResponse({
+                "dir": str(forensics_dir),
+                "dumps": _fx.list_dumps(forensics_dir, limit=limit),
+            })
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/dashboard/forensics/{name}")
+    def _dashboard_forensics_get(name: str) -> JSONResponse:
+        """Read a specific forensics dump by filename."""
+        try:
+            forensics_dir = log_dir.parent / "forensics"
+            # Sanitize: only allow alphanumeric + dash + dot, no path traversal
+            if not all(c.isalnum() or c in "-_." for c in name):
+                return JSONResponse({"error": "invalid name"}, status_code=400)
+            path = forensics_dir / name
+            if not path.exists() or path.parent != forensics_dir:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     @app.post("/dashboard/force-frontier")
     def _dashboard_force_frontier(
             proj_sid: str = "global",

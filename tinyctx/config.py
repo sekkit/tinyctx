@@ -429,6 +429,21 @@ class Config:
     # on high-confidence PUNT verdicts to limit cost.
     soft_completion_auto_force_frontier_threshold: float = 0.85
 
+    # Forensics: when an empty response is detected OR a high-confidence
+    # PUNT is classified, dump the FULL request body + response buffer +
+    # timing to ~/.tinyctx/forensics/. Lets us post-mortem rare
+    # failures (the 05:07 empty response had no captured request body
+    # and is forever unrecoverable). See tinyctx/forensics.py.
+    forensics_enabled: bool = True
+    # Trigger forensics for high-confidence PUNT verdicts too (not just
+    # empty responses). Default OFF to avoid disk spam — every PUNT
+    # would write a 1-10MB dump. Flip to True when actively debugging.
+    forensics_capture_punts: bool = False
+    # Threshold for PUNT-triggered forensics (when above flag is True)
+    forensics_punt_threshold: float = 0.9
+    # Max forensic dumps to retain (oldest deleted past this count).
+    forensics_max_dumps: int = 100
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`
