@@ -1113,6 +1113,25 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     holding_completion = [False]  # list-wrapped for nonlocal-like closure
     rewrite_enabled = CFG.soft_completion_stream_rewrite_enabled
 
+    # Outgoing-bytes capture for forensics. accumulate_chunk only stores
+    # raw upstream bytes; the bytes we YIELD to client (post-injection)
+    # are different — and that's what codex actually parses. Capture
+    # last 32KB of yielded bytes so forensics shows what codex saw.
+    outgoing_capture = bytearray()
+    OUTGOING_MAX = 32 * 1024
+
+    def _capture_outgoing(b: bytes) -> bytes:
+        """Append b to the outgoing capture (capped tail) and return b
+        so the caller can `yield _capture_outgoing(...)` inline."""
+        if not CFG.forensics_enabled:
+            return b
+        if b:
+            outgoing_capture.extend(b)
+            if len(outgoing_capture) > OUTGOING_MAX:
+                # Trim from the front to keep last OUTGOING_MAX bytes
+                del outgoing_capture[:len(outgoing_capture) - OUTGOING_MAX]
+        return b
+
     def _intercept_completed(out_bytes: bytes) -> bytes:
         """Return bytes safe to yield to client. If the response.completed
         marker is detected, hold the marker (and any subsequent bytes
@@ -1250,17 +1269,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     if translator is None:
                         out_bytes = _intercept_completed(payload)
                         if out_bytes:
-                            yield out_bytes
+                            yield _capture_outgoing(out_bytes)
                     else:
                         for out in translator.feed(payload):
                             out_bytes = _intercept_completed(out)
                             if out_bytes:
-                                yield out_bytes
+                                yield _capture_outgoing(out_bytes)
                 if translator is not None and not upstream_failed:
                     for out in translator.flush():
                         out_bytes = _intercept_completed(out)
                         if out_bytes:
-                            yield out_bytes
+                            yield _capture_outgoing(out_bytes)
 
                 # ─── stream-rewrite synthesis ──────────────────────
                 # We held back the response.completed event. Decide
@@ -1314,7 +1333,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             from . import synthetic_continue as _syn
                             inj_events, strategy = _syn.build_continue_injection(sid)
                             for evt in inj_events:
-                                yield evt
+                                yield _capture_outgoing(evt)
                             _log("soft_completion_stream_rewrite_injected",
                                  session=sid,
                                  p=diag.result.p,
@@ -1333,16 +1352,39 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                     and CFG.forensics_capture_punts
                                     and diag.result.p >= CFG.forensics_punt_threshold):
                                 try:
+                                    from . import forensics as _fx
                                     forensics_dir = CFG.log_dir.parent / "forensics"
-                                    fp = _sc.write_punt_forensics(
-                                        sid, forensics_dir,
-                                        diag.result, diag,
-                                        max_dumps=CFG.forensics_max_dumps)
-                                    if fp:
+                                    # Custom dump that ALSO includes the
+                                    # outgoing capture (what codex
+                                    # actually saw, post-injection).
+                                    raw = _sc._OUTPUT_BUFFER.get(sid, "") or ""
+                                    fpath = _fx.write_forensics_dump(
+                                        forensics_dir, sid,
+                                        trigger="punt_via_stream_rewrite",
+                                        response_buffer=raw,
+                                        classifier_verdict={
+                                            "soft_punt": diag.result.soft_punt,
+                                            "p": diag.result.p,
+                                            "reason": diag.result.reason,
+                                            "extracted_text_chars": diag.extracted_text_chars,
+                                            "raw_buffer_chars": diag.raw_buffer_chars,
+                                            "finish_reason": diag.finish_reason,
+                                        },
+                                        extra={
+                                            "strategy": strategy["label"],
+                                            "tool_name": strategy["tool_name"],
+                                            "outgoing_to_codex_chars": len(outgoing_capture),
+                                            "outgoing_to_codex_tail": (
+                                                bytes(outgoing_capture[-4000:]).decode("utf-8", "replace")
+                                                if outgoing_capture else ""),
+                                        },
+                                        max_dumps=CFG.forensics_max_dumps,
+                                    )
+                                    if fpath:
                                         _log("forensics_dump_written",
                                              session=sid,
                                              trigger="punt_via_stream_rewrite",
-                                             path=fp)
+                                             path=str(fpath))
                                 except Exception:  # noqa: BLE001
                                     pass
                         else:
@@ -1356,7 +1398,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                              session=sid, error=str(e))
                     # Always flush the held response.completed at the end
                     if held_completion_buf:
-                        yield bytes(held_completion_buf)
+                        yield _capture_outgoing(bytes(held_completion_buf))
             finally:
                 if not producer.done():
                     producer.cancel()
