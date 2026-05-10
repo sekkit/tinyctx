@@ -383,6 +383,31 @@ async def responses(request: Request) -> Any:
     decision = decide(body, CFG, error_streak=streak)
     backend = _select_backend(decision)
 
+    # Empty-response guard: if the previous turn for this session
+    # returned an effectively empty response (e.g., DeepSeek silently
+    # degraded under long context), force this turn to frontier so
+    # the user gets a real answer. One-shot per detection — flag is
+    # consumed here. See tinyctx/empty_response_guard.py.
+    if CFG.empty_response_guard_enabled:
+        try:
+            from . import empty_response_guard as _erg
+            force_info = _erg.consume_force_frontier(proj_sid)
+            if force_info is not None:
+                decision = Decision(
+                    "frontier",
+                    f"empty-response guard: {force_info.get('reason', '?')[:80]}",
+                    is_compaction=decision.is_compaction,
+                    est_input_tokens=decision.est_input_tokens,
+                    turn_count=decision.turn_count,
+                )
+                backend = CFG.frontier
+                _log("empty_response_guard_forced_frontier",
+                     session=sid, proj_sid=proj_sid,
+                     prev_completion_tokens=force_info.get("completion_tokens"),
+                     prev_finish_reason=force_info.get("finish_reason"))
+        except Exception as e:  # noqa: BLE001 — guard must never block
+            _log("empty_response_guard_error", session=sid, error=str(e))
+
     # Allow client to force a specific route via the model id sent.
     requested_model = (body.get("model") or "").lower()
     trace.requested_model = requested_model
@@ -1434,6 +1459,28 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 asyncio.create_task(_bg_classify())
             except Exception as e:  # noqa: BLE001
                 _log("soft_completion_classify_spawn_error",
+                     session=sid, error=str(e))
+        # Empty-response guard: parse upstream's usage block from buffer
+        # tail; if completion_tokens too low + finish_reason normal,
+        # flag this session so the NEXT request gets routed to frontier.
+        # See tinyctx/empty_response_guard.py.
+        if (CFG.empty_response_guard_enabled
+                and status == 200
+                and not upstream_failed):
+            try:
+                from . import empty_response_guard as _erg
+                from . import soft_completion as _sc
+                buf_for_check = _sc._OUTPUT_BUFFER.get(sid, "")
+                info = _erg.maybe_flag_empty_response(
+                    sid, buf_for_check,
+                    min_completion_tokens=CFG.empty_response_min_completion_tokens)
+                if info is not None:
+                    _log("empty_response_detected", session=sid,
+                         completion_tokens=info.get("completion_tokens"),
+                         finish_reason=info.get("finish_reason"),
+                         reason=info.get("reason"))
+            except Exception as e:  # noqa: BLE001
+                _log("empty_response_guard_error",
                      session=sid, error=str(e))
         if trace is not None:
             trace.status = status

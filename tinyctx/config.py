@@ -394,6 +394,19 @@ class Config:
     soft_completion_stream_rewrite_extra_args: dict[str, str] = field(
         default_factory=lambda: {"role": "advisor"})
 
+    # Empty-response guard: detect when the local backend returns
+    # essentially nothing (completion_tokens < threshold + normal stop)
+    # and force the NEXT turn for that session to frontier. Caught
+    # DeepSeek-v4-flash silently degrading at 724K context (live trace
+    # 2026-05-10 turn 1780: 1 completion token + finish_reason=stop →
+    # codex displayed empty response → user thought session crashed).
+    # See tinyctx/empty_response_guard.py.
+    empty_response_guard_enabled: bool = True
+    # Threshold below which a finish_reason=stop response is "empty".
+    # 5 tokens lets through brief acknowledgments ("OK", "Done.") but
+    # catches the 1-token failure mode.
+    empty_response_min_completion_tokens: int = 5
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`
