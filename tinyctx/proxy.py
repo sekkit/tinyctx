@@ -1320,6 +1320,25 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 trace.soft_completion_gate_injected = True
                                 trace.soft_completion_gate_pattern = (
                                     f"stream-rewrite: {diag.result.reason}")[:80]
+                            # Forensics: capture the PUNT that triggered
+                            # this stream-rewrite. Same write_punt_forensics
+                            # the bg_classify path uses.
+                            if (CFG.forensics_enabled
+                                    and CFG.forensics_capture_punts
+                                    and diag.result.p >= CFG.forensics_punt_threshold):
+                                try:
+                                    forensics_dir = CFG.log_dir.parent / "forensics"
+                                    fp = _sc.write_punt_forensics(
+                                        sid, forensics_dir,
+                                        diag.result, diag,
+                                        max_dumps=CFG.forensics_max_dumps)
+                                    if fp:
+                                        _log("forensics_dump_written",
+                                             session=sid,
+                                             trigger="punt_via_stream_rewrite",
+                                             path=fp)
+                                except Exception:  # noqa: BLE001
+                                    pass
                         else:
                             _log("soft_completion_stream_rewrite_skipped",
                                  session=sid,
