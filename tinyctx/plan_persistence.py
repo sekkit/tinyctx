@@ -22,7 +22,7 @@ Storage
 
 Each file:
 {
-  "cwd": "/Users/sekkit/dev/tinyxr",
+  "cwd": "<absolute path of working dir at save time>",
   "plan_text": "  1. [completed] Create viewmodel/...\n  2. [pending] ...",
   "updated_at": 1778383500.123,
   "turn_count_at_save": 1866,

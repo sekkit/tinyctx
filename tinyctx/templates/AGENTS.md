@@ -51,6 +51,16 @@
       - 累计修改 ≥5 个文件
       - 用户目标含构建 / 测试 / 部署 / 启动 / 验收等可验证收尾步骤
     收到 `fix: ...` 必须先处理再继续；收到 `ship: ...` 才能输出 Final summary。
+- **Plan 来源优先级 (Plan Source Authority)**：当多个地方似乎都有"任务 plan"时，按以下严格优先级取用，**不许混用、不许把后者覆盖前者**：
+  1. **tinyctx 注入的 `<persisted-plan source="tinyctx">` 块**（如果出现在 instructions 顶部）—— 这是跨 codex thread 的真实状态，最权威。
+  2. **当前对话历史中最新的 `update_plan` / `TodoWrite` 工具调用结果** —— session 内的 tracker 实际状态。
+  3. **用户当前 turn 显式贴的 plan 文本** —— 直接指令，明显新于历史。
+  4. **codex.app startup_context 列出的 working directory 文件清单** —— 仅作工作区索引参考，不是 plan。
+  - **永不**把仓库内的 `plan.md` / `progress.md` / `tasks.md` / `roadmap.md` / `TODO.md` / `agents/*.md` 等磁盘文件**直接当作权威 progress tracker**。这些文件可能严重过期 / 是另一个会话留下的 / 是某次提案没采纳。读取它们可以做参考，但**禁止**:
+    (a) 把它们的条目复制到当前 turn 当作 "current tracker"；
+    (b) 在 enumerate tracker 时引用磁盘文件代替对话历史；
+    (c) 看到磁盘 plan 比对话历史详细就采信磁盘版本。
+  - 如果对话历史**没有**任何 `update_plan` 调用，且也没有 `<persisted-plan>` 注入，且用户当前 turn 也没贴 plan —— 这意味着**没有 plan**，应当向用户**问一句"要执行什么"**，而不是从磁盘扒一个出来当 plan。
 
 ## 5. 风险与优先级
 - L1：生产数据变更/删除、敏感信息泄露、不可逆操作。必须先说明影响、风险、回滚，再二次确认。

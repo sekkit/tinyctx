@@ -11,10 +11,10 @@ import pytest
 
 def test_cwd_hash_stable():
     from tinyctx.plan_persistence import _cwd_hash
-    h1 = _cwd_hash("/Users/sekkit/dev/tinyxr")
-    h2 = _cwd_hash("/Users/sekkit/dev/tinyxr")
+    h1 = _cwd_hash("/tmp/repo")
+    h2 = _cwd_hash("/tmp/repo")
     assert h1 == h2
-    h3 = _cwd_hash("/Users/sekkit/dev/other")
+    h3 = _cwd_hash("/tmp/other")
     assert h1 != h3
     # Empty cwd → "default" sentinel
     assert _cwd_hash("") == "default"
