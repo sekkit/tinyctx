@@ -1486,11 +1486,42 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 yield out
     except httpx.HTTPError as e:
         _SESSION_ERROR_STREAK[sid] += 1
-        _log("stream_error", session=sid, error=str(e))
+        _log("stream_error", session=sid, error=str(e),
+             error_type=type(e).__name__, bytes_yielded=bytes_out)
         status = 0
         yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n".encode()
         upstream_failed = True
         upstream_failure_msg = f"http error: {e!s}"
+
+        # On transient stream error, set force-frontier flag so the NEXT
+        # request from codex (whether codex auto-retries or user nudges)
+        # bypasses the unstable backend and routes to gpt-5.5. Per user
+        # directive: "先重试原来模型，再出错就升级" — first retry happens
+        # implicitly via codex's natural behavior, second attempt then
+        # escalates by virtue of this flag.
+        is_transient = isinstance(e, (
+            httpx.RemoteProtocolError, httpx.ReadTimeout,
+            httpx.ReadError, httpx.ConnectError, httpx.WriteError))
+        if (CFG.empty_response_guard_enabled
+                and is_transient
+                and CFG.upstream_retry_enabled):
+            try:
+                from . import empty_response_guard as _erg
+                # Only escalate if THIS session has now had multiple
+                # consecutive errors (≥ retry_count + 1). The first
+                # error sets the streak; subsequent errors trip escalation.
+                if _SESSION_ERROR_STREAK[sid] > CFG.upstream_retry_count:
+                    _erg.force_next_to_frontier(
+                        sid,
+                        f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[sid]}")
+                    _log("stream_error_escalating_to_frontier", session=sid,
+                         streak=_SESSION_ERROR_STREAK[sid])
+                else:
+                    _log("stream_error_will_retry_same_backend",
+                         session=sid, streak=_SESSION_ERROR_STREAK[sid])
+            except Exception:  # noqa: BLE001
+                pass
+
         # Error forensics — capture request that triggered this stream
         # error so we can post-mortem the failure (network blip /
         # upstream timeout / TLS handshake issue / etc.)
@@ -1505,7 +1536,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     timing={"elapsed_s": round(time.time() - started, 3)},
                     extra={"error": str(e)[:1000],
                            "error_type": type(e).__name__,
-                           "url": url},
+                           "url": url,
+                           "bytes_yielded": bytes_out,
+                           "session_error_streak": _SESSION_ERROR_STREAK[sid]},
                     max_dumps=CFG.forensics_max_dumps,
                 )
             except Exception:  # noqa: BLE001

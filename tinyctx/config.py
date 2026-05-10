@@ -455,6 +455,20 @@ class Config:
     # TTL after which a persisted plan is no longer auto-injected.
     plan_persistence_ttl_s: int = 7 * 24 * 3600  # 7 days
 
+    # In-proxy retry on transient upstream stream errors. Per user
+    # directive: "先重试原来模型，再出错就升级". On RemoteProtocolError /
+    # ReadTimeout / ConnectError, retry the SAME backend up to N more
+    # times. After exhausting, set force-frontier flag so the NEXT
+    # request from codex auto-routes to gpt-5.5.
+    #
+    # Only retries when bytes_out is small (no meaningful content sent
+    # to client yet) — otherwise duplicate-content risk.
+    upstream_retry_enabled: bool = True
+    upstream_retry_count: int = 1  # 1 retry = 2 attempts total
+    # Max bytes already yielded to client at which retry is still safe.
+    # Above this, we've sent real content and can't redo cleanly.
+    upstream_retry_max_bytes_yielded: int = 4096
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`
