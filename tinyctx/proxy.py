@@ -1306,15 +1306,21 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 text_excerpt,
                                 diag.result.reason,
                                 diag.result.p)
-                            for evt in _sr.synthetic_advisor_call_events(
-                                    task_body,
-                                    tool_name=CFG.soft_completion_stream_rewrite_tool_name,
-                                    extra_args=dict(CFG.soft_completion_stream_rewrite_extra_args)):
+                            # Multi-strategy synthetic continue: rotate
+                            # through codex builtins (shell / local_shell /
+                            # update_plan) until codex actually dispatches
+                            # one. spawn_agent was tried first but binary
+                            # analysis confirmed codex silently drops it.
+                            from . import synthetic_continue as _syn
+                            inj_events, strategy = _syn.build_continue_injection(sid)
+                            for evt in inj_events:
                                 yield evt
                             _log("soft_completion_stream_rewrite_injected",
                                  session=sid,
                                  p=diag.result.p,
                                  reason=diag.result.reason,
+                                 strategy=strategy["label"],
+                                 tool_name=strategy["tool_name"],
                                  task_chars=len(task_body))
                             if trace is not None:
                                 trace.soft_completion_gate_injected = True
