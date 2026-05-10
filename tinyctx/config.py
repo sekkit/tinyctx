@@ -292,12 +292,37 @@ class Config:
     # Disabled (false) on local because (a) 1M ctx absorbs the cost and
     # (b) we don't want to surprise the local model by silently dropping
     # tools mid-conversation.
-    frontier_trim_tools: bool = True
+    #
+    # 2026-05-10: DEFAULT FLIPPED TO FALSE per user directive ("不要 trim
+    # tools, 所有 tools 都保留"). Background: even with the
+    # spawn_agent/wait_agent essentials fix, trimming creates a class of
+    # rare-tool-starvation bugs (any tool not in `essentials` AND not in
+    # the recent window is silently invisible). User accepts the
+    # ~10k-token-per-request cost in exchange for full tool availability.
+    # To re-enable trimming, set `frontier_trim_tools = true` under
+    # `[server]` in ~/.tinyctx/config.toml.
+    frontier_trim_tools: bool = False
     frontier_tools_recent_window: int = 30  # how many recent input items to scan
     frontier_tools_essentials: tuple[str, ...] = (
         "shell", "apply_patch", "container.exec",
         "update_plan",
         "view_image", "image_view",
+        # codex 0.128+ multi-agent / spawn_agent protocol — REQUIRED to
+        # keep, otherwise the advisor agent (and any other sub-agent
+        # role) becomes unreachable. Bug found 2026-05-10: agent had
+        # NEVER called spawn_agent, so frontier_trim_tools dropped it
+        # every turn (chicken-and-egg). User's `~/.codex/config.toml`
+        # has multi_agent=true + [agents.advisor] registered, but the
+        # tool literally wasn't in the request the executor saw on
+        # frontier route. log line:
+        #   "dropped_names": [..., "close_agent", "spawn_agent",
+        #                     "wait_agent", "resume_agent", ...]
+        "spawn_agent", "wait_agent", "close_agent", "resume_agent",
+        # User-input request channel — codex needs this to surface
+        # genuine clarifications (the only legit "ask user" path).
+        # Stripping it forces the agent to fall back to plain text,
+        # which the soft_completion classifier then flags as a punt.
+        "request_user_input", "send_input",
         # MCP advisor and the user's most-used MCP tools
         "mcp__advisor__ask_advisor",
     )
@@ -363,6 +388,24 @@ class Config:
     # to the user instead of completing the 4 tracker items.
     soft_completion_gate_enabled: bool = True
 
+    # Short-text floor for the LLM classifier. Two values because
+    # finish_reason=stop and finish_reason=length/incomplete carry
+    # different signal density — see soft_completion.py docstring.
+    #
+    # `short_text_threshold` (50) applies to length / incomplete /
+    # completed / null finish_reasons — partial / truncated streams
+    # where a short fragment is rarely a real punt.
+    #
+    # `stop_text_threshold` (1) applies to finish_reason=stop. Per
+    # user directive 2026-05-10: classify EVERY stop, even very short
+    # ones ("Done." / "好的。"), because those CAN be real soft-punts
+    # the original 50-char floor was missing. Tradeoff is ~2-5× more
+    # LLM classifier calls per session — bounded by the per-turn
+    # frequency of stop streams (most turns end on tool_calls anyway,
+    # which still short-circuits before the threshold check).
+    soft_completion_short_text_threshold: int = 50
+    soft_completion_stop_text_threshold: int = 1
+
     # Stream rewriting: when soft_completion classifier returns PUNT
     # with confidence ≥ rewrite_threshold, intercept the upstream's
     # `response.completed` event, run the classifier synchronously,
@@ -393,6 +436,16 @@ class Config:
     # which sub-agent to dispatch to.
     soft_completion_stream_rewrite_extra_args: dict[str, str] = field(
         default_factory=lambda: {"role": "advisor"})
+
+    # P2: per-session synthetic-continue injection budget. After this
+    # many synthetic continues for one session, `build_continue_injection`
+    # returns the `budget_exhausted` sentinel; the proxy stops yielding
+    # synthetic events, sets the force-frontier flag for the next turn,
+    # and injects a one-shot `<system-reminder>` warning the agent that
+    # tinyctx auto-continued N times and may have been wrong about the
+    # task being incomplete. Inspired by openai/symphony SPEC §7.1
+    # `agent.max_turns`.
+    max_continue_injections_per_session: int = 20
 
     # Empty-response guard: detect when the local backend returns
     # essentially nothing (completion_tokens < threshold + normal stop)
@@ -446,6 +499,17 @@ class Config:
     # Max forensic dumps to retain (oldest deleted past this count).
     forensics_max_dumps: int = 100
 
+    # When the local model emits a function_call whose `name` is NOT in the
+    # codex-side tool registry (typo, hallucinated tool, schema mismatch),
+    # codex's dispatcher cannot resolve it and the session stalls. With this
+    # flag ON, the translator drops the bad function_call SSE events and
+    # replaces them with a synthetic `shell ["echo", "tinyctx: dropped ..."]`
+    # call (codex always dispatches `shell`). The model sees the echo output
+    # next turn and self-corrects. See tinyctx/tool_call_translator.py.
+    # Set to False to fall back to today's pass-through behavior (escape
+    # hatch in case the replacement causes regressions).
+    unknown_tool_call_protection: bool = True
+
     # Cross-thread plan persistence: when codex's update_plan is called,
     # save the plan to disk keyed by working directory. When a new codex
     # thread opens on the same repo (turn_count==0), inject the persisted
@@ -454,6 +518,72 @@ class Config:
     plan_persistence_enabled: bool = True
     # TTL after which a persisted plan is no longer auto-injected.
     plan_persistence_ttl_s: int = 7 * 24 * 3600  # 7 days
+
+    # C-4 hybrid: codex exec resume "poke". When the soft_completion
+    # classifier returns a high-confidence PUNT, fire `codex exec resume
+    # <session_id> "<exec_resume_prompt>"` in a side process. exec is
+    # one-shot (no finish_reason=stop wait-for-user), so it forces a
+    # new turn into the SAME session without requiring user input —
+    # turning the empty_response_guard / auto_force_frontier flag from
+    # passive (waits on user) into active (immediate side-process turn).
+    # See tinyctx/exec_resume.py.
+    #
+    # Conservative defaults: read-only sandbox, approval=never. Agent
+    # can think + plan + advisor + read-only commands but cannot modify
+    # files. Once the loop is validated, set
+    # `exec_resume_sandbox = "workspace-write"` in config.toml.
+    exec_resume_enabled: bool = True
+    # Min PUNT confidence to trigger. Aligned with
+    # soft_completion_auto_force_frontier_threshold (0.85) so the same
+    # high-bar verdict drives both the flag AND the active poke.
+    exec_resume_min_p: float = 0.85
+    # Per-session cooldown (seconds) before another poke for the same
+    # session. Stops feedback loops if the poke itself triggers another
+    # PUNT verdict.
+    exec_resume_cooldown_s: int = 300
+    # Global cap across all sessions to bound API spend if many sessions
+    # PUNT at once.
+    exec_resume_max_per_minute: int = 3
+    # Prompt the side process sees as a new user message. Keep concise
+    # so the agent doesn't fixate on the prompt and forgets the actual
+    # work. Per user directive Q1=(b).
+    exec_resume_prompt: str = (
+        "continue working from where you left off; do not over-explain, "
+        "just take the next action")
+    # SPEC §12.3-style tiered prompts. The proxy passes this list to
+    # `exec_resume.poke(prompt_tiers=...)`; `select_tier_prompt` picks
+    # which one fires based on the per-session poke count:
+    #   count 0..1 -> gentle  (tiers[0])
+    #   count 2..4 -> firm    (tiers[1])
+    #   count >= 5 -> final   (tiers[2]) — after which the next
+    #                          would-be poke is skipped with reason
+    #                          `tier_exhausted` and the next request
+    #                          for that session is forced to frontier.
+    exec_resume_prompt_tiers: list[str] = field(default_factory=lambda: [
+        ("tinyctx auto-continue: please continue if there's remaining "
+         "work for this session, otherwise summarize and stop."),
+        ("tinyctx auto-continue (3rd nudge): you appear stuck. Run any "
+         "pending verification, consult advisor if confused, or stop "
+         "and surface a concrete blocker to the user."),
+        ("tinyctx auto-continue (final nudge): the auto-continue budget "
+         "for this session is nearly exhausted. Either complete the "
+         "task now or stop and surface a clear blocker — the next stop "
+         "will route to frontier instead of nudging again."),
+    ])
+    # Subprocess timeout (seconds). Killed at this point; partial log
+    # preserved.
+    exec_resume_timeout_s: int = 60
+    # Override codex binary path. Empty = auto-detect (codex.app's
+    # bundled binary, then $PATH).
+    exec_resume_codex_binary: str = ""
+    # Sandbox mode the poked turn runs under. read-only is safest;
+    # workspace-write lets the agent actually finish the work it was
+    # paused on (recommended once you trust the loop).
+    exec_resume_sandbox: str = "read-only"
+    # approval_policy override for the poked turn. `never` is the only
+    # value that keeps the subprocess non-interactive — anything else
+    # will deadlock waiting for user input.
+    exec_resume_approval_policy: str = "never"
 
     # In-proxy retry on transient upstream stream errors. Per user
     # directive: "先重试原来模型，再出错就升级". On RemoteProtocolError /
@@ -468,6 +598,26 @@ class Config:
     # Max bytes already yielded to client at which retry is still safe.
     # Above this, we've sent real content and can't redo cleanly.
     upstream_retry_max_bytes_yielded: int = 4096
+
+    # Mid-stream stall watchdog. While `empty_response_guard` catches
+    # near-empty responses post-stream, it does NOT catch the case where
+    # the upstream opens the SSE channel and then HANGS — no events, no
+    # error, no close. Codex.app waits for `response.completed`; tinyctx
+    # waits for the next byte; nothing fires. The watchdog polls each
+    # session's last-event timestamp and forces escalation when the gap
+    # exceeds `stall_threshold_s`. See tinyctx/stall_watchdog.py.
+    #
+    # Inspired by openai/symphony SPEC §8.5 Part A and codex's own
+    # `stall_timeout_ms` (5 min default in codex.app).
+    stall_watchdog_enabled: bool = True
+    # Seconds without an upstream event before declaring a stall. 180s
+    # is generous enough to absorb large-context cold starts (DeepSeek
+    # at 500K input can take 60-90s before the first token) without
+    # waiting forever for genuinely-dead sessions.
+    stall_threshold_s: float = 180.0
+    # How often the watchdog wakes up to check. 30s gives sub-minute
+    # detection latency on top of the threshold without burning CPU.
+    stall_check_interval_s: float = 30.0
 
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many

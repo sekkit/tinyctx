@@ -940,6 +940,203 @@ def test_translator_finish_intercepts_request_user_input_when_enabled():
         _adv.call_advisor = saved_adv
 
 
+# ───────────────────────── unknown tool name protection ─────────────────
+
+
+def _delta_event(text: str, item_id: str = "m1") -> bytes:
+    return (
+        "event: response.output_text.delta\n"
+        "data: " + json.dumps({
+            "type": "response.output_text.delta",
+            "item_id": item_id, "output_index": 0,
+            "content_index": 0, "delta": text, "sequence_number": 1,
+        }) + "\n\n"
+    ).encode("utf-8")
+
+
+def _full_xml(name: str, key: str = "k", value: str = "v") -> str:
+    return (
+        f"<tool_call>\n<function={name}>\n"
+        f"<parameter={key}>\n{value}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+
+def test_stream_translator_unknown_name_replaced_with_shell_echo():
+    t = StreamTranslator(valid_tool_names={"shell"})
+    out_bytes = list(t.feed(_delta_event(_full_xml("typo_tool"))))
+    out = _events_to_str(out_bytes)
+    # All function_call event names point at shell, never the bad name.
+    assert '"name": "typo_tool"' not in out
+    # Synthetic shell call covers both the .added and .done items.
+    assert out.count('"name": "shell"') >= 2
+    # Echo command was injected with the original name surfaced in the msg.
+    assert "echo" in out
+    assert "typo_tool" in out  # appears only inside the echo string
+    # Args carry shell-command JSON (escaped within the SSE data line).
+    assert "command" in out
+    assert "tinyctx: dropped unsupported tool call" in out
+
+
+def test_stream_translator_no_validation_when_names_none():
+    t = StreamTranslator(valid_tool_names=None)
+    out = _events_to_str(t.feed(_delta_event(_full_xml("typo_tool"))))
+    # Legacy pass-through: the unknown name flows through verbatim
+    assert '"name": "typo_tool"' in out
+    assert "shell" not in out  # untouched
+
+
+def test_stream_translator_known_name_passthrough_unchanged():
+    t = StreamTranslator(valid_tool_names={"shell", "update_plan"})
+    out = _events_to_str(t.feed(_delta_event(_full_xml("shell",
+                                                       "command", "ls"))))
+    assert '"name": "shell"' in out
+    # No replacement echo string injected
+    assert "tinyctx: dropped" not in out
+
+
+def test_stream_translator_empty_set_replaces_all_calls():
+    t = StreamTranslator(valid_tool_names=set())
+    out = _events_to_str(t.feed(_delta_event(_full_xml("anything"))))
+    assert '"name": "shell"' in out
+    assert "tinyctx: dropped unsupported tool call 'anything'" in out
+
+
+def test_stream_translator_handles_special_chars_in_unknown_name():
+    weird = "weird'\"name"
+    t = StreamTranslator(valid_tool_names={"shell"})
+    # Feed verbatim — won't crash even if name has quotes / shell metas.
+    list(t.feed(_delta_event(_full_xml(weird))))
+
+
+def test_chat_to_responses_unknown_name_replaced():
+    from tinyctx.tool_call_translator import ChatToResponsesTranslator
+    t = ChatToResponsesTranslator(valid_tool_names={"shell"})
+    chunk = (
+        b"data: " + json.dumps({
+            "id": "x", "object": "chat.completion.chunk", "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": "fc1",
+                    "function": {"name": "typo_tool",
+                                 "arguments": "{\"a\":1}"}}]},
+                "finish_reason": "tool_calls",
+            }],
+        }).encode("utf-8") + b"\n\n"
+    )
+    out = _events_to_str(t.feed(chunk)) + _events_to_str(t.flush())
+    assert "typo_tool" in out  # appears only in echo string
+    assert '"name": "shell"' in out
+    assert "echo" in out
+
+
+def test_chat_to_responses_no_validation_when_names_none():
+    from tinyctx.tool_call_translator import ChatToResponsesTranslator
+    t = ChatToResponsesTranslator(valid_tool_names=None)
+    chunk = (
+        b"data: " + json.dumps({
+            "id": "x", "object": "chat.completion.chunk", "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": "fc1",
+                    "function": {"name": "typo_tool",
+                                 "arguments": "{}"}}]},
+                "finish_reason": "tool_calls",
+            }],
+        }).encode("utf-8") + b"\n\n"
+    )
+    out = _events_to_str(t.feed(chunk)) + _events_to_str(t.flush())
+    assert '"name": "typo_tool"' in out
+    assert "tinyctx: dropped" not in out
+
+
+def test_chat_to_responses_known_name_passthrough():
+    from tinyctx.tool_call_translator import ChatToResponsesTranslator
+    t = ChatToResponsesTranslator(valid_tool_names={"shell"})
+    chunk = (
+        b"data: " + json.dumps({
+            "id": "x", "object": "chat.completion.chunk", "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": "fc1",
+                    "function": {"name": "shell",
+                                 "arguments": "{\"command\":[\"ls\"]}"}}]},
+                "finish_reason": "tool_calls",
+            }],
+        }).encode("utf-8") + b"\n\n"
+    )
+    out = _events_to_str(t.feed(chunk)) + _events_to_str(t.flush())
+    assert '"name": "shell"' in out
+    assert "tinyctx: dropped" not in out
+
+
+def test_rebuild_response_unknown_name_replaced():
+    response = {
+        "output": [
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "status": "completed",
+             "content": [
+                 {"type": "output_text",
+                  "text": _full_xml("hallucinated_tool")},
+             ]}
+        ]
+    }
+    out = rebuild_response(response, valid_tool_names={"shell"})
+    fcs = [it for it in out["output"] if it.get("type") == "function_call"]
+    assert len(fcs) == 1
+    assert fcs[0]["name"] == "shell"
+    args = json.loads(fcs[0]["arguments"])
+    assert args["command"][0] == "echo"
+    assert "hallucinated_tool" in args["command"][1]
+
+
+def test_rebuild_response_known_name_unchanged():
+    response = {
+        "output": [
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "status": "completed",
+             "content": [{"type": "output_text",
+                          "text": _full_xml("shell", "command", "ls")}]}
+        ]
+    }
+    out = rebuild_response(response, valid_tool_names={"shell"})
+    fcs = [it for it in out["output"] if it.get("type") == "function_call"]
+    assert len(fcs) == 1
+    assert fcs[0]["name"] == "shell"
+    assert "tinyctx: dropped" not in fcs[0]["arguments"]
+
+
+def test_rebuild_response_no_validation_when_names_none():
+    response = {
+        "output": [
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "status": "completed",
+             "content": [{"type": "output_text",
+                          "text": _full_xml("typo_tool")}]}
+        ]
+    }
+    out = rebuild_response(response, valid_tool_names=None)
+    fcs = [it for it in out["output"] if it.get("type") == "function_call"]
+    assert len(fcs) == 1
+    assert fcs[0]["name"] == "typo_tool"
+
+
+def test_extract_valid_tool_names_handles_both_shapes():
+    from tinyctx.proxy import _extract_valid_tool_names
+    body = {"tools": [
+        {"type": "function", "name": "shell"},
+        {"type": "function", "function": {"name": "update_plan"}},
+        {"type": "function"},  # malformed — skipped silently
+    ]}
+    assert _extract_valid_tool_names(body) == {"shell", "update_plan"}
+    assert _extract_valid_tool_names({}) is None
+    assert _extract_valid_tool_names({"tools": []}) is None
+    assert _extract_valid_tool_names({"tools": "junk"}) is None
+
+
 if __name__ == "__main__":
     import sys
     failed = 0

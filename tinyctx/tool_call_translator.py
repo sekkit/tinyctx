@@ -106,6 +106,49 @@ def parse_tool_call_block(text: str) -> list[dict[str, Any]]:
     return out
 
 
+def _build_unknown_tool_replacement(
+        original_name: str,
+        valid_tool_names: set[str] | None,
+) -> dict[str, Any]:
+    """Return a synthetic `shell ["echo", "..."]` call replacing an unknown
+    tool name. codex unconditionally dispatches `shell` (builtin), so the
+    echo result lands in the next turn's context and the model self-corrects.
+    Forensics record is emitted by the caller.
+    """
+    sample = ""
+    if valid_tool_names:
+        names = sorted(valid_tool_names)
+        if len(names) > 12:
+            sample = ", ".join(names[:12]) + f", … ({len(names)-12} more)"
+        else:
+            sample = ", ".join(names)
+    msg = (f"tinyctx: dropped unsupported tool call '{original_name}'; "
+           f"valid tools: {sample}" if sample else
+           f"tinyctx: dropped unsupported tool call '{original_name}'")
+    args = {"command": ["echo", msg]}
+    return {
+        "name": "shell",
+        "arguments": json.dumps(args, ensure_ascii=False),
+    }
+
+
+def _record_unknown_tool_drop(
+        original_name: str,
+        valid_tool_names: set[str] | None,
+        site: str,
+) -> None:
+    """Best-effort forensics breadcrumb. Never raises."""
+    try:
+        from tinyctx.proxy import _log
+        _log("unknown_tool_call_dropped",
+             original_name=original_name,
+             site=site,
+             valid_tool_count=(len(valid_tool_names)
+                               if valid_tool_names is not None else None))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _coerce_value(raw: str) -> Any:
     s = raw.strip()
     if s == "":
@@ -130,12 +173,19 @@ def _strip_tool_call_blocks(text: str) -> str:
 # ───────────────────────────── non-streaming ─────────────────────────────
 
 
-def rebuild_response(response: dict[str, Any]) -> dict[str, Any]:
+def rebuild_response(
+        response: dict[str, Any],
+        valid_tool_names: set[str] | None = None,
+) -> dict[str, Any]:
     """Take a Responses-API completion JSON and return a copy in which any
     `output_text` content containing `<tool_call>` XML has been replaced by
     structured `function_call` items.
 
     Idempotent: if no XML is present, returns the body unchanged (same dict).
+
+    `valid_tool_names`: when not None, any extracted call whose name isn't
+    in the set is replaced with a synthetic `shell echo` call so codex can
+    dispatch it cleanly. None (default) preserves legacy pass-through.
     """
     out_items = response.get("output")
     if not isinstance(out_items, list):
@@ -186,12 +236,22 @@ def rebuild_response(response: dict[str, Any]) -> dict[str, Any]:
         # Append one function_call item per extracted call.
         for call in extracted_calls:
             cid = "fc_" + uuid.uuid4().hex[:24]
+            name = call["name"]
+            arguments = call["arguments"]
+            if (valid_tool_names is not None
+                    and name not in valid_tool_names):
+                _record_unknown_tool_drop(name, valid_tool_names,
+                                          site="rebuild_response")
+                replacement = _build_unknown_tool_replacement(
+                    name, valid_tool_names)
+                name = replacement["name"]
+                arguments = replacement["arguments"]
             new_items.append({
                 "id": cid,
                 "type": "function_call",
                 "status": "completed",
-                "name": call["name"],
-                "arguments": call["arguments"],
+                "name": name,
+                "arguments": arguments,
                 "call_id": cid,
             })
 
@@ -225,6 +285,11 @@ class StreamTranslator:
     _emitted_calls: int = 0       # output_index counter for new function_call items
     _saw_partial: dict[str, bool] = field(default_factory=dict)
     _partial: str = ""            # partial event bytes carried across feed() calls
+    # Set of tool names codex's dispatcher will accept. When not None, any
+    # emitted function_call whose name isn't in the set is rewritten to a
+    # synthetic `shell echo` call so codex can dispatch it cleanly. None
+    # (default) preserves legacy pass-through.
+    valid_tool_names: set[str] | None = None
 
     # ────────── public API ──────────
 
@@ -330,13 +395,23 @@ class StreamTranslator:
         self._emitted_calls += 1
         oidx = self._emitted_calls + 1   # +1 to stay clear of the message item
         cid = "fc_" + uuid.uuid4().hex[:24]
+        name = call["name"]
+        arguments = call["arguments"]
+        if (self.valid_tool_names is not None
+                and name not in self.valid_tool_names):
+            _record_unknown_tool_drop(name, self.valid_tool_names,
+                                      site="StreamTranslator._emit_function_call")
+            replacement = _build_unknown_tool_replacement(
+                name, self.valid_tool_names)
+            name = replacement["name"]
+            arguments = replacement["arguments"]
         yield self._build_event(
             "response.output_item.added",
             {"type": "response.output_item.added",
              "output_index": oidx,
              "item": {"id": cid, "type": "function_call",
                       "status": "in_progress",
-                      "name": call["name"],
+                      "name": name,
                       "arguments": "",
                       "call_id": cid},
              "sequence_number": self._next_seq()},
@@ -345,14 +420,14 @@ class StreamTranslator:
             "response.function_call_arguments.delta",
             {"type": "response.function_call_arguments.delta",
              "item_id": cid, "output_index": oidx,
-             "delta": call["arguments"],
+             "delta": arguments,
              "sequence_number": self._next_seq()},
         )
         yield self._build_event(
             "response.function_call_arguments.done",
             {"type": "response.function_call_arguments.done",
              "item_id": cid, "output_index": oidx,
-             "arguments": call["arguments"],
+             "arguments": arguments,
              "sequence_number": self._next_seq()},
         )
         yield self._build_event(
@@ -361,8 +436,8 @@ class StreamTranslator:
              "output_index": oidx,
              "item": {"id": cid, "type": "function_call",
                       "status": "completed",
-                      "name": call["name"],
-                      "arguments": call["arguments"],
+                      "name": name,
+                      "arguments": arguments,
                       "call_id": cid},
              "sequence_number": self._next_seq()},
         )
@@ -777,6 +852,10 @@ class ChatToResponsesTranslator:
     _reasoning_item_emitted: bool = False
     _reasoning_done: bool = False
     _message_item_emitted: bool = False
+    # Same semantics as StreamTranslator.valid_tool_names — None means no
+    # validation (legacy pass-through). When set, function_calls naming a
+    # tool not in the set are rewritten to a synthetic `shell echo` call.
+    valid_tool_names: set[str] | None = None
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         self._partial += chunk.decode("utf-8", errors="replace")
@@ -1059,26 +1138,41 @@ class ChatToResponsesTranslator:
             self._emitted_calls += 1
             oidx = tc_base + self._emitted_calls - 1
             cid = entry["id"] or "fc_" + uuid.uuid4().hex[:24]
+            name = entry["name"]
+            arguments = entry["arguments"]
+            if (self.valid_tool_names is not None
+                    and name not in self.valid_tool_names):
+                _record_unknown_tool_drop(
+                    name, self.valid_tool_names,
+                    site="ChatToResponsesTranslator._finish")
+                replacement = _build_unknown_tool_replacement(
+                    name, self.valid_tool_names)
+                name = replacement["name"]
+                arguments = replacement["arguments"]
+                # Mutate the entry too so the response.completed final
+                # output items list (built below) reflects the rewrite.
+                entry["name"] = name
+                entry["arguments"] = arguments
             yield self._sse("response.output_item.added", {
                 "type": "response.output_item.added",
                 "output_index": oidx,
                 "item": {"id": cid, "type": "function_call",
-                         "status": "in_progress", "name": entry["name"],
+                         "status": "in_progress", "name": name,
                          "arguments": "", "call_id": cid},
                 "sequence_number": self._next_seq(),
             })
             yield self._sse("response.function_call_arguments.done", {
                 "type": "response.function_call_arguments.done",
                 "item_id": cid, "output_index": oidx,
-                "arguments": entry["arguments"],
+                "arguments": arguments,
                 "sequence_number": self._next_seq(),
             })
             yield self._sse("response.output_item.done", {
                 "type": "response.output_item.done",
                 "output_index": oidx,
                 "item": {"id": cid, "type": "function_call",
-                         "status": "completed", "name": entry["name"],
-                         "arguments": entry["arguments"], "call_id": cid},
+                         "status": "completed", "name": name,
+                         "arguments": arguments, "call_id": cid},
                 "sequence_number": self._next_seq(),
             })
 

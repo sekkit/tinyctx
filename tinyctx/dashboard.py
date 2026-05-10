@@ -53,6 +53,8 @@ _INTERESTING_EVENTS = {
     "upstream_error",
     "self_classify_error",
     "stuck_loop_error",
+    "exec_resume_poke",
+    "exec_resume_poke_error",
 }
 
 
@@ -109,10 +111,19 @@ def _format_event_for_dashboard(e: dict[str, Any]) -> dict[str, Any] | None:
     elif ev in ("soft_completion_classify_backend_error",
                 "soft_completion_classify_parse_failed",
                 "stream_error", "upstream_error",
-                "self_classify_error", "stuck_loop_error"):
+                "self_classify_error", "stuck_loop_error",
+                "exec_resume_poke_error"):
         base.update({
             "error": (e.get("error", "") or e.get("body", "") or "")[:200],
             "status": e.get("status", 0),
+        })
+    elif ev == "exec_resume_poke":
+        base.update({
+            "status_label": (e.get("status", "") or "")[:20],
+            "reason": (e.get("reason", "") or "")[:80],
+            "pid": e.get("pid", 0),
+            "p": e.get("p", 0.0),
+            "resolved_session_id": (e.get("resolved_session_id", "") or "")[:24],
         })
     return base
 
@@ -238,6 +249,18 @@ def state_snapshot() -> dict[str, Any]:
             empty_response_guard.state_snapshot())
     except Exception as e:  # noqa: BLE001
         out["empty_response_guard_flags"] = {"error": str(e)}
+    # Per-session request lifecycle phase (P3)
+    try:
+        from . import request_phase as _rp
+        snap = _rp.state_snapshot()
+        now = time.time()
+        out["request_phase"] = {
+            sid: {**info,
+                  "age_s": round(now - info.get("since_ts", now), 2)}
+            for sid, info in snap.items()
+        }
+    except Exception as e:  # noqa: BLE001
+        out["request_phase"] = {"error": str(e)}
     # forensics dump count
     try:
         from pathlib import Path as _P
@@ -250,6 +273,25 @@ def state_snapshot() -> dict[str, Any]:
             out["forensics_dumps_count"] = 0
     except Exception:  # noqa: BLE001
         out["forensics_dumps_count"] = -1
+    # C-4 exec_resume poke summary
+    try:
+        from . import exec_resume as _xr
+        out["exec_resume"] = _xr.state_snapshot()
+    except Exception as e:  # noqa: BLE001
+        out["exec_resume"] = {"error": str(e)}
+    # Tool-call frequency by namespace (live)
+    try:
+        from . import tool_metrics as _tm
+        snap = _tm.snapshot()
+        # Compact form for state endpoint — full detail at
+        # /dashboard/tool-metrics
+        out["tool_metrics"] = {
+            "total_calls": snap["total_calls"],
+            "distinct_tools": snap["distinct_tools"],
+            "by_namespace": snap["by_namespace"],
+        }
+    except Exception as e:  # noqa: BLE001
+        out["tool_metrics"] = {"error": str(e)}
     return out
 
 
@@ -765,6 +807,34 @@ def register(app: Any, log_dir: Path) -> None:
         except Exception as e:  # noqa: BLE001
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    @app.get("/dashboard/tool-metrics")
+    def _dashboard_tool_metrics() -> JSONResponse:
+        """Per-(namespace, tool) call counts — surfaces which MCP
+        servers + built-in tools the agent actually uses. Helps catch
+        dead-tool issues like the 2026-05-10 advisor-trim-bug:
+        spawn_agent had 0 calls because frontier_trim_tools was
+        dropping it (essentials list missing the agent protocol)."""
+        try:
+            from . import tool_metrics as _tm
+            return JSONResponse(_tm.snapshot())
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/dashboard/exec-resume")
+    def _dashboard_exec_resume(limit: int = 50) -> JSONResponse:
+        """Recent `codex exec resume` poke attempts. C-4 hybrid module
+        fires these when soft_completion classifier returns a high-
+        confidence PUNT — turning the passive force_frontier flag into
+        an active side-process that doesn't wait on user input."""
+        try:
+            from . import exec_resume as _xr
+            return JSONResponse({
+                "history": _xr.history_snapshot(limit=limit),
+                "state": _xr.state_snapshot(),
+            })
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     @app.post("/dashboard/force-frontier")
     def _dashboard_force_frontier(
             proj_sid: str = "global",
@@ -785,3 +855,102 @@ def register(app: Any, log_dir: Path) -> None:
             })
         except Exception as e:  # noqa: BLE001
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # ─── P4: structured machine-readable JSON API ──────────────────────
+    # /api/v1/state aggregates all per-session module snapshots into a
+    # single response so external monitors don't have to scrape multiple
+    # /dashboard/* endpoints. /api/v1/escalate is the operator's
+    # one-button "force this session to frontier next turn" hook.
+
+    @app.get("/api/v1/state")
+    def _api_v1_state() -> JSONResponse:
+        """Snapshot of all per-session in-memory state. Pulls from each
+        module's `state_snapshot()`/`history_snapshot()` so it stays in
+        sync without dashboard knowing internals."""
+        from datetime import datetime, timezone
+
+        active: list[dict[str, Any]] = []
+        force_frontier_flags: dict[str, Any] = {}
+        stuck_loop_state: dict[str, Any] = {}
+        synthetic_continue_state: dict[str, Any] = {}
+        exec_resume_history: list[dict[str, Any]] = []
+        exec_resume_state: dict[str, Any] = {}
+        request_phase_snap: dict[str, Any] = {}
+
+        try:
+            from . import request_phase as _rp
+            request_phase_snap = _rp.state_snapshot()
+            now = time.time()
+            for sid, info in request_phase_snap.items():
+                active.append({
+                    "proj_sid": sid,
+                    "phase": info.get("phase", ""),
+                    "since_ts": info.get("since_ts", 0.0),
+                    "age_s": round(now - info.get("since_ts", now), 2),
+                    "request_id": info.get("request_id", ""),
+                })
+        except Exception:  # noqa: BLE001
+            request_phase_snap = {}
+        try:
+            from . import empty_response_guard as _erg
+            force_frontier_flags = _erg.state_snapshot()
+        except Exception:  # noqa: BLE001
+            force_frontier_flags = {}
+        # stuck_loop.state_snapshot is per-sid; iterate known sids
+        try:
+            from . import stuck_loop as _sl
+            for sid in request_phase_snap.keys():
+                stuck_loop_state[sid] = _sl.state_snapshot(sid)
+        except Exception:  # noqa: BLE001
+            stuck_loop_state = {}
+        try:
+            from . import synthetic_continue as _syn
+            for sid in request_phase_snap.keys():
+                synthetic_continue_state[sid] = _syn.state_snapshot(sid)
+        except Exception:  # noqa: BLE001
+            synthetic_continue_state = {}
+        try:
+            from . import exec_resume as _xr
+            exec_resume_history = _xr.history_snapshot(20)
+            exec_resume_state = _xr.state_snapshot()
+        except Exception:  # noqa: BLE001
+            exec_resume_history = []
+            exec_resume_state = {}
+
+        return JSONResponse({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "counts": {
+                "active_sessions": len(active),
+                "force_frontier_flagged": len(force_frontier_flags),
+            },
+            "active": active,
+            "force_frontier_flags": force_frontier_flags,
+            "stuck_loop_state": stuck_loop_state,
+            "exec_resume_history": exec_resume_history,
+            "synthetic_continue_state": synthetic_continue_state,
+            "exec_resume_state": exec_resume_state,
+        })
+
+    @app.post("/api/v1/escalate")
+    async def _api_v1_escalate(request: Request) -> JSONResponse:
+        """Body: {"proj_sid": "..."}. Sets empty-response-guard flag
+        so the NEXT request to that session forces the frontier route.
+        Returns 202 on success, 400 when proj_sid is missing."""
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "missing or invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"error": "body must be a JSON object"}, status_code=400)
+        proj_sid = payload.get("proj_sid") or ""
+        if not proj_sid:
+            return JSONResponse(
+                {"error": "proj_sid is required"}, status_code=400)
+        try:
+            from . import empty_response_guard as _erg
+            _erg.force_next_to_frontier(proj_sid, "manual_api")
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"escalated": proj_sid}, status_code=202)

@@ -63,6 +63,8 @@ from .sanitize import (
     strip_unsupported_responses_fields,
     trim_tools_for_frontier,
 )
+from .request_phase import RequestPhase, set_phase as _phase_set
+from . import stall_watchdog as _stall
 from .tool_call_translator import ChatToResponsesTranslator, StreamTranslator, rebuild_response
 from .trace import RequestTrace
 
@@ -101,6 +103,34 @@ def _log(event: str, **fields: Any) -> None:
             fh.write(line + "\n")
     except Exception:
         pass
+
+
+def _extract_valid_tool_names(body: dict[str, Any] | Any) -> set[str] | None:
+    """Pull tool names out of a request body's `tools` array. Returns None
+    when the body has no `tools` field, or the field is empty or unusable —
+    None signals the translator to skip name validation entirely (legacy
+    pass-through). Handles two common entry shapes:
+        {"type": "function", "name": "shell", ...}
+        {"type": "function", "function": {"name": "shell", ...}}
+    Unknown shapes are skipped silently (lenient), not fatal.
+    """
+    if not isinstance(body, dict):
+        return None
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    names: set[str] = set()
+    for entry in tools:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            fn = entry.get("function")
+            if isinstance(fn, dict):
+                name = fn.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names or None
 
 
 _PROACTIVE_SUMMARY_SYSTEM_PROMPT = (
@@ -309,6 +339,71 @@ def _project_session_key(request: Request, sid: str) -> str:
     return f"{cwd_hash}:{sid}"
 
 
+_STALL_WATCHDOG_TASK: asyncio.Task | None = None
+
+
+@APP.on_event("startup")
+async def _start_stall_watchdog_on_startup() -> None:
+    """Spawn the mid-stream stall watchdog. On stall, set the phase,
+    record a forensic event, and flag the next request to escalate to
+    frontier — graceful degradation when we can't safely cancel the
+    in-flight upstream connection from outside its task."""
+    global _STALL_WATCHDOG_TASK
+    if not CFG.stall_watchdog_enabled:
+        return
+
+    async def _on_stall(proj_sid: str) -> None:
+        try:
+            _phase_set(proj_sid, RequestPhase.stalled, "")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from . import empty_response_guard as _erg
+            _erg.force_next_to_frontier(proj_sid, "mid_stream_stall")
+            _phase_set(proj_sid, RequestPhase.escalated_to_frontier, "")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _log("stall_kill", session=proj_sid,
+                 threshold_s=CFG.stall_threshold_s)
+        except Exception:  # noqa: BLE001
+            pass
+        if CFG.forensics_enabled:
+            try:
+                from . import forensics as _fx
+                forensics_dir = CFG.log_dir.parent / "forensics"
+                _fx.write_forensics_dump(
+                    forensics_dir, proj_sid,
+                    trigger="stall_kill",
+                    response_buffer="",
+                    extra={"threshold_s": CFG.stall_threshold_s,
+                           "escalation": "force_next_to_frontier"},
+                    max_dumps=CFG.forensics_max_dumps,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    _STALL_WATCHDOG_TASK = _stall.start_watchdog(
+        check_interval_s=CFG.stall_check_interval_s,
+        threshold_s=CFG.stall_threshold_s,
+        on_stall=_on_stall,
+    )
+
+
+@APP.on_event("shutdown")
+async def _stop_stall_watchdog_on_shutdown() -> None:
+    global _STALL_WATCHDOG_TASK
+    task = _STALL_WATCHDOG_TASK
+    _STALL_WATCHDOG_TASK = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+
+
 @APP.on_event("startup")
 def _auto_register_mcp_servers_on_startup() -> None:
     """One-shot: detect graphify/gitnexus, register them into
@@ -379,9 +474,22 @@ async def responses(request: Request) -> Any:
     proj_sid = _project_session_key(request, sid)
     trace = RequestTrace(session_id=sid)
     trace.project_session_key = proj_sid
+    _phase_set(proj_sid, RequestPhase.received, trace.request_id)
     streak = _SESSION_ERROR_STREAK[proj_sid]
+    _phase_set(proj_sid, RequestPhase.classifying, trace.request_id)
     decision = decide(body, CFG, error_streak=streak)
     backend = _select_backend(decision)
+    _phase_set(proj_sid, RequestPhase.routing, trace.request_id)
+
+    # Tool-call frequency tracking — mine body.input for function_call
+    # items (deduped by call_id) so the dashboard can show which MCP
+    # servers / built-in tools are actually being used. Fire-and-forget
+    # — never raises. See tinyctx/tool_metrics.py.
+    try:
+        from . import tool_metrics as _tm
+        _tm.record_from_body(body)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Plan persistence: save any update_plan / TodoWrite tracker
     # currently in body.input to disk (per-cwd), and inject the
@@ -433,6 +541,7 @@ async def responses(request: Request) -> Any:
                     turn_count=decision.turn_count,
                 )
                 backend = CFG.frontier
+                _phase_set(proj_sid, RequestPhase.empty_guarded, trace.request_id)
                 _log("empty_response_guard_forced_frontier",
                      session=sid, proj_sid=proj_sid,
                      prev_completion_tokens=force_info.get("completion_tokens"),
@@ -503,6 +612,8 @@ async def responses(request: Request) -> Any:
                     )
                     backend = CFG.frontier
                     trace.self_classify_overrode = True
+                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
+                               trace.request_id)
         except Exception as e:  # noqa: BLE001 — classifier must never fail forward
             _log("self_classify_error", session=sid, error=str(e))
 
@@ -533,10 +644,34 @@ async def responses(request: Request) -> Any:
             if was_injected:
                 trace.stuck_reminder_injected = True
                 trace.stuck_turn_count_at_inject = decision.turn_count
+                _phase_set(proj_sid, RequestPhase.injecting, trace.request_id)
                 _log("stuck_reminder_injected", session=sid,
                      proj_sid=proj_sid, turn_count=decision.turn_count)
         except Exception as e:  # noqa: BLE001 — watchdog must never block
             _log("stuck_loop_error", session=sid, error=str(e))
+
+    # P2: injection-budget exhaustion reminder. When synthetic_continue
+    # tripped its budget on the previous turn, append a one-shot
+    # `<system-reminder>` warning the agent that tinyctx auto-continued
+    # N times and may have been wrong. The counter is keyed by `sid`
+    # because the stream-rewrite path increments under `sid` (matching
+    # the existing empty_response_guard pattern in _stream_proxy).
+    # The flag is consumed on use so this never repeats next turn.
+    if not decision.is_compaction and not trace.forced_by_client_model:
+        try:
+            from . import synthetic_continue as _syn_budget
+            inj_count = _syn_budget.injection_count(sid)
+            if (inj_count >= CFG.max_continue_injections_per_session
+                    and inj_count > 0):
+                body, was_budget_inj = (
+                    _syn_budget.maybe_inject_budget_reminder(
+                        body, sid, inj_count))
+                if was_budget_inj:
+                    _log("budget_exhausted_reminder_injected",
+                         session=sid, proj_sid=proj_sid,
+                         injection_count=inj_count)
+        except Exception as e:  # noqa: BLE001
+            _log("budget_reminder_error", session=sid, error=str(e))
 
     # Soft-completion gate: if the previous turn ended with a "soft
     # punt to user" pattern (matched in the streaming sniffer), inject
@@ -945,10 +1080,12 @@ async def responses(request: Request) -> Any:
         except Exception:  # noqa: BLE001
             pass
 
+    _phase_set(proj_sid, RequestPhase.backend_streaming, trace.request_id)
     return await _forward(url, headers, forward_body, is_stream, proj_sid, decision,
                           translate_tool_calls=backend.translate_tool_calls,
                           chat_to_responses=(backend.wire_api != "responses"),
-                          trace=trace)
+                          trace=trace,
+                          cwd=request.headers.get("x-codex-cwd") or "")
 
 
 @APP.post("/v1/chat/completions")
@@ -1002,7 +1139,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                    is_stream: bool, sid: str, decision: Decision,
                    *, translate_tool_calls: bool = False,
                    chat_to_responses: bool = False,
-                   trace: RequestTrace | None = None) -> Any:
+                   trace: RequestTrace | None = None,
+                   cwd: str = "") -> Any:
     # write=180s gives headroom for multi-megabyte request bodies on
     # slow uplinks. With a 2MB body and a stalled TCP send-window, the
     # old write=60s would fire before any keepalive could rescue the
@@ -1025,7 +1163,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                           transport=transport,
                           translate_tool_calls=translate_tool_calls,
                           chat_to_responses=chat_to_responses,
-                          trace=trace),
+                          trace=trace,
+                          cwd=cwd),
             media_type="text/event-stream",
         )
     started = time.time()
@@ -1060,7 +1199,9 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
         if chat_to_responses and isinstance(payload, dict) and "choices" in payload:
             payload = _chat_to_responses_payload(payload)
         if translate_tool_calls and isinstance(payload, dict):
-            new_payload = rebuild_response(payload)
+            valid_names = (_extract_valid_tool_names(body)
+                           if CFG.unknown_tool_call_protection else None)
+            new_payload = rebuild_response(payload, valid_tool_names=valid_names)
             if new_payload is not payload:
                 # rebuild swapped some message text → function_call items
                 translated_calls = sum(1 for it in new_payload.get("output", [])
@@ -1083,15 +1224,18 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         *, transport: httpx.AsyncBaseTransport | None = None,
                         translate_tool_calls: bool = False,
                         chat_to_responses: bool = False,
-                        trace: RequestTrace | None = None) -> AsyncIterator[bytes]:
+                        trace: RequestTrace | None = None,
+                        cwd: str = "") -> AsyncIterator[bytes]:
     started = time.time()
     bytes_out = 0
     status = 200
     translator: StreamTranslator | ChatToResponsesTranslator | None
+    valid_names = (_extract_valid_tool_names(body)
+                   if CFG.unknown_tool_call_protection else None)
     if chat_to_responses:
-        translator = ChatToResponsesTranslator()
+        translator = ChatToResponsesTranslator(valid_tool_names=valid_names)
     elif translate_tool_calls:
-        translator = StreamTranslator()
+        translator = StreamTranslator(valid_tool_names=valid_names)
     else:
         translator = None
     # codex.app's SSE parser raises "stream closed before response.completed"
@@ -1251,6 +1395,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     if tag is _STATUS:
                         status_code, err_body = payload
                         status = status_code
+                        if CFG.stall_watchdog_enabled:
+                            _stall.mark_event(sid)
                         if err_body is not None:
                             _SESSION_ERROR_STREAK[sid] += 1
                             _log("upstream_error", session=sid,
@@ -1288,6 +1434,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         continue
                     # tag is None → real response-body chunk
                     bytes_out += len(payload)
+                    if CFG.stall_watchdog_enabled:
+                        _stall.mark_event(sid)
                     # Soft-completion accumulator: just buffer the bytes,
                     # the LLM behavioral classifier runs ONCE at stream
                     # end (see finally block below). We don't decide
@@ -1347,6 +1495,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 CFG.soft_completion_auto_force_frontier_threshold
                                 if CFG.soft_completion_auto_force_frontier_enabled
                                 else 1.01),
+                            short_text_threshold=CFG.soft_completion_short_text_threshold,
+                            stop_text_threshold=CFG.soft_completion_stop_text_threshold,
                         )
                         if (diag.result is not None
                                 and diag.result.soft_punt
@@ -1363,16 +1513,30 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             # one. spawn_agent was tried first but binary
                             # analysis confirmed codex silently drops it.
                             from . import synthetic_continue as _syn
-                            inj_events, strategy = _syn.build_continue_injection(sid)
-                            for evt in inj_events:
-                                yield _capture_outgoing(evt)
-                            _log("soft_completion_stream_rewrite_injected",
-                                 session=sid,
-                                 p=diag.result.p,
-                                 reason=diag.result.reason,
-                                 strategy=strategy["label"],
-                                 tool_name=strategy["tool_name"],
-                                 task_chars=len(task_body))
+                            inj_events, strategy = _syn.build_continue_injection(
+                                sid,
+                                max_injections=CFG.max_continue_injections_per_session,
+                            )
+                            if strategy["label"] == "budget_exhausted":
+                                from . import empty_response_guard as _erg_budget
+                                _erg_budget.force_next_to_frontier(
+                                    sid, "injection_budget_exhausted")
+                                _log("soft_completion_stream_rewrite_budget_exhausted",
+                                     session=sid,
+                                     p=diag.result.p,
+                                     injection_count=_syn.injection_count(sid),
+                                     max_injections=CFG.max_continue_injections_per_session)
+                            else:
+                                for evt in inj_events:
+                                    yield _capture_outgoing(evt)
+                                _log("soft_completion_stream_rewrite_injected",
+                                     session=sid,
+                                     p=diag.result.p,
+                                     reason=diag.result.reason,
+                                     strategy=strategy["label"],
+                                     tool_name=strategy["tool_name"],
+                                     task_chars=len(task_body),
+                                     injection_count=_syn.injection_count(sid))
                             if trace is not None:
                                 trace.soft_completion_gate_injected = True
                                 trace.soft_completion_gate_pattern = (
@@ -1461,6 +1625,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         _SESSION_ERROR_STREAK[sid] = 0
                         async for chunk in r.aiter_raw():
                             bytes_out += len(chunk)
+                            if CFG.stall_watchdog_enabled:
+                                _stall.mark_event(sid)
                             # Soft-completion accumulator (no-keepalive path).
                             # LLM classifier runs at stream end.
                             if CFG.soft_completion_gate_enabled:
@@ -1514,9 +1680,13 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     _erg.force_next_to_frontier(
                         sid,
                         f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[sid]}")
+                    _phase_set(sid, RequestPhase.escalated_to_frontier,
+                               trace.request_id if trace is not None else "")
                     _log("stream_error_escalating_to_frontier", session=sid,
                          streak=_SESSION_ERROR_STREAK[sid])
                 else:
+                    _phase_set(sid, RequestPhase.retrying,
+                               trace.request_id if trace is not None else "")
                     _log("stream_error_will_retry_same_backend",
                          session=sid, streak=_SESSION_ERROR_STREAK[sid])
             except Exception:  # noqa: BLE001
@@ -1554,6 +1724,11 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     except Exception:  # noqa: BLE001 — never fail the finally
         pass
     finally:
+        if CFG.stall_watchdog_enabled:
+            try:
+                _stall.clear(sid)
+            except Exception:  # noqa: BLE001
+                pass
         elapsed = round(time.time() - started, 3)
         _log("stream_done", session=sid, route=decision.route, bytes=bytes_out,
              translated=bool(translator),
@@ -1568,6 +1743,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 and status == 200
                 and bytes_out > 0
                 and not upstream_failed):
+            _phase_set(sid, RequestPhase.post_stream_classifying,
+                       trace.request_id if trace is not None else "")
             try:
                 from . import soft_completion as _sc
                 api_key = (os.environ.get(CFG.local.api_key_env)
@@ -1613,6 +1790,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 CFG.soft_completion_auto_force_frontier_threshold
                                 if CFG.soft_completion_auto_force_frontier_enabled
                                 else 1.01),
+                            short_text_threshold=CFG.soft_completion_short_text_threshold,
+                            stop_text_threshold=CFG.soft_completion_stop_text_threshold,
                         )
                         # Always log the outcome — even None paths, so
                         # silent-skip cases are diagnosable. One of the
@@ -1643,6 +1822,44 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 except Exception as fe:  # noqa: BLE001
                                     _log("forensics_dump_error",
                                          session=sid, error=str(fe))
+                            # C-4 hybrid: actively poke the codex.app
+                            # session via `codex exec resume` side
+                            # process. Turns the auto_force_frontier flag
+                            # from passive (waits on user input) into
+                            # active (immediate one-shot turn). See
+                            # tinyctx/exec_resume.py.
+                            if (CFG.exec_resume_enabled
+                                    and diag.result.soft_punt
+                                    and diag.result.p >= CFG.exec_resume_min_p
+                                    and cwd):
+                                try:
+                                    from . import exec_resume as _xr
+                                    log_dir = CFG.log_dir.parent / "exec_resume_logs"
+                                    tiers = list(CFG.exec_resume_prompt_tiers or [])
+                                    rec = await _xr.poke(
+                                        cwd=cwd,
+                                        prompt=CFG.exec_resume_prompt,
+                                        prompt_tiers=tiers or None,
+                                        codex_binary=CFG.exec_resume_codex_binary,
+                                        sandbox=CFG.exec_resume_sandbox,
+                                        approval_policy=CFG.exec_resume_approval_policy,
+                                        cooldown_s=CFG.exec_resume_cooldown_s,
+                                        max_per_minute=CFG.exec_resume_max_per_minute,
+                                        timeout_s=CFG.exec_resume_timeout_s,
+                                        log_dir=log_dir,
+                                        proj_sid=sid,
+                                    )
+                                    _log("exec_resume_poke",
+                                         session=sid,
+                                         status=rec.status,
+                                         reason=rec.reason,
+                                         pid=rec.pid,
+                                         resolved_session_id=rec.session_id,
+                                         log_path=rec.log_path,
+                                         p=diag.result.p)
+                                except Exception as xe:  # noqa: BLE001
+                                    _log("exec_resume_poke_error",
+                                         session=sid, error=str(xe))
                         elif diag.skipped_reason:
                             _log("soft_completion_classify_skipped",
                                  session=sid,
@@ -1737,6 +1954,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.elapsed_s = elapsed
             trace.keepalives_emitted = keepalives_emitted
             trace.emit(CFG.log_dir)
+        _phase_set(sid,
+                   RequestPhase.stalled if upstream_failed else RequestPhase.done,
+                   trace.request_id if trace is not None else "")
 
 
 def _safe_json(r: httpx.Response) -> Any:

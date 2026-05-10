@@ -30,6 +30,16 @@ Per-session strategy rotation
 On EACH soft-completion-driven injection for a session, pick the NEXT
 untried strategy. After cycling through all, start over (maybe a later
 attempt works; conditions can change). Tracker is `_NEXT_STRATEGY_IDX`.
+
+Per-session injection budget
+────────────────────────────
+`_INJECTION_COUNT_PER_SESSION` caps how many synthetic continues we
+inject for one session. When over budget, `build_continue_injection`
+returns the `budget_exhausted` sentinel; the caller is expected to
+escalate (force frontier on next turn) and to inject a one-shot
+`<system-reminder>` warning the agent that auto-continue ran out — a
+genuine "agent finished" outcome should be reviewed manually instead
+of nudged forever.
 """
 from __future__ import annotations
 
@@ -44,6 +54,18 @@ from uuid import uuid4
 # successfully dispatched and prefer those, but rotation is a fine
 # default.
 _NEXT_STRATEGY_IDX: dict[str, int] = defaultdict(int)
+
+
+# Per-session count of synthetic-continue injections. Caps runaway
+# loops where soft_completion mis-classifies and we keep injecting
+# forever. Default cap is the caller-provided `max_injections`.
+_INJECTION_COUNT_PER_SESSION: dict[str, int] = defaultdict(int)
+
+
+# Per-session flag tracking whether the budget-exhausted system-
+# reminder has already been injected. One-shot per exhaustion event so
+# we don't append the warning every turn.
+_LAST_BUDGET_REMINDER_FIRED: dict[str, bool] = defaultdict(bool)
 
 
 # Strategy registry. Each entry: tool_name codex dispatches + the
@@ -88,6 +110,17 @@ def reset_strategy_index(proj_sid: str) -> None:
     confirmed working (e.g. observed function_call_output from codex
     matching one of our synthetic ids in the next request)."""
     _NEXT_STRATEGY_IDX[proj_sid] = 0
+
+
+# ─── injection budget ────────────────────────────────────────────────────
+
+
+def injection_count(proj_sid: str) -> int:
+    return _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0)
+
+
+def is_over_budget(proj_sid: str, max_injections: int) -> bool:
+    return _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0) >= max_injections
 
 
 # ─── synthetic SSE event builder ──────────────────────────────────────────
@@ -148,14 +181,79 @@ def synthetic_tool_call_events(
     ]
 
 
-def build_continue_injection(proj_sid: str) -> tuple[list[bytes], dict[str, Any]]:
+def build_continue_injection(
+        proj_sid: str,
+        max_injections: int = 20,
+) -> tuple[list[bytes], dict[str, Any]]:
     """High-level: pick next strategy + build its SSE events. Returns
     (events, strategy_used). The proxy yields events into the response
-    stream; the strategy dict goes into log/forensics."""
+    stream; the strategy dict goes into log/forensics.
+
+    When `_INJECTION_COUNT_PER_SESSION[proj_sid] >= max_injections`,
+    returns `([], {"label": "budget_exhausted", ...})` and does not
+    increment the counter. Caller should escalate to frontier and inject
+    `build_budget_exhausted_reminder` text on the next request.
+    """
+    if is_over_budget(proj_sid, max_injections):
+        return [], {"label": "budget_exhausted", "tool_name": "", "args": {}}
     strategy = pick_next_strategy(proj_sid)
+    _INJECTION_COUNT_PER_SESSION[proj_sid] += 1
     events = synthetic_tool_call_events(
         strategy["tool_name"], strategy["args"])
     return events, strategy
+
+
+# ─── budget-exhausted reminder ───────────────────────────────────────────
+
+_BUDGET_REMINDER_TEMPLATE = """\
+<system-reminder>
+[NOT USER INPUT — tinyctx proxy injection-budget watchdog]
+
+This session has been auto-continued **{count} times** by tinyctx after detecting `finish_reason=stop` while the tracker still appeared open. The synthetic-continue budget is now exhausted.
+
+If you are GENUINELY DONE with the user's request:
+- Say so explicitly in one short sentence so the user can verify and route the next ask.
+
+If you are NOT done:
+- Either invoke `spawn_agent(role="advisor", task=...)` to plan the next concrete action, OR surface a clear blocker to the user (one specific question that would unblock you).
+
+The next `finish_reason=stop` for this session will route to the frontier model instead of being auto-continued. This warning is one-shot — it will not repeat next turn.
+</system-reminder>"""
+
+
+def build_budget_exhausted_reminder(proj_sid: str, count: int) -> str:
+    """Return the system-reminder text shown to the agent on the request
+    AFTER `build_continue_injection` returned `budget_exhausted`."""
+    return _BUDGET_REMINDER_TEMPLATE.format(count=count)
+
+
+def maybe_inject_budget_reminder(
+        body: dict[str, Any],
+        proj_sid: str,
+        count: int,
+) -> tuple[dict[str, Any], bool]:
+    """Append `build_budget_exhausted_reminder` text to `body.input` once
+    per exhaustion. Subsequent calls for the same session return
+    `(body, False)` until `reset_state(proj_sid)` clears the flag.
+    Mirrors stuck_loop's API."""
+    if _LAST_BUDGET_REMINDER_FIRED.get(proj_sid):
+        return body, False
+    items = body.get("input")
+    if not isinstance(items, list):
+        return body, False
+    new_items = list(items)
+    new_items.append({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": build_budget_exhausted_reminder(proj_sid, count),
+        }],
+    })
+    out = dict(body)
+    out["input"] = new_items
+    _LAST_BUDGET_REMINDER_FIRED[proj_sid] = True
+    return out, True
 
 
 # ─── test helpers ────────────────────────────────────────────────────────
@@ -164,12 +262,21 @@ def build_continue_injection(proj_sid: str) -> tuple[list[bytes], dict[str, Any]
 def reset_state(proj_sid: str | None = None) -> None:
     if proj_sid is None:
         _NEXT_STRATEGY_IDX.clear()
+        _INJECTION_COUNT_PER_SESSION.clear()
+        _LAST_BUDGET_REMINDER_FIRED.clear()
         return
     _NEXT_STRATEGY_IDX.pop(proj_sid, None)
+    _INJECTION_COUNT_PER_SESSION.pop(proj_sid, None)
+    _LAST_BUDGET_REMINDER_FIRED.pop(proj_sid, None)
 
 
-def state_snapshot(proj_sid: str) -> dict[str, Any]:
+def state_snapshot(proj_sid: str,
+                    max_injections: int = 20) -> dict[str, Any]:
+    count = _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0)
     return {
         "next_strategy_idx": _NEXT_STRATEGY_IDX.get(proj_sid, 0),
         "available_strategies": [s["label"] for s in STRATEGIES],
+        "injection_count": count,
+        "over_budget": count >= max_injections,
+        "budget_reminder_fired": _LAST_BUDGET_REMINDER_FIRED.get(proj_sid, False),
     }

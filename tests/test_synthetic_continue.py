@@ -114,3 +114,135 @@ def test_state_snapshot_lists_strategies():
     snap = state_snapshot("any")
     assert "available_strategies" in snap
     assert len(snap["available_strategies"]) == len(STRATEGIES)
+
+
+# ─── P2: per-session injection budget cap ─────────────────────────────────
+
+
+def test_injection_count_increments_on_build_continue():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    assert _syn.injection_count("p1") == 0
+    _syn.build_continue_injection("p1")
+    assert _syn.injection_count("p1") == 1
+    _syn.build_continue_injection("p1")
+    assert _syn.injection_count("p1") == 2
+
+
+def test_is_over_budget_threshold():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    assert _syn.is_over_budget("p1", max_injections=3) is False
+    for _ in range(3):
+        _syn.build_continue_injection("p1", max_injections=3)
+    assert _syn.is_over_budget("p1", max_injections=3) is True
+    assert _syn.injection_count("p1") == 3
+
+
+def test_build_continue_returns_budget_exhausted_when_over():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    for _ in range(2):
+        events, strategy = _syn.build_continue_injection(
+            "p1", max_injections=2)
+        assert strategy["label"] != "budget_exhausted"
+        assert len(events) == 4
+    events, strategy = _syn.build_continue_injection(
+        "p1", max_injections=2)
+    assert strategy["label"] == "budget_exhausted"
+    assert events == []
+    # Counter should NOT increment past the cap
+    assert _syn.injection_count("p1") == 2
+
+
+def test_build_continue_default_max_is_back_compat():
+    """Calling build_continue_injection(proj_sid) with no max_injections
+    must still work (default=20)."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    events, strategy = _syn.build_continue_injection("p1")
+    assert len(events) == 4
+    assert strategy["label"] != "budget_exhausted"
+
+
+def test_reset_state_clears_injection_counter():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    _syn.build_continue_injection("p1", max_injections=10)
+    _syn.build_continue_injection("p1", max_injections=10)
+    assert _syn.injection_count("p1") == 2
+    _syn.reset_state("p1")
+    assert _syn.injection_count("p1") == 0
+
+
+def test_state_snapshot_exposes_injection_count_and_over_budget():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    _syn.build_continue_injection("p1", max_injections=2)
+    snap = _syn.state_snapshot("p1", max_injections=2)
+    assert snap["injection_count"] == 1
+    assert snap["over_budget"] is False
+    _syn.build_continue_injection("p1", max_injections=2)
+    snap = _syn.state_snapshot("p1", max_injections=2)
+    assert snap["injection_count"] == 2
+    assert snap["over_budget"] is True
+
+
+def test_build_budget_exhausted_reminder_is_non_empty_and_mentions_count():
+    from tinyctx import synthetic_continue as _syn
+    text = _syn.build_budget_exhausted_reminder("p1", count=12)
+    assert isinstance(text, str)
+    assert len(text) > 50
+    assert "12" in text
+
+
+def test_maybe_inject_budget_reminder_appends_once():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    body = {
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hello"}]}
+        ]
+    }
+    new_body, fired = _syn.maybe_inject_budget_reminder(
+        body, "p1", count=20)
+    assert fired is True
+    assert len(new_body["input"]) == 2
+    last = new_body["input"][-1]
+    assert last["role"] == "user"
+    assert "tinyctx" in last["content"][0]["text"].lower()
+    # Original body untouched
+    assert len(body["input"]) == 1
+    # Second call no-ops
+    new_body2, fired2 = _syn.maybe_inject_budget_reminder(
+        new_body, "p1", count=20)
+    assert fired2 is False
+    assert new_body2 is new_body or new_body2 == new_body
+
+
+def test_maybe_inject_budget_reminder_handles_missing_input():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    new_body, fired = _syn.maybe_inject_budget_reminder(
+        {"no": "input"}, "p1", count=10)
+    assert fired is False
+
+
+def test_reset_state_clears_budget_reminder_flag():
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    body = {"input": [{"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "x"}]}]}
+    _, fired = _syn.maybe_inject_budget_reminder(body, "p1", count=5)
+    assert fired is True
+    _syn.reset_state("p1")
+    _, fired2 = _syn.maybe_inject_budget_reminder(body, "p1", count=5)
+    assert fired2 is True
+
+
+def test_config_default_max_continue_injections():
+    from tinyctx.config import Config
+    cfg = Config()
+    assert cfg.max_continue_injections_per_session > 0
+    assert cfg.max_continue_injections_per_session <= 100
