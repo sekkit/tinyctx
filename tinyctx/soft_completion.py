@@ -512,6 +512,7 @@ async def classify_at_stream_end_diag(
         user_goal: str = "",
         progress_tracker: str = "",
         tool_summary: str = "",
+        force_frontier_threshold: float = 1.01,  # 1.01 = effectively disabled
 ) -> ClassifyDiag:
     """Same as `classify_at_stream_end` but returns a `ClassifyDiag`
     capturing why the call returned None (for logging in the proxy
@@ -624,6 +625,21 @@ async def classify_at_stream_end_diag(
             "p": result.p,
             "ts": time.time(),
         }
+        # Auto-force frontier on high-confidence PUNT. The deterministic
+        # fix that doesn't depend on codex parsing synthetic events or
+        # agent self-discipline. Same flag mechanism as
+        # empty_response_guard — next request to this session bypasses
+        # routing heuristics and goes straight to frontier (gpt-5.5).
+        # Bounded by the higher `soft_completion_auto_force_frontier_threshold`
+        # so we don't escalate every borderline verdict.
+        if result.p >= force_frontier_threshold:
+            try:
+                from . import empty_response_guard as _erg
+                _erg.force_next_to_frontier(
+                    proj_sid,
+                    f"soft_punt p={result.p:.2f}: {result.reason[:60]}")
+            except Exception:  # noqa: BLE001 — guard must never break classifier
+                pass
     return diag
 
 

@@ -1257,6 +1257,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             user_goal=user_goal,
                             progress_tracker=tracker,
                             tool_summary=tool_summary,
+                            force_frontier_threshold=(
+                                CFG.soft_completion_auto_force_frontier_threshold
+                                if CFG.soft_completion_auto_force_frontier_enabled
+                                else 1.01),
                         )
                         if (diag.result is not None
                                 and diag.result.soft_punt
@@ -1419,6 +1423,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             user_goal=user_goal_snapshot,
                             progress_tracker=tracker_snapshot,
                             tool_summary=tool_summary_snapshot,
+                            force_frontier_threshold=(
+                                CFG.soft_completion_auto_force_frontier_threshold
+                                if CFG.soft_completion_auto_force_frontier_enabled
+                                else 1.01),
                         )
                         # Always log the outcome — even None paths, so
                         # silent-skip cases are diagnosable. One of the

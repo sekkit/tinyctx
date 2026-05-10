@@ -407,6 +407,28 @@ class Config:
     # catches the 1-token failure mode.
     empty_response_min_completion_tokens: int = 5
 
+    # Auto-force frontier on high-confidence soft-punt verdicts. Layer
+    # on top of empty_response_guard's flag mechanism: when the LLM-
+    # based soft_completion classifier returns PUNT with p >= threshold,
+    # also set the same `_FORCE_NEXT_TO_FRONTIER` flag. The next turn
+    # for that session auto-routes to frontier (gpt-5.5 via chatgpt.com)
+    # — the deterministic fix that doesn't depend on codex parsing
+    # synthetic events or agent self-discipline.
+    #
+    # Codex-side rationale (verified by binary analysis): codex's
+    # function_call dispatcher validates against internal state and
+    # silently drops synthetic injections that aren't tied to real
+    # model reasoning. So stream-rewrite is unreliable. Forcing the
+    # NEXT request to frontier sidesteps that entirely.
+    #
+    # Costs: each fire is one extra frontier turn (~5-15K gpt-5.5
+    # tokens, ~$0.05-0.15). One-shot per detection (consumed on use),
+    # so won't escalate indefinitely.
+    soft_completion_auto_force_frontier_enabled: bool = True
+    # Higher than the gate's 0.7 threshold — only escalate to frontier
+    # on high-confidence PUNT verdicts to limit cost.
+    soft_completion_auto_force_frontier_threshold: float = 0.85
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`

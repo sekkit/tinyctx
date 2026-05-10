@@ -175,6 +175,137 @@ def test_force_flag_isolated_by_proj_sid():
     assert soft_completion.get_flag("projB") is None
 
 
+# ─── auto-force-frontier on high-confidence PUNT ──────────────────────────
+
+
+def test_auto_force_frontier_fires_on_high_p_punt():
+    """High-confidence PUNT verdict (p ≥ force_frontier_threshold) sets
+    the empty_response_guard flag so the next turn auto-routes to
+    frontier — the deterministic fix that doesn't depend on agent
+    self-discipline or codex parsing synthetic events."""
+    import asyncio
+    from tinyctx import soft_completion, empty_response_guard
+    soft_completion.reset_state()
+    empty_response_guard.reset_state()
+
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    # Backend says PUNT with high p
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 0.95, "reason": "premature done"}')
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7,
+                force_frontier_threshold=0.85))
+        # gate flag set (existing behavior)
+        assert soft_completion.get_flag("p1") is not None
+        # NEW: empty_response_guard flag also set → next turn forces frontier
+        flag = empty_response_guard.peek_force_frontier("p1")
+        assert flag is not None
+        assert "soft_punt" in flag["reason"]
+        assert "0.95" in flag["reason"]
+        assert "premature done" in flag["reason"]
+    finally:
+        httpd.shutdown()
+
+
+def test_auto_force_frontier_skips_below_threshold():
+    """PUNT with p < force_frontier_threshold → only gate fires, no
+    frontier escalation."""
+    import asyncio
+    from tinyctx import soft_completion, empty_response_guard
+    soft_completion.reset_state()
+    empty_response_guard.reset_state()
+
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    # Backend says PUNT but p just barely above the gate threshold (0.7),
+    # below the force-frontier threshold (0.85)
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 0.75, "reason": "borderline"}')
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7,
+                force_frontier_threshold=0.85))
+        # gate fires
+        assert soft_completion.get_flag("p1") is not None
+        # but force-frontier does NOT fire
+        assert empty_response_guard.peek_force_frontier("p1") is None
+    finally:
+        httpd.shutdown()
+
+
+def test_auto_force_frontier_skips_on_not_punt():
+    """soft_punt:false → no gate, no force-frontier."""
+    import asyncio
+    from tinyctx import soft_completion, empty_response_guard
+    soft_completion.reset_state()
+    empty_response_guard.reset_state()
+
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": false, "p": 0.95, "reason": "substantive answer"}')
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7,
+                force_frontier_threshold=0.85))
+        assert soft_completion.get_flag("p1") is None
+        assert empty_response_guard.peek_force_frontier("p1") is None
+    finally:
+        httpd.shutdown()
+
+
+def test_auto_force_frontier_default_disabled_when_threshold_is_1_01():
+    """force_frontier_threshold=1.01 (the default sentinel) means feature
+    OFF — even p=1.0 PUNT verdicts won't escalate. Used by callers that
+    want classic gate behavior only."""
+    import asyncio
+    from tinyctx import soft_completion, empty_response_guard
+    soft_completion.reset_state()
+    empty_response_guard.reset_state()
+
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 1.0, "reason": "max conf"}')
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7))  # force_frontier_threshold defaults to 1.01
+        assert soft_completion.get_flag("p1") is not None
+        assert empty_response_guard.peek_force_frontier("p1") is None
+    finally:
+        httpd.shutdown()
+
+
+def test_default_config_auto_force_frontier_enabled_with_sane_threshold():
+    from tinyctx.config import Config
+    cfg = Config()
+    assert cfg.soft_completion_auto_force_frontier_enabled is True
+    # Higher than gate's 0.7, lower than 1.0
+    assert 0.7 < cfg.soft_completion_auto_force_frontier_threshold < 1.0
+
+
 # ─── classifier full HTTP flow ────────────────────────────────────────────
 
 
