@@ -435,12 +435,14 @@ class Config:
     # failures (the 05:07 empty response had no captured request body
     # and is forever unrecoverable). See tinyctx/forensics.py.
     forensics_enabled: bool = True
-    # Trigger forensics for high-confidence PUNT verdicts too (not just
-    # empty responses). Default OFF to avoid disk spam — every PUNT
-    # would write a 1-10MB dump. Flip to True when actively debugging.
-    forensics_capture_punts: bool = False
-    # Threshold for PUNT-triggered forensics (when above flag is True)
+    # Trigger forensics for high-confidence PUNT verdicts too. Each
+    # dump is ~10-50KB; with max_dumps=100 cap, total bounded ~5MB.
+    forensics_capture_punts: bool = True
+    # Threshold for PUNT-triggered forensics. 0.9 keeps the volume low
+    # (only the cleanest punts trigger).
     forensics_punt_threshold: float = 0.9
+    # Trigger forensics on upstream errors / stream errors / disconnect.
+    forensics_capture_errors: bool = True
     # Max forensic dumps to retain (oldest deleted past this count).
     forensics_max_dumps: int = 100
 

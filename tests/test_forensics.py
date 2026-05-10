@@ -159,5 +159,9 @@ def test_default_config_enabled():
     from tinyctx.config import Config
     cfg = Config()
     assert cfg.forensics_enabled is True
-    assert cfg.forensics_capture_punts is False  # off by default (disk spam)
+    # User asked for "all probes on" — punts + errors capture on too
+    assert cfg.forensics_capture_punts is True
+    assert cfg.forensics_capture_errors is True
     assert cfg.forensics_max_dumps >= 30
+    # Disk-spam control: only HIGH-confidence punts (p ≥ 0.9)
+    assert cfg.forensics_punt_threshold >= 0.85

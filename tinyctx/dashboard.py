@@ -231,6 +231,25 @@ def state_snapshot() -> dict[str, Any]:
         out["self_classify_cache_entries"] = len(self_classify._CACHE)
     except Exception as e:  # noqa: BLE001
         out["self_classify_cache_entries"] = -1
+    # empty_response_guard pending flags
+    try:
+        from . import empty_response_guard
+        out["empty_response_guard_flags"] = (
+            empty_response_guard.state_snapshot())
+    except Exception as e:  # noqa: BLE001
+        out["empty_response_guard_flags"] = {"error": str(e)}
+    # forensics dump count
+    try:
+        from pathlib import Path as _P
+        # Best-effort: dashboard doesn't have CFG so derive from default
+        import os as _os
+        forensics_dir = _P(_os.path.expanduser("~/.tinyctx/forensics"))
+        if forensics_dir.exists():
+            out["forensics_dumps_count"] = len(list(forensics_dir.glob("*.json")))
+        else:
+            out["forensics_dumps_count"] = 0
+    except Exception:  # noqa: BLE001
+        out["forensics_dumps_count"] = -1
     return out
 
 

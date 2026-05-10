@@ -1212,6 +1212,24 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             upstream_failed = True
                             upstream_failure_msg = (
                                 f"upstream {status_code}: {err_body[:200]}")
+                            # Forensics dump for upstream errors —
+                            # capture the request that triggered the
+                            # 4xx/5xx + the upstream's error body
+                            if (CFG.forensics_enabled
+                                    and CFG.forensics_capture_errors):
+                                try:
+                                    from . import forensics as _fx
+                                    forensics_dir = CFG.log_dir.parent / "forensics"
+                                    _fx.write_forensics_dump(
+                                        forensics_dir, sid,
+                                        trigger=f"upstream_{status_code}",
+                                        response_buffer=err_body or "",
+                                        extra={"status": status_code,
+                                               "url": url},
+                                        max_dumps=CFG.forensics_max_dumps,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
                             # Don't break — wait for SENTINEL so producer
                             # cleanly closes its async-with stack.
                         else:
@@ -1374,6 +1392,25 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n".encode()
         upstream_failed = True
         upstream_failure_msg = f"http error: {e!s}"
+        # Error forensics — capture request that triggered this stream
+        # error so we can post-mortem the failure (network blip /
+        # upstream timeout / TLS handshake issue / etc.)
+        if CFG.forensics_enabled and CFG.forensics_capture_errors:
+            try:
+                from . import forensics as _fx
+                forensics_dir = CFG.log_dir.parent / "forensics"
+                _fx.write_forensics_dump(
+                    forensics_dir, sid,
+                    trigger="stream_error",
+                    response_buffer="",
+                    timing={"elapsed_s": round(time.time() - started, 3)},
+                    extra={"error": str(e)[:1000],
+                           "error_type": type(e).__name__,
+                           "url": url},
+                    max_dumps=CFG.forensics_max_dumps,
+                )
+            except Exception:  # noqa: BLE001
+                pass
     # Always emit a structurally valid response.completed terminator so
     # codex.app's SSE parser doesn't raise "stream closed before
     # response.completed". For the success path we hope the upstream
@@ -1455,6 +1492,25 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                  p=diag.result.p,
                                  reason=diag.result.reason,
                                  extracted_text_chars=diag.extracted_text_chars)
+                            # PUNT forensics dump for high-confidence
+                            # cases — lets us inspect what the agent
+                            # actually said when classifier flagged it.
+                            if (CFG.forensics_enabled
+                                    and CFG.forensics_capture_punts
+                                    and diag.result.soft_punt
+                                    and diag.result.p >= CFG.forensics_punt_threshold):
+                                try:
+                                    forensics_dir = CFG.log_dir.parent / "forensics"
+                                    p = _sc.write_punt_forensics(
+                                        sid, forensics_dir, diag.result, diag,
+                                        max_dumps=CFG.forensics_max_dumps)
+                                    if p:
+                                        _log("forensics_dump_written",
+                                             session=sid, trigger="punt",
+                                             path=p)
+                                except Exception as fe:  # noqa: BLE001
+                                    _log("forensics_dump_error",
+                                         session=sid, error=str(fe))
                         elif diag.skipped_reason:
                             _log("soft_completion_classify_skipped",
                                  session=sid,

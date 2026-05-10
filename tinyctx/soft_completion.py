@@ -643,6 +643,42 @@ async def classify_at_stream_end_diag(
     return diag
 
 
+# ─── public helper for PUNT-triggered forensics ───────────────────────────
+
+
+def write_punt_forensics(
+        proj_sid: str,
+        forensics_dir,
+        result: ClassifyResult,
+        diag: ClassifyDiag,
+        max_dumps: int = 100,
+) -> str | None:
+    """Convenience: dump forensics when classifier returned a high-
+    confidence PUNT. Lets the proxy do this without importing forensics
+    + composing the args repeatedly. Returns dump path str or None."""
+    try:
+        from . import forensics as _fx
+    except Exception:  # noqa: BLE001
+        return None
+    raw = _OUTPUT_BUFFER.get(proj_sid, "") or ""
+    path = _fx.write_forensics_dump(
+        forensics_dir=forensics_dir,
+        proj_sid=proj_sid,
+        trigger=f"punt_p{int(result.p * 100):02d}",
+        response_buffer=raw,
+        classifier_verdict={
+            "soft_punt": result.soft_punt,
+            "p": result.p,
+            "reason": result.reason,
+            "extracted_text_chars": diag.extracted_text_chars,
+            "raw_buffer_chars": diag.raw_buffer_chars,
+            "finish_reason": diag.finish_reason,
+        },
+        max_dumps=max_dumps,
+    )
+    return str(path) if path else None
+
+
 # ─── gate injection ────────────────────────────────────────────────────────
 
 _GATE_TEMPLATE = """\
