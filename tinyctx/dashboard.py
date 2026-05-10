@@ -710,6 +710,32 @@ def register(app: Any, log_dir: Path) -> None:
             limit = 200
         return JSONResponse(recent_events(log_dir, limit=limit))
 
+    @app.get("/dashboard/plans")
+    def _dashboard_plans() -> JSONResponse:
+        """List persisted plans (per-cwd) with metadata. Lets you see
+        which repos have a saved plan and when it was last updated."""
+        try:
+            from . import plan_persistence as _pp
+            state_dir = log_dir.parent / "state"
+            return JSONResponse({
+                "dir": str(state_dir / "plans"),
+                "plans": _pp.list_plans(state_dir),
+            })
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.delete("/dashboard/plans")
+    def _dashboard_plans_clear(cwd: str = "") -> JSONResponse:
+        """Delete the persisted plan for `cwd`. Use when you want to
+        start a genuinely fresh task and don't want stale context."""
+        try:
+            from . import plan_persistence as _pp
+            state_dir = log_dir.parent / "state"
+            removed = _pp.clear_plan(state_dir, cwd)
+            return JSONResponse({"removed": removed, "cwd": cwd})
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     @app.get("/dashboard/forensics")
     def _dashboard_forensics_list(limit: int = 30) -> JSONResponse:
         """List recent forensics dumps. Each dump pairs a problematic

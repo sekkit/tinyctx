@@ -383,6 +383,38 @@ async def responses(request: Request) -> Any:
     decision = decide(body, CFG, error_streak=streak)
     backend = _select_backend(decision)
 
+    # Plan persistence: save any update_plan / TodoWrite tracker
+    # currently in body.input to disk (per-cwd), and inject the
+    # persisted plan when this is a fresh thread (turn_count==0)
+    # — bridges context across codex thread boundaries.
+    if CFG.plan_persistence_enabled:
+        try:
+            from . import plan_persistence as _pp
+            cwd_hdr = request.headers.get("x-codex-cwd") or ""
+            state_dir = CFG.log_dir.parent / "state"
+            # Save current plan if any
+            plan_now = _pp.extract_plan_text(body)
+            if plan_now:
+                saved = _pp.save_plan(state_dir, cwd_hdr, plan_now,
+                                       session_id=sid,
+                                       turn_count=decision.turn_count)
+                if saved:
+                    _log("plan_persistence_saved", session=sid,
+                         cwd=cwd_hdr[:120], turn_count=decision.turn_count)
+            # Inject persisted plan on fresh thread
+            if decision.turn_count == 0:
+                pdata = _pp.load_plan(state_dir, cwd_hdr,
+                                       ttl_s=CFG.plan_persistence_ttl_s)
+                if pdata is not None:
+                    body, was_inj = _pp.inject_plan(body, pdata)
+                    if was_inj:
+                        _log("plan_persistence_injected",
+                             session=sid, cwd=cwd_hdr[:120],
+                             prev_turn_count=pdata.get("turn_count_at_save"),
+                             updated=pdata.get("updated_at_iso"))
+        except Exception as e:  # noqa: BLE001
+            _log("plan_persistence_error", session=sid, error=str(e))
+
     # Empty-response guard: if the previous turn for this session
     # returned an effectively empty response (e.g., DeepSeek silently
     # degraded under long context), force this turn to frontier so

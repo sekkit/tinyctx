@@ -446,6 +446,15 @@ class Config:
     # Max forensic dumps to retain (oldest deleted past this count).
     forensics_max_dumps: int = 100
 
+    # Cross-thread plan persistence: when codex's update_plan is called,
+    # save the plan to disk keyed by working directory. When a new codex
+    # thread opens on the same repo (turn_count==0), inject the persisted
+    # plan into instructions so context isn't lost across thread switches.
+    # See tinyctx/plan_persistence.py.
+    plan_persistence_enabled: bool = True
+    # TTL after which a persisted plan is no longer auto-injected.
+    plan_persistence_ttl_s: int = 7 * 24 * 3600  # 7 days
+
     # SSE keepalive injector for long-running upstream streams. When the
     # upstream (DeepSeek / chatgpt.com / etc.) is silent for this many
     # seconds during streaming, the proxy emits a `: tinyctx keepalive`
