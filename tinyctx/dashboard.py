@@ -690,3 +690,24 @@ def register(app: Any, log_dir: Path) -> None:
         if limit > 200:
             limit = 200
         return JSONResponse(recent_events(log_dir, limit=limit))
+
+    @app.post("/dashboard/force-frontier")
+    def _dashboard_force_frontier(
+            proj_sid: str = "global",
+            reason: str = "manual",
+    ) -> JSONResponse:
+        """Manually set the empty-response-guard flag for a session so
+        the NEXT request from codex auto-routes to frontier. Used to
+        recover sessions that hit an empty-response BEFORE the
+        empty_response_guard code was deployed."""
+        try:
+            from . import empty_response_guard as _erg
+            _erg.force_next_to_frontier(proj_sid, reason)
+            return JSONResponse({
+                "set": True,
+                "proj_sid": proj_sid,
+                "reason": reason,
+                "current_state": _erg.peek_force_frontier(proj_sid),
+            })
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
