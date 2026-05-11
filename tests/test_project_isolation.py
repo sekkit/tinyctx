@@ -259,3 +259,100 @@ def test_conv_key_distinct_for_different_conversations():
     # Both start with the same project prefix
     assert key_a.startswith("p:global:")
     assert key_b.startswith("p:global:")
+
+
+# ─── stable-fingerprint resolution (pck-drift bug fix) ─────────────────────
+#
+# The new key shape is `proj_sid:fp:<8-hex>` when codex sends any of:
+#   - client_metadata.x-codex-installation-id
+#   - body.model
+#   - body.input[0..2] developer-role text
+# That fingerprint is computed from the union of those signals and is
+# STABLE across prompt_cache_key drift. When none of those signals are
+# present we fall back to `proj_sid:<pck>` and then to bare `proj_sid`.
+
+def _codex_body(*, pck="pck-A", install="inst-1", model="gpt-5.5",
+                dev_text="<permissions>danger-full-access</permissions>"):
+    """Minimal codex-shaped body for fingerprint tests."""
+    body = {"model": model, "prompt_cache_key": pck,
+            "client_metadata": {"x-codex-installation-id": install},
+            "input": [{"type": "message", "role": "developer",
+                       "content": [{"type": "input_text", "text": dev_text}]}]}
+    return body
+
+
+def test_conv_key_stable_across_prompt_cache_key_drift():
+    """The original bug: in a long stuck saga the prompt_cache_key flips
+    mid-conversation (OpenAI prompt-cache invalidation), which reset the
+    synthetic_continue counter on every drift event. The fingerprint
+    must produce IDENTICAL keys across pck drift when the structural
+    signals are unchanged."""
+    from tinyctx.proxy import _conversation_session_key
+    body_t1 = _codex_body(pck="019e0741-aaaa")
+    body_t2 = _codex_body(pck="019e14c1-bbbb")  # drift!
+    body_t3 = _codex_body(pck="019e1700-cccc")  # more drift!
+    k1 = _conversation_session_key("proj:global", body_t1)
+    k2 = _conversation_session_key("proj:global", body_t2)
+    k3 = _conversation_session_key("proj:global", body_t3)
+    assert k1 == k2 == k3, f"keys must be stable across pck drift; got {k1!r} {k2!r} {k3!r}"
+    assert k1.startswith("proj:global:fp:")
+
+
+def test_conv_key_distinguishes_advisor_subthread_by_model():
+    """Advisor sub-threads use a different model (`tinyctx-frontier`)
+    and a different body shape. Even on the same install, they must
+    produce a DIFFERENT conv_sid from the main thread to keep their
+    counters isolated."""
+    from tinyctx.proxy import _conversation_session_key
+    main = _codex_body(model="gpt-5.5")
+    advisor = _codex_body(model="tinyctx-frontier")
+    k_main = _conversation_session_key("proj:global", main)
+    k_adv = _conversation_session_key("proj:global", advisor)
+    assert k_main != k_adv
+
+
+def test_conv_key_distinguishes_different_installations():
+    """Two codex installs on the same machine (rare but possible) must
+    not share counters."""
+    from tinyctx.proxy import _conversation_session_key
+    b1 = _codex_body(install="inst-A")
+    b2 = _codex_body(install="inst-B")
+    assert _conversation_session_key("p", b1) != _conversation_session_key("p", b2)
+
+
+def test_conv_key_distinguishes_sandbox_mode_change():
+    """Different developer-block content (different sandbox mode or
+    permissions config) → different key. This is the proxy for 'genuinely
+    different conversation context'."""
+    from tinyctx.proxy import _conversation_session_key
+    b1 = _codex_body(dev_text="<permissions>danger-full-access</permissions>")
+    b2 = _codex_body(dev_text="<permissions>workspace-write</permissions>")
+    assert _conversation_session_key("p", b1) != _conversation_session_key("p", b2)
+
+
+def test_conv_key_falls_back_to_pck_when_no_stable_signals():
+    """If client_metadata, model, and input are all absent (older clients
+    or non-codex callers), the resolver gracefully falls back to the
+    legacy `proj_sid:pck` form."""
+    from tinyctx.proxy import _conversation_session_key
+    body = {"prompt_cache_key": "legacy-uuid-1234"}
+    out = _conversation_session_key("p:global", body)
+    assert out == "p:global:legacy-uuid-1234"
+
+
+def test_conv_key_falls_back_to_proj_sid_when_nothing_present():
+    """Empty body (compaction handoff, etc.) → bare proj_sid."""
+    from tinyctx.proxy import _conversation_session_key
+    assert _conversation_session_key("p:global", {}) == "p:global"
+
+
+def test_conv_key_same_within_one_real_conversation():
+    """Realistic scenario: same codex install / model / first-dev-block
+    across many turns → SAME key. This is the invariant the budget cap
+    depends on for monotonic accumulation."""
+    from tinyctx.proxy import _conversation_session_key
+    keys = set()
+    for turn_pck in ["a", "b", "c", "d", "e", "f"]:  # simulate drift each turn
+        body = _codex_body(pck=turn_pck)
+        keys.add(_conversation_session_key("proj:global", body))
+    assert len(keys) == 1, f"expected single stable key across 6 turns, got {keys}"

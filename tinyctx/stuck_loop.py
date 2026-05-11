@@ -172,37 +172,34 @@ def reset_state(proj_sid: str | None = None) -> None:
 
 def reset_compaction_state(conv_sid: str | None,
                              proj_sid: str | None = None) -> None:
-    """Clear the per-conversation reminder-turn baseline after tinyctx
-    observes a compaction boundary. Codex's turn_count may keep
-    climbing across compaction, but the practical "have we recently
-    nudged this conversation about being stuck" question is best
-    answered against a clean post-compaction baseline.
+    """Hook called when tinyctx observes a compaction boundary.
 
-    When `proj_sid` is supplied AND differs from `conv_sid`, also sweep
-    every per-conv key prefixed by `f"{proj_sid}:"` — codex's compaction
-    handoff request may omit `prompt_cache_key`, degrading `conv_sid`
-    to just `proj_sid`, while normal-turn keys look like
-    `"proj_sid:cache_key"`. Without the sweep, pre-compaction baselines
-    survive across the boundary.
+    Originally this cleared `_LAST_REMINDER_TURN[conv_sid]` on the
+    rationale that codex's turn_count keeps climbing post-compaction and
+    a clean baseline gives the watchdog a fresh window. Live observation
+    proved that wrong: turn 322 fired a reminder, then a compaction
+    landed mid-stream, and turn 324 re-fired (gap=2, far below the
+    configured 50). The agent perceived rapid double-nag.
 
-    Advisor grace timestamp is preserved — advisor activity remains
-    relevant regardless of compaction.
+    Resolution: do NOT reset `_LAST_REMINDER_TURN` here. Codex's
+    absolute turn counter is fine as a reference — the gate
+    `turn_count - _LAST_REMINDER_TURN[scope] >= turn_gap` still holds
+    its intended semantics across compaction. Worst case the first
+    post-compaction reminder fires "as soon as the gap allows" instead
+    of "as soon as turn_trigger allows" — but that's the right behavior
+    for an agent that's been stuck through a compaction.
 
-    No-op when `conv_sid` is falsy.
+    Advisor grace timestamp is also preserved (advisor activity remains
+    relevant regardless of compaction). The function is kept as a stable
+    hook in case future tracker state needs compaction-boundary handling.
+
+    No-op when `conv_sid` is falsy. `proj_sid` accepted but unused —
+    kept for back-compat with proxy.py call sites.
     """
     if not conv_sid:
         return
-    _LAST_REMINDER_TURN.pop(conv_sid, None)
-    # Codex's compaction-handoff request may omit `prompt_cache_key`,
-    # degrading `conv_sid` to `proj_sid`. Normal-turn keys for this
-    # project look like `f"{proj_sid}:{cache_key}"` so the single pop
-    # above wouldn't reach them. Sweep prefix-matching keys only when
-    # the caller flags the degenerate case via `proj_sid == conv_sid`.
-    if proj_sid and proj_sid == conv_sid:
-        prefix = f"{proj_sid}:"
-        for k in list(_LAST_REMINDER_TURN.keys()):
-            if k.startswith(prefix):
-                _LAST_REMINDER_TURN.pop(k, None)
+    # Intentionally no state mutation. See docstring for rationale.
+    return
 
 
 def state_snapshot(proj_sid: str) -> dict[str, Any]:

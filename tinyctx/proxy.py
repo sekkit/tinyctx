@@ -55,6 +55,7 @@ from .sanitize import (
     normalize_for_chat,
     proactive_compact,
     purge_failed_tool_inputs,
+    rewrite_input_roles,
     rewrite_model,
     expand_mcp_namespaces,
     inject_advisor_hint,
@@ -342,29 +343,16 @@ def _project_session_key(request: Request, sid: str) -> str:
 def _conversation_session_key(proj_sid: str, body: dict[str, Any]) -> str:
     """Conversation-scoped composite key for per-thread state.
 
-    `proj_sid` is project-level (default "global" + cwd hash), so it
-    collapses every conversation in one project to the same key. Three
-    modules rely on per-conversation isolation: synthetic_continue's
+    Three modules rely on per-conversation isolation: synthetic_continue's
     injection counter, empty_response_guard's force-frontier flag, and
-    stuck_loop's per-turn reminder gate. Without conversation scoping
-    they leak across thread boundaries (a fresh conversation inherits
-    the previous one's budget) and across concurrent advisor sub-threads
-    (advisor activity bumps the main thread's counter).
-
-    Codex sends `prompt_cache_key` — a UUID stable across all turns of
-    one conversation/thread and distinct for separate threads (advisor
-    sub-threads spawn with their own key). It's stripped before being
-    forwarded upstream (see sanitize._DEFAULT_STRIP_FIELDS) so this only
-    reads the pristine incoming body.
-
-    Returns `f"{proj_sid}:{prompt_cache_key}"` when present, else just
-    `proj_sid` (back-compat: callers / older clients without the field
-    keep the old project-scoped behavior).
+    stuck_loop's per-turn reminder gate. Earlier this keyed on
+    `prompt_cache_key` alone; live trace showed that field drifts mid-
+    conversation (OpenAI prompt-cache invalidation), which silently reset
+    every per-conv counter and prevented the P2 budget cap from ever
+    firing. See `tinyctx/conv_id.py` for the resolver and full rationale.
     """
-    cck = body.get("prompt_cache_key") if isinstance(body, dict) else None
-    if not isinstance(cck, str) or not cck:
-        return proj_sid
-    return f"{proj_sid}:{cck}"
+    from .conv_id import resolve_conv_key
+    return resolve_conv_key(proj_sid, body)
 
 
 _STALL_WATCHDOG_TASK: asyncio.Task | None = None
@@ -1126,6 +1114,19 @@ async def responses(request: Request) -> Any:
     if backend.wire_api == "responses":
         url = backend.base_url.rstrip("/") + "/responses"
         forward_body = body
+        # Older/community LMStudio responses adapters reject role=developer
+        # with HTTP 400 ("Unexpected message role."). Rewrite to system on
+        # the local route only; frontier (chatgpt.com/backend-api/codex)
+        # supports developer natively. The chat-completions branch below
+        # is already handled inside normalize_for_chat.
+        if (decision.route == "local"
+                and CFG.local_role_rewrite_enabled
+                and CFG.local_role_rewrite_map):
+            forward_body, _n_role_rw = rewrite_input_roles(
+                forward_body, rewrite_map=CFG.local_role_rewrite_map)
+            if _n_role_rw:
+                _log("role_rewrite", session=sid,
+                     count=_n_role_rw, map=CFG.local_role_rewrite_map)
     else:
         # Local backend speaks chat-completions. Convert the body and fix URL.
         url = backend.base_url.rstrip("/") + "/chat/completions"

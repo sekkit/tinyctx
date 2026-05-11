@@ -289,10 +289,15 @@ def test_back_compat_when_no_advisor_scope_passed():
 # ─── Bug 4: compaction boundary clears reminder-turn baseline ─────────────
 
 
-def test_reset_compaction_state_clears_last_reminder_turn():
-    """After codex compacts, the post-compaction conversation should be
-    able to fire a fresh stuck-loop reminder without waiting another
-    `turn_gap` turns past the pre-compaction reminder turn."""
+def test_reset_compaction_state_preserves_last_reminder_turn():
+    """Live trace 2026-05-11 showed clearing `_LAST_REMINDER_TURN` on
+    compaction caused rapid double-nag (turn 322 fired, compaction landed
+    mid-stream, turn 324 re-fired with gap=2 << configured 50).
+
+    Current contract: `reset_compaction_state` does NOT mutate
+    `_LAST_REMINDER_TURN`. Codex's monotonic turn counter survives
+    compaction so the `turn_count - _LAST_REMINDER_TURN[scope] >= turn_gap`
+    gate retains its semantics."""
     from tinyctx import stuck_loop
     stuck_loop.reset_state()
     body = {"input": [{"role": "user", "content": "x"}]}
@@ -300,17 +305,14 @@ def test_reset_compaction_state_clears_last_reminder_turn():
     _, inj1 = stuck_loop.maybe_inject_stuck_reminder(
         body, conv, turn_count=100, turn_trigger=80, turn_gap=50)
     assert inj1 is True
-    # Without reset, a follow-up at turn 110 would be throttled.
-    _, inj_pre = stuck_loop.maybe_inject_stuck_reminder(
-        body, conv, turn_count=110, turn_trigger=80, turn_gap=50)
-    assert inj_pre is False
-    # Compaction boundary: clear the per-conv baseline.
+    assert stuck_loop._LAST_REMINDER_TURN[conv] == 100
+    # Compaction boundary should NOT zero the baseline.
     stuck_loop.reset_compaction_state(conv)
-    # Now the same turn fires fresh (because the gate's last-reminder
-    # baseline was zeroed and 110 >= turn_trigger).
+    assert stuck_loop._LAST_REMINDER_TURN[conv] == 100
+    # Follow-up at turn 110 stays throttled (gap=10 < 50).
     _, inj_post = stuck_loop.maybe_inject_stuck_reminder(
         body, conv, turn_count=110, turn_trigger=80, turn_gap=50)
-    assert inj_post is True
+    assert inj_post is False
 
 
 def test_reset_compaction_state_preserves_advisor_grace():
@@ -330,7 +332,9 @@ def test_reset_compaction_state_preserves_advisor_grace():
 
 
 def test_reset_compaction_state_isolated_per_conversation():
-    """Compaction in conv A must NOT touch conv B's reminder gate."""
+    """Compaction is a no-op for `_LAST_REMINDER_TURN`; per-conv state
+    is intrinsically isolated because the call doesn't mutate anything.
+    Both conversations keep their pre-compaction baselines."""
     from tinyctx import stuck_loop
     stuck_loop.reset_state()
     body = {"input": [{"role": "user", "content": "x"}]}
@@ -342,7 +346,7 @@ def test_reset_compaction_state_isolated_per_conversation():
     stuck_loop.maybe_inject_stuck_reminder(
         body, conv_b, turn_count=100, turn_trigger=80, turn_gap=50)
     stuck_loop.reset_compaction_state(conv_a)
-    assert stuck_loop._LAST_REMINDER_TURN.get(conv_a, 0) == 0
+    assert stuck_loop._LAST_REMINDER_TURN.get(conv_a, 0) == 100
     assert stuck_loop._LAST_REMINDER_TURN.get(conv_b, 0) == 100
 
 
@@ -354,13 +358,11 @@ def test_reset_compaction_state_handles_none_gracefully():
     stuck_loop.reset_compaction_state("")
 
 
-def test_reset_compaction_state_prefix_sweeps_when_proj_sid_supplied():
-    """Codex's compaction-handoff request can omit `prompt_cache_key`,
-    degrading conv_sid to proj_sid. Normal-turn keys for the same
-    project look like `f"{proj_sid}:{cache_key}"` so a bare
-    `pop(proj_sid)` would miss them. When caller supplies `proj_sid`,
-    sweep every matching key; other projects untouched. Advisor grace
-    timestamps stay intact regardless."""
+def test_reset_compaction_state_preserves_all_reminder_turn_keys():
+    """Current contract (post 2026-05-11 fix): `reset_compaction_state`
+    never mutates `_LAST_REMINDER_TURN` or `_LAST_ADVISOR_TS` regardless
+    of whether `proj_sid` is supplied. Both prefix-sweep and bare-key
+    pop are intentionally disabled to prevent rapid double-nag."""
     from tinyctx import stuck_loop
     stuck_loop.reset_state()
     stuck_loop._LAST_REMINDER_TURN["global:abc"] = 50
@@ -368,19 +370,18 @@ def test_reset_compaction_state_prefix_sweeps_when_proj_sid_supplied():
     stuck_loop._LAST_REMINDER_TURN["other:xyz"] = 30
     stuck_loop._LAST_ADVISOR_TS["global:abc"] = 12345.0
     stuck_loop.reset_compaction_state("global", proj_sid="global")
-    assert "global:abc" not in stuck_loop._LAST_REMINDER_TURN
-    assert "global:def" not in stuck_loop._LAST_REMINDER_TURN
+    assert stuck_loop._LAST_REMINDER_TURN.get("global:abc") == 50
+    assert stuck_loop._LAST_REMINDER_TURN.get("global:def") == 80
     assert stuck_loop._LAST_REMINDER_TURN.get("other:xyz") == 30
-    # Advisor grace preserved.
     assert stuck_loop._LAST_ADVISOR_TS.get("global:abc") == 12345.0
 
 
-def test_reset_compaction_state_back_compat_single_arg():
-    """Old callers passing only conv_sid get exact-key pop, no sweep."""
+def test_reset_compaction_state_back_compat_single_arg_preserves_state():
+    """Single-arg form is also a no-op now."""
     from tinyctx import stuck_loop
     stuck_loop.reset_state()
     stuck_loop._LAST_REMINDER_TURN["global:abc"] = 50
     stuck_loop._LAST_REMINDER_TURN["global:def"] = 80
     stuck_loop.reset_compaction_state("global:abc")
-    assert "global:abc" not in stuck_loop._LAST_REMINDER_TURN
+    assert stuck_loop._LAST_REMINDER_TURN.get("global:abc") == 50
     assert stuck_loop._LAST_REMINDER_TURN.get("global:def") == 80

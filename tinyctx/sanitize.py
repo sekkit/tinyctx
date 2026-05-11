@@ -74,6 +74,48 @@ def rewrite_model(body: dict[str, Any], target_model: str) -> dict[str, Any]:
     return body
 
 
+# Default rewrite map for `body.input[*].role` values that older / community
+# OpenAI-compat backends (LMStudio < 0.4.x, vLLM responses adapter, llama.cpp
+# OAI server) reject with HTTP 400 "Unexpected message role.". codex 0.128+
+# emits `role="developer"` for system-level instructions (AGENTS.md etc.);
+# `system` is the universally-accepted equivalent.
+_DEFAULT_ROLE_REWRITE_MAP: dict[str, str] = {"developer": "system"}
+
+
+def rewrite_input_roles(
+    body: dict[str, Any],
+    *,
+    rewrite_map: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Walk `body.input` (Responses API) and rewrite items whose `role` is a
+    key in `rewrite_map`. Returns (new_body, rewritten_count). When nothing
+    matches, returns the original body and 0 (no copy made).
+
+    Only touches the `input` array (Responses API). `messages` is the chat-
+    completions shape and `normalize_for_chat` already handles
+    `developer -> system` there.
+    """
+    if not rewrite_map:
+        return body, 0
+    items = body.get("input")
+    if not isinstance(items, list) or not items:
+        return body, 0
+    # Cheap pre-scan to avoid deepcopy when there's nothing to rewrite.
+    if not any(isinstance(it, dict) and it.get("role") in rewrite_map
+               for it in items):
+        return body, 0
+    out = deepcopy(body)
+    n = 0
+    for it in out["input"]:
+        if not isinstance(it, dict):
+            continue
+        r = it.get("role")
+        if r in rewrite_map:
+            it["role"] = rewrite_map[r]
+            n += 1
+    return out, n
+
+
 # Codex's Responses-API requests carry tool entries with codex-specific
 # `type` values that strict schemas (LMStudio's, vLLM's older versions, etc.)
 # reject with HTTP 400. The universal type every OpenAI-compat backend

@@ -205,6 +205,18 @@ class Config:
     # them. Avoids the "encrypted content could not be decrypted" crash.
     sanitize_encrypted_content: bool = True
 
+    # Rewrite `body.input[*].role` values that strict local OpenAI-compat
+    # backends reject. codex 0.128+ emits `role="developer"` for system-level
+    # instructions; older / community LMStudio builds (and the remote tunnel
+    # observed 2026-05-11) HTTP-400 with "Unexpected message role." Maps
+    # default to {"developer": "system"} which is the universally-accepted
+    # equivalent. Only applied on route=local + wire_api=responses; the chat-
+    # completions path already normalizes via normalize_for_chat. Frontier is
+    # never rewritten (it natively supports `developer`).
+    local_role_rewrite_enabled: bool = True
+    local_role_rewrite_map: dict[str, str] = field(
+        default_factory=lambda: {"developer": "system"})
+
     # History-hygiene transforms (DCP-inspired). When enabled, the
     # CacheAwareMutator (sanitize.py) gates them so they fire only when the
     # prompt cache is likely stale anyway, preserving cache hits in the
