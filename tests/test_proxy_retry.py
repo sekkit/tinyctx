@@ -601,6 +601,155 @@ class TestStreamProxyRetry:
             "compaction stream must NEVER retry"
 
 
+# ─── stall-cancel: watchdog-triggered relay cancellation ─────────────────
+
+
+class _HangingStreamCtx:
+    """Mock httpx stream that opens with 200 and then HANGS forever on
+    aiter_raw — simulates the upstream-silence stall scenario the
+    watchdog is designed to break."""
+
+    def __init__(self, started_event: asyncio.Event):
+        self.status_code = 200
+        self.headers = {}
+        self._started = started_event
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aread(self):
+        return b""
+
+    async def aiter_raw(self):
+        # Signal that we've opened — test can then trigger the cancel.
+        self._started.set()
+        # Sleep forever; respects cancellation via the next await.
+        await asyncio.sleep(3600)
+        if False:
+            yield b""
+
+
+class TestStreamProxyStallCancel:
+    """End-to-end: stall watchdog cancels the in-flight relay producer,
+    consumer emits a clean SSE terminator with status=incomplete, and
+    force_next_to_frontier is set on the conv key so codex's follow-up
+    turn routes to frontier."""
+
+    @pytest.mark.asyncio
+    async def test_stall_cancel_emits_terminator_and_sets_force_frontier(
+            self, proxy_module, monkeypatch):
+        from tinyctx import stall_watchdog as _sw
+        from tinyctx import empty_response_guard as _erg
+        # Short keepalive so the consumer wakes quickly enough.
+        monkeypatch.setattr(proxy_module.CFG,
+                            "stream_keepalive_interval_s", 0.05)
+        _sw.reset_state()
+        _erg.reset_state()
+
+        started = asyncio.Event()
+
+        def stream_fn(self, method, url, **kwargs):
+            return _HangingStreamCtx(started)
+
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-stall")
+            sr = await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json"},
+                {"model": "qwen-test", "input": []},
+                is_stream=True,
+                sid="s-stall",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-stall",
+            )
+
+            collected = bytearray()
+
+            async def _drain():
+                async for chunk in sr.body_iterator:
+                    if isinstance(chunk, (bytes, bytearray)):
+                        collected.extend(chunk)
+                    else:
+                        collected.extend(str(chunk).encode())
+
+            drain_task = asyncio.create_task(_drain())
+
+            # Wait for the producer to be live and registered.
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            # Give it a beat so register_task ran on the producer-create
+            # line right after asyncio.create_task.
+            await asyncio.sleep(0.05)
+
+            # Simulate the watchdog firing: cancel the registered task.
+            assert _sw.get_active_task("s-stall") is not None
+            cancelled = _sw.cancel_active_task("s-stall")
+            assert cancelled is True
+            # And set the force_next flag the real on_stall callback
+            # would set (test the proxy path, not the watchdog wiring).
+            _erg.force_next_to_frontier("conv-stall", "mid_stream_stall")
+
+            try:
+                await asyncio.wait_for(drain_task, timeout=3.0)
+            except asyncio.CancelledError:
+                pass
+
+        body_bytes = bytes(collected)
+        # Structurally valid SSE close — codex's parser needs
+        # response.completed to accept the stream.
+        assert b"response.completed" in body_bytes
+        # Status=incomplete signals "this attempt failed, please retry"
+        # to codex.
+        assert b"incomplete" in body_bytes
+        # The synthetic stall_cancelled marker should appear in the
+        # error event.
+        assert b"stall_cancelled" in body_bytes
+        # force_next_to_frontier flag is consumable on the conv key.
+        info = _erg.consume_force_frontier("conv-stall")
+        assert info is not None
+        assert "mid_stream_stall" in info["reason"]
+
+    @pytest.mark.asyncio
+    async def test_register_unregister_in_stream_lifecycle(
+            self, proxy_module, monkeypatch):
+        """After a normal-success stream completes, the registered
+        producer task is unregistered — leaks would let stale handles
+        confuse the next stream's cancel call."""
+        from tinyctx import stall_watchdog as _sw
+        monkeypatch.setattr(proxy_module.CFG,
+                            "stream_keepalive_interval_s", 0.5)
+        _sw.reset_state()
+
+        scripts = [
+            ("ok", [b'event: response.completed\ndata: {"type":"response.completed"}\n\n']),
+        ]
+        stream_fn, _state = _make_mock_stream(scripts)
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-lifecycle")
+            sr = await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json"},
+                {"model": "qwen-test", "input": []},
+                is_stream=True,
+                sid="s-lifecycle",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-lifecycle",
+            )
+            await _drain_stream(sr)
+        # After the stream finished, the registry must be empty.
+        assert _sw.get_active_task("s-lifecycle") is None
+
+
 # ─── retry policy state machine ──────────────────────────────────────────
 
 

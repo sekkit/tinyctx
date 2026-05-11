@@ -31,6 +31,21 @@ the next poll.
 
 `time.monotonic()` is used throughout — wall-clock can jump (NTP, DST,
 suspend/resume) and would fire spurious stalls.
+
+Cancel-and-retry (2026-05-11)
+─────────────────────────────
+The flag-for-next-turn fallback alone is insufficient when codex.app is
+itself wedged waiting on `response.completed` — codex won't send a next
+turn until the current one closes. To honour the user directive "凡是
+中断了都要加重试", `_ACTIVE_TASKS` tracks the in-flight relay producer
+task per proj_sid via `register_task` / `unregister_task`. When the
+watchdog fires, the stall callback cancels that task — sending
+`CancelledError` into its httpx await — which makes the producer push a
+synthetic `StallCancelledError` onto its consumer queue. The consumer
+then emits a clean SSE terminator (status=incomplete) so codex's SSE
+parser sees a structurally valid close and re-prompts; meanwhile the
+existing `force_next_to_frontier` flag stays set as belt+suspenders so
+the codex-driven follow-up routes to frontier.
 """
 from __future__ import annotations
 
@@ -50,6 +65,40 @@ _LOG = logging.getLogger("tinyctx.stall_watchdog")
 # that conversation's next request gets force-routed) and falls back to
 # the iterated sid when conv_sid wasn't supplied.
 _LAST_EVENT: dict[str, dict[str, Any]] = {}
+
+
+# Per-session in-flight relay task handle. The proxy's `_stream_proxy`
+# registers ITS OWN producer task at relay start (via `register_task`)
+# and unregisters in `finally`. The stall callback consults this dict
+# to actually cancel the wedged upstream task — without it, the watchdog
+# can only flag the NEXT turn, leaving the current request hung until
+# codex's own idle timeout fires (observed: ~9 minutes).
+_ACTIVE_TASKS: dict[str, "asyncio.Task"] = {}
+
+
+class StallCancelledError(Exception):
+    """Synthetic exception the proxy's relay producer pushes onto its
+    consumer queue when the stall watchdog cancels the in-flight task.
+
+    Carries enough context for forensics + retry classification:
+      - elapsed_silent_s: seconds since last upstream event
+      - conv_sid: per-conversation scope key (None for legacy callers)
+      - proj_sid: project/session key the cancel was scoped to
+
+    The proxy's `_stream_proxy` catches this in its consumer error
+    handler, emits a clean `_terminator_event(status=incomplete)`, and
+    sets `force_next_to_frontier` on the conv scope so codex's
+    follow-up turn routes to frontier (retry-escalate equivalent).
+    """
+
+    def __init__(self, message: str, *,
+                 proj_sid: str = "",
+                 conv_sid: str | None = None,
+                 elapsed_silent_s: float | None = None) -> None:
+        super().__init__(message)
+        self.proj_sid = proj_sid
+        self.conv_sid = conv_sid
+        self.elapsed_silent_s = elapsed_silent_s
 
 
 # ─── public API ────────────────────────────────────────────────────────────
@@ -116,6 +165,65 @@ def clear(proj_sid: str) -> None:
     if not proj_sid:
         return
     _LAST_EVENT.pop(proj_sid, None)
+
+
+# ─── active-task registry (cancel-and-retry on stall) ──────────────────────
+
+
+def register_task(proj_sid: str, task: "asyncio.Task") -> None:
+    """Register the in-flight relay producer task for `proj_sid` so the
+    stall callback can cancel it when silence exceeds threshold. The
+    proxy's `_stream_proxy` calls this at producer-task creation and
+    pairs it with `unregister_task` in `finally`. A subsequent
+    `register_task` for the same `proj_sid` replaces the previous
+    handle without raising — last-writer-wins matches the proxy's
+    one-active-stream-per-session invariant.
+
+    No-op when proj_sid is empty or task is None — callers can
+    fire-and-forget without guarding."""
+    if not proj_sid or task is None:
+        return
+    _ACTIVE_TASKS[proj_sid] = task
+
+
+def unregister_task(proj_sid: str, task: "asyncio.Task | None" = None) -> None:
+    """Drop the registered task for `proj_sid`. If `task` is supplied,
+    only unregister when it matches the current registration — prevents
+    a late-finishing producer from clobbering a freshly-registered new
+    stream's handle. With `task=None`, unconditionally drop."""
+    if not proj_sid:
+        return
+    if task is None:
+        _ACTIVE_TASKS.pop(proj_sid, None)
+        return
+    cur = _ACTIVE_TASKS.get(proj_sid)
+    if cur is task:
+        _ACTIVE_TASKS.pop(proj_sid, None)
+
+
+def get_active_task(proj_sid: str) -> "asyncio.Task | None":
+    """Return the registered relay task for `proj_sid`, or None if no
+    task is currently registered. For stall callbacks + tests."""
+    if not proj_sid:
+        return None
+    return _ACTIVE_TASKS.get(proj_sid)
+
+
+def cancel_active_task(proj_sid: str) -> bool:
+    """Cancel the registered relay task for `proj_sid` if one is live
+    (not already done). Returns True when a cancel was issued, False
+    when no live task was registered. Safe to call from any coroutine —
+    `task.cancel()` is just a flag flip on the task object; the
+    CancelledError fires at the task's next await point.
+
+    The caller does NOT remove the entry from `_ACTIVE_TASKS` — that
+    happens via the producer task's own `unregister_task` call in
+    `finally`. Removing here would race with a fresh `register_task`."""
+    task = _ACTIVE_TASKS.get(proj_sid)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
 
 
 # ─── background loop ──────────────────────────────────────────────────────
@@ -218,8 +326,12 @@ def state_snapshot() -> dict[str, dict[str, Any]]:
 
 def reset_state(proj_sid: str | None = None) -> None:
     """Test/dev helper. With no arg, clear all sessions; with a key,
-    clear just that one."""
+    clear just that one. Also drops any registered active task handles
+    for the affected scope — tests that build a fresh `_ACTIVE_TASKS`
+    don't leak stale handles into the next test."""
     if proj_sid is None:
         _LAST_EVENT.clear()
+        _ACTIVE_TASKS.clear()
         return
     _LAST_EVENT.pop(proj_sid, None)
+    _ACTIVE_TASKS.pop(proj_sid, None)

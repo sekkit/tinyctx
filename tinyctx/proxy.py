@@ -411,16 +411,35 @@ async def _start_stall_watchdog_on_startup() -> None:
             _phase_set(proj_sid, RequestPhase.stalled, "")
         except Exception:  # noqa: BLE001
             pass
+        # Cancel-and-retry: if the relay producer task is registered for
+        # this proj_sid, cancel it so the consumer wakes up, emits a
+        # clean SSE terminator, and unblocks codex. The flag-only
+        # fallback below still fires as belt+suspenders for the next
+        # turn — codex's natural retry on incomplete-status will then
+        # route to frontier.
+        cancelled = False
+        try:
+            cancelled = _stall.cancel_active_task(proj_sid)
+        except Exception:  # noqa: BLE001
+            cancelled = False
         try:
             from . import empty_response_guard as _erg
             _erg.force_next_to_frontier(escalate_key, "mid_stream_stall")
             _phase_set(proj_sid, RequestPhase.escalated_to_frontier, "")
         except Exception:  # noqa: BLE001
             pass
+        trigger_label = "stall_cancelled" if cancelled else "stall_kill"
+        elapsed: float | None = None
         try:
-            _log("stall_kill", session=proj_sid, conv_sid=conv_sid,
+            elapsed = _stall.seconds_since_event(proj_sid)
+        except Exception:  # noqa: BLE001
+            elapsed = None
+        try:
+            _log(trigger_label, session=proj_sid, conv_sid=conv_sid,
                  escalate_key=escalate_key,
-                 threshold_s=CFG.stall_threshold_s)
+                 threshold_s=CFG.stall_threshold_s,
+                 elapsed_silent_s=elapsed,
+                 task_cancelled=cancelled)
         except Exception:  # noqa: BLE001
             pass
         if CFG.forensics_enabled:
@@ -429,12 +448,14 @@ async def _start_stall_watchdog_on_startup() -> None:
                 forensics_dir = CFG.log_dir.parent / "forensics"
                 _fx.write_forensics_dump(
                     forensics_dir, proj_sid,
-                    trigger="stall_kill",
+                    trigger=trigger_label,
                     response_buffer="",
                     extra={"threshold_s": CFG.stall_threshold_s,
                            "escalation": "force_next_to_frontier",
                            "escalate_key": escalate_key,
-                           "conv_sid": conv_sid},
+                           "conv_sid": conv_sid,
+                           "task_cancelled": cancelled,
+                           "elapsed_silent_s": elapsed},
                     max_dumps=CFG.forensics_max_dumps,
                 )
             except Exception:  # noqa: BLE001
@@ -1777,12 +1798,39 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         attempt_headers[0] = new_headers
                         attempt_decision[0] = new_decision
                         # loop and re-attempt
+                except asyncio.CancelledError:
+                    # Stall watchdog (or shutdown) cancelled us. Surface
+                    # as a synthetic StallCancelledError so the consumer
+                    # can emit a clean SSE terminator and trigger the
+                    # next-turn escalation. We MUST NOT re-raise here —
+                    # the producer is a fire-and-forget task whose
+                    # cancellation must be communicated to the consumer
+                    # via the queue, not by killing the whole generator.
+                    try:
+                        elapsed = _stall.seconds_since_event(proj_sid)
+                    except Exception:  # noqa: BLE001
+                        elapsed = None
+                    synthetic = _stall.StallCancelledError(
+                        "stall_watchdog_cancelled_relay",
+                        proj_sid=proj_sid,
+                        conv_sid=conv_sid,
+                        elapsed_silent_s=elapsed,
+                    )
+                    try:
+                        await chunk_q.put((_ERR, synthetic))
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception as exc:  # noqa: BLE001
                     await chunk_q.put((_ERR, exc))
                 else:
                     await chunk_q.put((_SENTINEL, None))
 
             producer = asyncio.create_task(_producer())
+            if CFG.stall_watchdog_enabled:
+                try:
+                    _stall.register_task(proj_sid, producer)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 while True:
                     try:
@@ -2006,6 +2054,15 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         await producer
                     except (asyncio.CancelledError, Exception):  # noqa: BLE001
                         pass
+                # Always unregister, even if the watchdog already
+                # cancelled us — `unregister_task(task=producer)` is a
+                # no-op when a fresh stream has already replaced the
+                # registration, so we never clobber the next stream.
+                if CFG.stall_watchdog_enabled:
+                    try:
+                        _stall.unregister_task(proj_sid, producer)
+                    except Exception:  # noqa: BLE001
+                        pass
         else:
             # keepalive disabled — original simple loop, no extra task overhead
             async with httpx.AsyncClient(
@@ -2054,6 +2111,45 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         if translator is not None:
                             for out in translator.flush():
                                 yield out
+    except _stall.StallCancelledError as e:
+        # Watchdog cancelled the in-flight relay because the upstream
+        # went silent past CFG.stall_threshold_s. Emit a clean SSE
+        # error event and let the always-fires terminator below close
+        # the stream with status=incomplete so codex's SSE parser
+        # accepts it. force_next_to_frontier was already set by the
+        # stall callback — codex's follow-up turn routes frontier-side.
+        _SESSION_ERROR_STREAK[proj_sid] += 1
+        _log("stream_error", session=proj_sid, error=str(e),
+             error_type="StallCancelledError",
+             bytes_yielded=bytes_out,
+             elapsed_silent_s=e.elapsed_silent_s,
+             conv_sid=e.conv_sid)
+        status = 0
+        yield (
+            f"event: error\ndata: "
+            f"{json.dumps({'message': str(e), 'type': 'stall_cancelled'})}"
+            f"\n\n").encode()
+        upstream_failed = True
+        upstream_failure_msg = f"stall_cancelled: {e!s}"
+        # Forensics dump — capture what we saw so post-mortems can
+        # confirm the watchdog fired correctly.
+        if CFG.forensics_enabled and CFG.forensics_capture_errors:
+            try:
+                from . import forensics as _fx
+                forensics_dir = CFG.log_dir.parent / "forensics"
+                _fx.write_forensics_dump(
+                    forensics_dir, proj_sid,
+                    trigger="stall_cancelled_relay",
+                    response_buffer="",
+                    timing={"elapsed_s": round(time.time() - started, 3),
+                            "elapsed_silent_s": e.elapsed_silent_s},
+                    extra={"conv_sid": e.conv_sid,
+                           "bytes_yielded": bytes_out,
+                           "url": url},
+                    max_dumps=CFG.forensics_max_dumps,
+                )
+            except Exception:  # noqa: BLE001
+                pass
     except httpx.HTTPError as e:
         _SESSION_ERROR_STREAK[proj_sid] += 1
         _log("stream_error", session=proj_sid, error=str(e),

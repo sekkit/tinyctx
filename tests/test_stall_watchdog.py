@@ -388,3 +388,296 @@ def test_stall_escalation_isolates_conversations():
     info = erg.consume_force_frontier("projA:conv-b")
     assert info is not None
     assert "mid_stream_stall" in info["reason"]
+
+
+# ─── cancel-and-retry: _ACTIVE_TASKS registry ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_register_and_get_active_task():
+    """register_task stores a handle; get_active_task retrieves it."""
+    async def _hang():
+        await asyncio.sleep(10)
+    task = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", task)
+        assert sw.get_active_task("projA") is task
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_register_task_replaces_previous_handle():
+    """A second register_task call for the same proj_sid replaces the
+    first — matches the one-active-stream-per-session invariant."""
+    async def _hang():
+        await asyncio.sleep(10)
+    t1 = asyncio.create_task(_hang())
+    t2 = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", t1)
+        sw.register_task("projA", t2)
+        assert sw.get_active_task("projA") is t2
+    finally:
+        for t in (t1, t2):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_unregister_task_with_matching_handle_clears():
+    """unregister_task(proj_sid, task) only clears when the task
+    matches — guards against a late-finishing producer clobbering a
+    freshly-registered new stream."""
+    async def _hang():
+        await asyncio.sleep(10)
+    t1 = asyncio.create_task(_hang())
+    t2 = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", t1)
+        # Try to unregister t2 while t1 is current — must NOT clear.
+        sw.unregister_task("projA", t2)
+        assert sw.get_active_task("projA") is t1
+        # Unregister with matching handle — clears.
+        sw.unregister_task("projA", t1)
+        assert sw.get_active_task("projA") is None
+    finally:
+        for t in (t1, t2):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_unregister_task_without_handle_unconditional():
+    """unregister_task(proj_sid, task=None) drops unconditionally —
+    test/cleanup helper."""
+    async def _hang():
+        await asyncio.sleep(10)
+    t1 = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", t1)
+        sw.unregister_task("projA")  # no task arg
+        assert sw.get_active_task("projA") is None
+    finally:
+        t1.cancel()
+        try:
+            await t1
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+def test_register_task_noop_on_empty_proj_sid():
+    """register_task("") / unregister_task("") are no-ops, never raise."""
+    sw.register_task("", None)  # type: ignore[arg-type]
+    sw.unregister_task("")
+    assert sw.get_active_task("") is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_task_cancels_registered_handle():
+    """cancel_active_task returns True and the task's CancelledError
+    fires at the next await."""
+    fired = {"cancelled": False}
+
+    async def _hang():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            fired["cancelled"] = True
+            raise
+
+    task = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", task)
+        await asyncio.sleep(0.01)  # let it park on sleep
+        ok = sw.cancel_active_task("projA")
+        assert ok is True
+        # Wait for the task to actually finish.
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+        assert fired["cancelled"] is True
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def test_cancel_active_task_no_registered_returns_false():
+    """No-op + False when nothing registered. Preserves back-compat with
+    callers that never call register_task (legacy chat-completions
+    path)."""
+    assert sw.cancel_active_task("never-registered") is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_task_already_done_returns_false():
+    """If the task already finished naturally, cancel_active_task is a
+    no-op — no spurious cancel attempts, no false-positive True."""
+    async def _quick():
+        return None
+    task = asyncio.create_task(_quick())
+    await task  # let it complete
+    sw.register_task("projA", task)
+    assert sw.cancel_active_task("projA") is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_registrations_isolate_per_sid():
+    """Two different proj_sids each register their own task; cancelling
+    one must not affect the other."""
+    fired_a = {"cancelled": False}
+    fired_b = {"cancelled": False}
+
+    async def _hang(slot):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            slot["cancelled"] = True
+            raise
+
+    ta = asyncio.create_task(_hang(fired_a))
+    tb = asyncio.create_task(_hang(fired_b))
+    try:
+        sw.register_task("projA", ta)
+        sw.register_task("projB", tb)
+        await asyncio.sleep(0.01)
+        sw.cancel_active_task("projA")
+        try:
+            await asyncio.wait_for(ta, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+        assert fired_a["cancelled"] is True
+        assert fired_b["cancelled"] is False
+        assert not tb.done()
+    finally:
+        for t in (ta, tb):
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+
+@pytest.mark.asyncio
+async def test_reset_state_clears_active_tasks_registry():
+    """reset_state() must also drop the _ACTIVE_TASKS registry — tests
+    that build a fresh registry don't leak handles into the next test."""
+    async def _hang():
+        await asyncio.sleep(10)
+    task = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", task)
+        sw.reset_state()
+        assert sw.get_active_task("projA") is None
+        assert sw.cancel_active_task("projA") is False
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_on_stall_callback_path_cancels_registered_task():
+    """End-to-end: register_task + watchdog firing → cancel_active_task
+    invoked from inside the callback → registered task is cancelled."""
+    cancelled = {"hit": False}
+
+    async def _hang():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled["hit"] = True
+            raise
+
+    task = asyncio.create_task(_hang())
+    try:
+        sw.register_task("projA", task)
+        sw.mark_event("projA", conv_sid="projA:conv-1")
+        sw._LAST_EVENT["projA"]["ts"] = time.monotonic() - 1.0
+
+        def _on_stall(sid: str, conv_sid: str | None = None) -> None:
+            sw.cancel_active_task(sid)
+
+        wd = sw.start_watchdog(check_interval_s=0.02,
+                                threshold_s=0.1,
+                                on_stall=_on_stall)
+        try:
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except asyncio.CancelledError:
+                pass
+        finally:
+            wd.cancel()
+            try:
+                await wd
+            except (asyncio.CancelledError, Exception):
+                pass
+        assert cancelled["hit"] is True
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_on_stall_without_registered_task_still_fires_callback():
+    """Back-compat: callers that don't register a task still get the
+    callback invoked (flag-for-next-turn fallback path). cancel returns
+    False but the callback still runs side effects."""
+    received: list[tuple[str, str | None]] = []
+
+    def _on_stall(sid: str, conv_sid: str | None = None) -> None:
+        ok = sw.cancel_active_task(sid)
+        received.append((sid, conv_sid))
+        # Must not raise even when no task registered
+        assert ok is False
+
+    sw.mark_event("projNoTask", conv_sid="projNoTask:conv-1")
+    sw._LAST_EVENT["projNoTask"]["ts"] = time.monotonic() - 1.0
+
+    wd = sw.start_watchdog(check_interval_s=0.02,
+                            threshold_s=0.1,
+                            on_stall=_on_stall)
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        wd.cancel()
+        try:
+            await wd
+        except (asyncio.CancelledError, Exception):
+            pass
+    assert ("projNoTask", "projNoTask:conv-1") in received
+
+
+def test_stall_cancelled_error_carries_context():
+    """The synthetic exception preserves proj_sid / conv_sid / elapsed
+    so forensics + log emitters can include them in the dump."""
+    e = sw.StallCancelledError("stall",
+                                proj_sid="projZ",
+                                conv_sid="projZ:conv-1",
+                                elapsed_silent_s=42.0)
+    assert e.proj_sid == "projZ"
+    assert e.conv_sid == "projZ:conv-1"
+    assert e.elapsed_silent_s == 42.0
+    assert "stall" in str(e)
