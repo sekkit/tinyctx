@@ -394,10 +394,12 @@ _STALL_WATCHDOG_TASK: asyncio.Task | None = None
 
 @APP.on_event("startup")
 async def _start_stall_watchdog_on_startup() -> None:
-    """Spawn the mid-stream stall watchdog. On stall, set the phase,
-    record a forensic event, and flag the next request to escalate to
-    frontier — graceful degradation when we can't safely cancel the
-    in-flight upstream connection from outside its task."""
+    """Spawn the mid-stream stall watchdog. On stall: set the phase,
+    cancel the in-flight relay producer task (if registered), flag the
+    next request to escalate to frontier, and record a forensic event.
+    The cancel-and-retry primary path unblocks the wedged stream
+    immediately; the force-frontier flag is belt+suspenders for the
+    follow-up turn codex naturally retries."""
     global _STALL_WATCHDOG_TASK
     if not CFG.stall_watchdog_enabled:
         return
@@ -1344,6 +1346,11 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
     # failure. Bounded by max_total_retries_per_request as a hard cap.
     retry_state = retry_policy.RequestRetryState()
     cur_url, cur_headers, cur_body, cur_decision = url, headers, body, decision
+    # Scope force-frontier escalation to the per-conversation key when
+    # known so a failure in conv A doesn't bleed into conv B. Falls back
+    # to proj_sid (`sid` here) for back-compat with callers that haven't
+    # supplied conv_sid yet.
+    erg_key = conv_sid if conv_sid else sid
     last_response_payload: Any = None
     last_response_status: int = 0
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
@@ -1400,7 +1407,6 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     if action.escalate_flag_reason:
                         try:
                             from . import empty_response_guard as _erg
-                            erg_key = conv_sid if conv_sid else sid
                             _erg.force_next_to_frontier(
                                 erg_key, action.escalate_flag_reason)
                         except Exception:  # noqa: BLE001
@@ -1413,7 +1419,6 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                 if action.escalate_flag_reason:
                     try:
                         from . import empty_response_guard as _erg
-                        erg_key = conv_sid if conv_sid else sid
                         _erg.force_next_to_frontier(
                             erg_key, action.escalate_flag_reason)
                     except Exception:  # noqa: BLE001
@@ -1443,7 +1448,6 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                 if action.escalate_flag_reason:
                     try:
                         from . import empty_response_guard as _erg
-                        erg_key = conv_sid if conv_sid else sid
                         _erg.force_next_to_frontier(
                             erg_key, action.escalate_flag_reason)
                     except Exception:  # noqa: BLE001
@@ -1513,6 +1517,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     # proj_sid when not provided by callers that haven't been migrated —
     # preserves old project-scoped behavior.
     erg_key = conv_sid if conv_sid is not None else proj_sid
+    # Hoisted: every retry/escalation/phase-set log site below wants
+    # request_id, and `trace` is the same object throughout the relay.
+    request_id = trace.request_id if trace is not None else ""
     started = time.time()
     bytes_out = 0
     status = 200
@@ -1650,7 +1657,6 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             # the producer has put a body chunk, retry is blocked
             # (partial content already in flight).
             retry_state = retry_policy.RequestRetryState()
-            request_id = trace.request_id if trace is not None else ""
             # Mutable per-attempt state so we can swap on escalate.
             attempt_url = [url]
             attempt_headers = [headers]
@@ -1739,8 +1745,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         if action.decision == "propagate":
                             if action.escalate_flag_reason:
                                 try:
-                                    from . import empty_response_guard as _erg_p
-                                    _erg_p.force_next_to_frontier(
+                                    from . import empty_response_guard as _erg
+                                    _erg.force_next_to_frontier(
                                         erg_key, action.escalate_flag_reason)
                                 except Exception:  # noqa: BLE001
                                     pass
@@ -1772,8 +1778,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             new_decision = esc_decision
                             if action.escalate_flag_reason:
                                 try:
-                                    from . import empty_response_guard as _erg_e
-                                    _erg_e.force_next_to_frontier(
+                                    from . import empty_response_guard as _erg
+                                    _erg.force_next_to_frontier(
                                         erg_key, action.escalate_flag_reason)
                                 except Exception:  # noqa: BLE001
                                     pass
@@ -2180,13 +2186,11 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     _erg.force_next_to_frontier(
                         erg_key,
                         f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[proj_sid]}")
-                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
-                               trace.request_id if trace is not None else "")
+                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier, request_id)
                     _log("stream_error_escalating_to_frontier", session=proj_sid,
                          streak=_SESSION_ERROR_STREAK[proj_sid])
                 else:
-                    _phase_set(proj_sid, RequestPhase.retrying,
-                               trace.request_id if trace is not None else "")
+                    _phase_set(proj_sid, RequestPhase.retrying, request_id)
                     _log("stream_error_will_retry_same_backend",
                          session=proj_sid, streak=_SESSION_ERROR_STREAK[proj_sid])
             except Exception:  # noqa: BLE001
@@ -2243,8 +2247,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 and status == 200
                 and bytes_out > 0
                 and not upstream_failed):
-            _phase_set(proj_sid, RequestPhase.post_stream_classifying,
-                       trace.request_id if trace is not None else "")
+            _phase_set(proj_sid, RequestPhase.post_stream_classifying, request_id)
             try:
                 from . import soft_completion as _sc
                 api_key = (os.environ.get(CFG.local.api_key_env)
@@ -2457,7 +2460,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.emit(CFG.log_dir)
         _phase_set(proj_sid,
                    RequestPhase.stalled if upstream_failed else RequestPhase.done,
-                   trace.request_id if trace is not None else "")
+                   request_id)
 
 
 def _safe_json(r: httpx.Response) -> Any:
