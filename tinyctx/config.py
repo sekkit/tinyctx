@@ -631,6 +631,48 @@ class Config:
     # Above this, we've sent real content and can't redo cleanly.
     upstream_retry_max_bytes_yielded: int = 4096
 
+    # ── Unified retry policy (retry_policy.py) ─────────────────────────
+    # Per user directive 2026-05-11: "凡是中断了都要加重试" — every
+    # interruption should trigger retry. Layer on top of the legacy
+    # mid-stream-error retry above. The classifier in retry_policy.py
+    # consults these flags to decide whether to retry same / escalate /
+    # propagate for each (route, status/exception) combination.
+    #
+    # Flow:
+    #   1. local 400/422 → escalate to frontier (chatgpt.com accepts
+    #      every codex-emitted role/field; usually fixes schema-shape
+    #      rejections). Controlled by `retry_on_local_4xx_escalate_frontier`.
+    #   2. local 5xx / connection drop → retry same up to
+    #      `upstream_retry_count` then escalate to frontier.
+    #   3. frontier 5xx / connection drop → retry same up to
+    #      `upstream_retry_count` then propagate (no further escalation
+    #      possible).
+    #   4. frontier 4xx → propagate (chatgpt.com is strict; same body
+    #      retry rarely helps). Controlled by `retry_on_frontier_4xx`
+    #      — off by default.
+    #   5. 401/403/404 (auth/forbidden/not-found) → propagate. These
+    #      don't get easier on retry.
+    #   6. 429 → retry same with bounded backoff (Retry-After respected,
+    #      capped at 5s), then escalate.
+    #   7. is_compaction → never retry. Codex self-retries with a
+    #      different shape, and proxy-side retry doubles cost.
+    #   8. All retries capped by `max_total_retries_per_request` as a
+    #      hard safety bound (default 3).
+    #
+    # Each retry emits `retry_attempted` log event with attempt number,
+    # status, retry_target, original_url, new_url. Escalation also marks
+    # the session via empty_response_guard.force_next_to_frontier so
+    # codex's subsequent turns on the same conversation auto-route
+    # frontier — avoiding the ping-pong of "local fails → escalate →
+    # next turn back on local with the same broken body → fails again".
+    retry_on_local_4xx_escalate_frontier: bool = True
+    retry_on_frontier_4xx: bool = False
+    # Safety bound across all retry kinds for one request. Adding all
+    # the per-bucket caps could in theory let one request burn ~6
+    # attempts (local 5xx ×2 + frontier 5xx ×2 + connection ×2). Hard
+    # cap stops that. Default 3 = initial + up to 2 retries.
+    max_total_retries_per_request: int = 3
+
     # Mid-stream stall watchdog. While `empty_response_guard` catches
     # near-empty responses post-stream, it does NOT catch the case where
     # the upstream opens the SSE channel and then HANGS — no events, no

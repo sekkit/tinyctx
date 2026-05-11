@@ -66,6 +66,7 @@ from .sanitize import (
     trim_tools_for_frontier,
 )
 from .request_phase import RequestPhase, set_phase as _phase_set
+from . import retry_policy
 from . import stall_watchdog as _stall
 from .tool_call_translator import ChatToResponsesTranslator, StreamTranslator, rebuild_response
 from .trace import RequestTrace
@@ -309,6 +310,38 @@ def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
 
 def _select_backend(decision: Decision) -> BackendCfg:
     return CFG.local if decision.route == "local" else CFG.frontier
+
+
+def _build_frontier_retry_target(
+        request: Request | None,
+        body: dict[str, Any],
+        reason: str,
+) -> tuple[str, dict[str, str], dict[str, Any], Decision, BackendCfg]:
+    """Rebuild url/headers/body for a retry that escalates to frontier.
+
+    Used by the unified retry layer (retry_policy.classify_failure ==
+    retry_escalate) to switch from local to frontier mid-request. We
+    reuse the same `body` (frontier accepts every codex-emitted role/
+    field/tool-type natively, so no transform needed) but rebuild the
+    URL + auth headers from the frontier backend config.
+
+    `request` may be None when called from a context that doesn't have
+    the FastAPI Request handy (e.g. retry inside a stream producer).
+    In that case the caller passes a pre-built headers dict separately;
+    we still produce frontier-shaped url + decision so the dispatch
+    loop can swap them in.
+    """
+    backend = CFG.frontier
+    url = backend.base_url.rstrip("/") + "/responses"
+    headers = (_forward_headers(request, backend) if request is not None
+               else {"Content-Type": "application/json",
+                     "Accept": "text/event-stream"})
+    decision = Decision(
+        "frontier",
+        f"retry_escalate: {reason}",
+        is_compaction=False,
+    )
+    return url, headers, body, decision, backend
 
 
 def _session_id(request: Request, body: dict[str, Any]) -> str:
@@ -1284,26 +1317,137 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             media_type="text/event-stream",
         )
     started = time.time()
+    # ── Unified retry layer ──────────────────────────────────────────
+    # Per user directive "凡是中断了都要加重试". The retry_policy
+    # classifier decides retry_same / retry_escalate / propagate for each
+    # failure. Bounded by max_total_retries_per_request as a hard cap.
+    retry_state = retry_policy.RequestRetryState()
+    cur_url, cur_headers, cur_body, cur_decision = url, headers, body, decision
+    last_response_payload: Any = None
+    last_response_status: int = 0
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-        try:
-            r = await client.post(url, headers=headers, json=body)
-        except httpx.HTTPError as e:
+        while True:
+            retry_state.record_attempt()
+            attempt_url = cur_url
+            attempt_started = time.time()
+            try:
+                r = await client.post(attempt_url, headers=cur_headers, json=cur_body)
+                http_status: int | None = r.status_code
+                conn_error = False
+                exc: Exception | None = None
+            except httpx.HTTPError as e:
+                r = None
+                http_status = None
+                conn_error = True
+                exc = e
+            if r is not None and r.status_code < 400:
+                _SESSION_ERROR_STREAK[sid] = 0
+                break  # success — fall through to payload handling
+            # Failure path — classify and decide next action.
+            retry_after = 0.0
+            if r is not None:
+                ra = r.headers.get("retry-after") or r.headers.get("Retry-After")
+                try:
+                    retry_after = float(ra) if ra else 0.0
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+            action = retry_policy.classify_failure(
+                route=cur_decision.route,
+                status=http_status,
+                is_connection_error=conn_error,
+                is_compaction=cur_decision.is_compaction,
+                attempts_used=retry_state.attempts_used,
+                max_total_retries=CFG.max_total_retries_per_request,
+                upstream_retry_count=CFG.upstream_retry_count,
+                retry_on_local_4xx_escalate_frontier=CFG.retry_on_local_4xx_escalate_frontier,
+                retry_on_frontier_4xx=CFG.retry_on_frontier_4xx,
+                retry_after_s=retry_after,
+            )
+            retry_state.last_action = action
             _SESSION_ERROR_STREAK[sid] += 1
-            _log("upstream_error", session=sid, error=str(e), url=url)
-            if trace is not None:
-                trace.status = 0
-                trace.elapsed_s = round(time.time() - started, 3)
-                trace.emit(CFG.log_dir)
-            return JSONResponse({"error": {"message": str(e), "type": "tinyctx_upstream"}},
-                                status_code=502)
-        if r.status_code >= 400:
-            _SESSION_ERROR_STREAK[sid] += 1
-            if trace is not None:
-                trace.status = r.status_code
-                trace.elapsed_s = round(time.time() - started, 3)
-                trace.emit(CFG.log_dir)
-            return JSONResponse(content=_safe_json(r), status_code=r.status_code)
-        _SESSION_ERROR_STREAK[sid] = 0
+            if action.decision == "propagate":
+                if conn_error:
+                    _log("upstream_error", session=sid,
+                         error=str(exc), url=attempt_url,
+                         attempts_used=retry_state.attempts_used,
+                         policy_reason=action.reason)
+                    if trace is not None:
+                        trace.status = 0
+                        trace.elapsed_s = round(time.time() - started, 3)
+                        trace.emit(CFG.log_dir)
+                    # Set force_next_to_frontier if classifier asked for it
+                    if action.escalate_flag_reason:
+                        try:
+                            from . import empty_response_guard as _erg
+                            erg_key = conv_sid if conv_sid else sid
+                            _erg.force_next_to_frontier(
+                                erg_key, action.escalate_flag_reason)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return JSONResponse(
+                        {"error": {"message": str(exc),
+                                   "type": "tinyctx_upstream"}},
+                        status_code=502)
+                assert r is not None  # mypy/type narrowing
+                if action.escalate_flag_reason:
+                    try:
+                        from . import empty_response_guard as _erg
+                        erg_key = conv_sid if conv_sid else sid
+                        _erg.force_next_to_frontier(
+                            erg_key, action.escalate_flag_reason)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if trace is not None:
+                    trace.status = r.status_code
+                    trace.elapsed_s = round(time.time() - started, 3)
+                    trace.emit(CFG.log_dir)
+                return JSONResponse(content=_safe_json(r),
+                                    status_code=r.status_code)
+            # Retry path — log and re-attempt.
+            new_url = attempt_url
+            new_headers = cur_headers
+            new_decision = cur_decision
+            if action.decision == "retry_escalate":
+                new_url, new_headers, _b, new_decision, _backend = (
+                    _build_frontier_retry_target(None, cur_body, action.reason))
+                # Reuse incoming Authorization-style headers (codex auth);
+                # the original `headers` already had auth resolved. Frontier
+                # accepts the same body so no body transform needed.
+                # Patch Content-Type + Accept defaults.
+                merged = dict(cur_headers)
+                merged["Content-Type"] = "application/json"
+                merged.setdefault("Accept", "text/event-stream")
+                new_headers = merged
+                # Set force_next_to_frontier so next turn also frontier
+                if action.escalate_flag_reason:
+                    try:
+                        from . import empty_response_guard as _erg
+                        erg_key = conv_sid if conv_sid else sid
+                        _erg.force_next_to_frontier(
+                            erg_key, action.escalate_flag_reason)
+                    except Exception:  # noqa: BLE001
+                        pass
+                retry_state.record_escalation()
+            _log("retry_attempted",
+                 session=sid,
+                 attempt_number=retry_state.attempts_used,
+                 original_status=http_status,
+                 retry_target=action.decision,
+                 original_url=attempt_url,
+                 new_url=new_url,
+                 reason=action.reason,
+                 request_id=trace.request_id if trace is not None else "",
+                 conn_error=conn_error,
+                 elapsed_s=round(time.time() - attempt_started, 3))
+            if action.backoff_s > 0:
+                try:
+                    await asyncio.sleep(action.backoff_s)
+                except Exception:  # noqa: BLE001
+                    pass
+            cur_url, cur_headers, cur_decision = new_url, new_headers, new_decision
+            # loop continues — try again
+        # success branch
+        assert r is not None
         payload = _safe_json(r)
         translated_calls = 0
         # Non-streaming chat→responses translation. The streaming path in
@@ -1473,28 +1617,166 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             _STATUS = object()
             _SENTINEL = object()
             _ERR = object()
+            # ── Unified retry layer ──────────────────────────────────
+            # Per user directive 2026-05-11 "凡是中断了都要加重试".
+            # The producer task itself runs a retry loop: when the
+            # upstream returns 4xx/5xx or raises a connection error
+            # BEFORE we've put any body chunks on the queue, the
+            # producer consults `retry_policy.classify_failure` and
+            # may re-issue the request — switching to frontier when
+            # the policy says retry_escalate. The consumer below sees
+            # only the FINAL outcome (status + body or error). Once
+            # the producer has put a body chunk, retry is blocked
+            # (partial content already in flight).
+            retry_state = retry_policy.RequestRetryState()
+            request_id = trace.request_id if trace is not None else ""
+            # Mutable per-attempt state so we can swap on escalate.
+            attempt_url = [url]
+            attempt_headers = [headers]
+            attempt_body = [body]
+            attempt_decision = [decision]
 
             async def _producer():
+                produced_chunk = False
                 try:
-                    async with httpx.AsyncClient(
-                            timeout=timeout, transport=transport) as client:
-                        async with client.stream(
-                                "POST", url, headers=headers, json=body) as r:
-                            if r.status_code >= 400:
-                                err_body = (await r.aread()).decode(
-                                    "utf-8", "replace")
-                                await chunk_q.put(
-                                    (_STATUS, (r.status_code, err_body)))
-                                # NOTE: fall through (no early return). The
-                                # try/except/else's `else:` puts SENTINEL
-                                # only when the try-block runs to completion;
-                                # an early return would skip it and the
-                                # consumer would hang waiting for sentinel.
-                            else:
-                                await chunk_q.put(
-                                    (_STATUS, (r.status_code, None)))
-                                async for chunk in r.aiter_raw():
-                                    await chunk_q.put((None, chunk))
+                    while True:
+                        retry_state.record_attempt()
+                        cur_attempt_url = attempt_url[0]
+                        cur_attempt_headers = attempt_headers[0]
+                        cur_attempt_body = attempt_body[0]
+                        cur_decision = attempt_decision[0]
+                        attempt_started = time.time()
+                        http_status: int | None = None
+                        conn_error = False
+                        exc_caught: Exception | None = None
+                        err_body_for_retry: str = ""
+                        retry_after_s = 0.0
+                        try:
+                            async with httpx.AsyncClient(
+                                    timeout=timeout, transport=transport) as client:
+                                async with client.stream(
+                                        "POST", cur_attempt_url,
+                                        headers=cur_attempt_headers,
+                                        json=cur_attempt_body) as r:
+                                    http_status = r.status_code
+                                    if r.status_code >= 400:
+                                        err_body_for_retry = (
+                                            await r.aread()).decode(
+                                            "utf-8", "replace")
+                                        ra = (r.headers.get("retry-after")
+                                              or r.headers.get("Retry-After"))
+                                        try:
+                                            retry_after_s = float(ra) if ra else 0.0
+                                        except (TypeError, ValueError):
+                                            retry_after_s = 0.0
+                                        # Fall through to the policy check
+                                        # below — do NOT push STATUS yet.
+                                    else:
+                                        # Success — emit STATUS and stream
+                                        # body chunks. From this point on
+                                        # retry is impossible (partial
+                                        # content in flight).
+                                        await chunk_q.put(
+                                            (_STATUS, (r.status_code, None)))
+                                        async for chunk in r.aiter_raw():
+                                            produced_chunk = True
+                                            await chunk_q.put((None, chunk))
+                                        # finished successfully — push
+                                        # sentinel (return skips the
+                                        # outer else clause) and exit.
+                                        await chunk_q.put(
+                                            (_SENTINEL, None))
+                                        return
+                        except Exception as e:  # noqa: BLE001
+                            conn_error = True
+                            exc_caught = e
+                        # Failure path. Consult policy.
+                        if produced_chunk:
+                            # We already streamed bytes to the consumer
+                            # for THIS attempt's response body — cannot
+                            # retry. Propagate.
+                            if exc_caught is not None:
+                                raise exc_caught
+                            await chunk_q.put(
+                                (_STATUS, (http_status or 0, err_body_for_retry)))
+                            await chunk_q.put((_SENTINEL, None))
+                            return
+                        action = retry_policy.classify_failure(
+                            route=cur_decision.route,
+                            status=http_status,
+                            is_connection_error=conn_error,
+                            is_compaction=cur_decision.is_compaction,
+                            attempts_used=retry_state.attempts_used,
+                            max_total_retries=CFG.max_total_retries_per_request,
+                            upstream_retry_count=CFG.upstream_retry_count,
+                            retry_on_local_4xx_escalate_frontier=(
+                                CFG.retry_on_local_4xx_escalate_frontier),
+                            retry_on_frontier_4xx=CFG.retry_on_frontier_4xx,
+                            retry_after_s=retry_after_s,
+                        )
+                        retry_state.last_action = action
+                        if action.decision == "propagate":
+                            if action.escalate_flag_reason:
+                                try:
+                                    from . import empty_response_guard as _erg_p
+                                    _erg_p.force_next_to_frontier(
+                                        erg_key, action.escalate_flag_reason)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            if exc_caught is not None:
+                                # surface connection error to consumer
+                                raise exc_caught
+                            # surface upstream 4xx/5xx to consumer
+                            await chunk_q.put(
+                                (_STATUS, (http_status or 0,
+                                            err_body_for_retry)))
+                            await chunk_q.put((_SENTINEL, None))
+                            return
+                        # retry_same / retry_escalate
+                        new_url = cur_attempt_url
+                        new_headers = cur_attempt_headers
+                        new_decision = cur_decision
+                        if action.decision == "retry_escalate":
+                            esc_url, esc_headers_proto, _b, esc_decision, _bk = (
+                                _build_frontier_retry_target(
+                                    None, cur_attempt_body, action.reason))
+                            # Reuse existing auth headers (codex auth was
+                            # already resolved by _forward_headers); patch
+                            # Content-Type + Accept.
+                            merged = dict(cur_attempt_headers)
+                            merged["Content-Type"] = "application/json"
+                            merged.setdefault("Accept", "text/event-stream")
+                            new_url = esc_url
+                            new_headers = merged
+                            new_decision = esc_decision
+                            if action.escalate_flag_reason:
+                                try:
+                                    from . import empty_response_guard as _erg_e
+                                    _erg_e.force_next_to_frontier(
+                                        erg_key, action.escalate_flag_reason)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            retry_state.record_escalation()
+                        _log("retry_attempted",
+                             session=proj_sid,
+                             attempt_number=retry_state.attempts_used,
+                             original_status=http_status,
+                             retry_target=action.decision,
+                             original_url=cur_attempt_url,
+                             new_url=new_url,
+                             reason=action.reason,
+                             request_id=request_id,
+                             conn_error=conn_error,
+                             elapsed_s=round(time.time() - attempt_started, 3))
+                        if action.backoff_s > 0:
+                            try:
+                                await asyncio.sleep(action.backoff_s)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        attempt_url[0] = new_url
+                        attempt_headers[0] = new_headers
+                        attempt_decision[0] = new_decision
+                        # loop and re-attempt
                 except Exception as exc:  # noqa: BLE001
                     await chunk_q.put((_ERR, exc))
                 else:
