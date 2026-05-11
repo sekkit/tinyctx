@@ -121,7 +121,13 @@ def clear(proj_sid: str) -> None:
 # ─── background loop ──────────────────────────────────────────────────────
 
 
-StallCallback = Callable[..., Union[None, Awaitable[None]]]
+# Two callback shapes are accepted; start_watchdog picks the right call form
+# via inspect.signature once at startup. The 2-arg form gets conv_sid so
+# stall escalation can be scoped to a single conversation; the 1-arg form
+# is kept for legacy callers that haven't migrated.
+_StallCallback2 = Callable[[str, Union[str, None]], Union[None, Awaitable[None]]]
+_StallCallback1 = Callable[[str], Union[None, Awaitable[None]]]
+StallCallback = Union[_StallCallback2, _StallCallback1]
 
 
 def start_watchdog(check_interval_s: float,

@@ -864,11 +864,13 @@ async def responses(request: Request) -> Any:
 
     # Proactive history truncation (last line of defense against "Codex
     # ran out of room"). Fires only when est_tokens crosses
-    # CFG.proactive_compact_threshold AND the request is NOT already a
-    # codex compaction request. Replaces the middle of body.input with a
-    # tinyctx summary item; codex's client-side history is unchanged so
-    # the UI still shows every turn. See sanitize.proactive_compact for
-    # full rationale.
+    # CFG.effective_proactive_compact_threshold() (i.e. the raw threshold
+    # minus CFG.proactive_compact_overhead_buffer to calibrate for tinyctx's
+    # own ~25-30K of instructions/tools/scout overhead) AND the request is
+    # NOT already a codex compaction request. Replaces the middle of
+    # body.input with a tinyctx summary item; codex's client-side history
+    # is unchanged so the UI still shows every turn. See
+    # sanitize.proactive_compact for full rationale.
     #
     # Gated by `proactive_compact_only_on_frontier`: skip when route=local
     # since the local backend has 1M context (cost-free to overspend) and
@@ -1320,7 +1322,7 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
 
 
 async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
-                        sid: str, decision: Decision,
+                        proj_sid: str, decision: Decision,
                         timeout: httpx.Timeout,
                         *, transport: httpx.AsyncBaseTransport | None = None,
                         translate_tool_calls: bool = False,
@@ -1330,9 +1332,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         conv_sid: str | None = None) -> AsyncIterator[bytes]:
     # conv_sid is the per-conversation scope key for synthetic_continue
     # injection budget and empty_response_guard flagging. Falls back to
-    # sid (which is itself proj_sid) when not provided by callers that
-    # haven't been migrated — preserves old project-scoped behavior.
-    erg_key = conv_sid if conv_sid is not None else sid
+    # proj_sid when not provided by callers that haven't been migrated —
+    # preserves old project-scoped behavior.
+    erg_key = conv_sid if conv_sid is not None else proj_sid
     started = time.time()
     bytes_out = 0
     status = 200
@@ -1383,7 +1385,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     if CFG.soft_completion_gate_enabled:
         try:
             from . import soft_completion
-            soft_completion.reset_stream(sid)
+            soft_completion.reset_stream(proj_sid)
         except Exception:  # noqa: BLE001 — instrumentation must never fail forward
             pass
 
@@ -1503,10 +1505,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         status_code, err_body = payload
                         status = status_code
                         if CFG.stall_watchdog_enabled:
-                            _stall.mark_event(sid, conv_sid=conv_sid)
+                            _stall.mark_event(proj_sid, conv_sid=conv_sid)
                         if err_body is not None:
-                            _SESSION_ERROR_STREAK[sid] += 1
-                            _log("upstream_error", session=sid,
+                            _SESSION_ERROR_STREAK[proj_sid] += 1
+                            _log("upstream_error", session=proj_sid,
                                  status=status_code, url=url,
                                  body=err_body[:2000])
                             yield (
@@ -1525,7 +1527,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                     from . import forensics as _fx
                                     forensics_dir = CFG.log_dir.parent / "forensics"
                                     _fx.write_forensics_dump(
-                                        forensics_dir, sid,
+                                        forensics_dir, proj_sid,
                                         trigger=f"upstream_{status_code}",
                                         response_buffer=err_body or "",
                                         extra={"status": status_code,
@@ -1537,12 +1539,12 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             # Don't break — wait for SENTINEL so producer
                             # cleanly closes its async-with stack.
                         else:
-                            _SESSION_ERROR_STREAK[sid] = 0
+                            _SESSION_ERROR_STREAK[proj_sid] = 0
                         continue
                     # tag is None → real response-body chunk
                     bytes_out += len(payload)
                     if CFG.stall_watchdog_enabled:
-                        _stall.mark_event(sid, conv_sid=conv_sid)
+                        _stall.mark_event(proj_sid, conv_sid=conv_sid)
                     # Soft-completion accumulator: just buffer the bytes,
                     # the LLM behavioral classifier runs ONCE at stream
                     # end (see finally block below). We don't decide
@@ -1550,7 +1552,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     if CFG.soft_completion_gate_enabled:
                         try:
                             from . import soft_completion as _sc
-                            _sc.accumulate_chunk(sid, payload)
+                            _sc.accumulate_chunk(proj_sid, payload)
                         except Exception:  # noqa: BLE001
                             pass
                     if translator is None:
@@ -1578,7 +1580,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         from . import stream_rewrite as _sr
                         api_key = (os.environ.get(CFG.local.api_key_env)
                                    if CFG.local.api_key_env else None)
-                        buffer_snapshot = _sc._OUTPUT_BUFFER.get(sid, "")
+                        buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
                         body_input = (body.get("input")
                                        if isinstance(body, dict) else None)
                         user_goal = _sc.extract_user_goal(body_input)
@@ -1588,7 +1590,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         # end, no other bytes flowing. Bounded by
                         # self_classify_timeout_s (default 30s).
                         diag = await _sc.classify_at_stream_end_diag(
-                            sid,
+                            proj_sid,
                             local_base_url=CFG.local.base_url,
                             local_model=CFG.local.model,
                             api_key=api_key,
@@ -1629,7 +1631,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 _erg_budget.force_next_to_frontier(
                                     erg_key, "injection_budget_exhausted")
                                 _log("soft_completion_stream_rewrite_budget_exhausted",
-                                     session=sid,
+                                     session=proj_sid,
                                      p=diag.result.p,
                                      injection_count=_syn.injection_count(erg_key),
                                      max_injections=CFG.max_continue_injections_per_session)
@@ -1637,7 +1639,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 for evt in inj_events:
                                     yield _capture_outgoing(evt)
                                 _log("soft_completion_stream_rewrite_injected",
-                                     session=sid,
+                                     session=proj_sid,
                                      p=diag.result.p,
                                      reason=diag.result.reason,
                                      strategy=strategy["label"],
@@ -1660,9 +1662,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                     # Custom dump that ALSO includes the
                                     # outgoing capture (what codex
                                     # actually saw, post-injection).
-                                    raw = _sc._OUTPUT_BUFFER.get(sid, "") or ""
+                                    raw = _sc._OUTPUT_BUFFER.get(proj_sid, "") or ""
                                     fpath = _fx.write_forensics_dump(
-                                        forensics_dir, sid,
+                                        forensics_dir, proj_sid,
                                         trigger="punt_via_stream_rewrite",
                                         response_buffer=raw,
                                         classifier_verdict={
@@ -1685,20 +1687,20 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                     )
                                     if fpath:
                                         _log("forensics_dump_written",
-                                             session=sid,
+                                             session=proj_sid,
                                              trigger="punt_via_stream_rewrite",
                                              path=str(fpath))
                                 except Exception:  # noqa: BLE001
                                     pass
                         else:
                             _log("soft_completion_stream_rewrite_skipped",
-                                 session=sid,
+                                 session=proj_sid,
                                  reason=("not_punt" if diag.result is None
                                          else f"p={diag.result.p:.2f}"
                                               f"<{CFG.soft_completion_stream_rewrite_threshold}"))
                     except Exception as e:  # noqa: BLE001
                         _log("soft_completion_stream_rewrite_error",
-                             session=sid, error=str(e))
+                             session=proj_sid, error=str(e))
                     # Always flush the held response.completed at the end
                     if held_completion_buf:
                         yield _capture_outgoing(bytes(held_completion_buf))
@@ -1717,9 +1719,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         "POST", url, headers=headers, json=body) as r:
                     status = r.status_code
                     if r.status_code >= 400:
-                        _SESSION_ERROR_STREAK[sid] += 1
+                        _SESSION_ERROR_STREAK[proj_sid] += 1
                         text = (await r.aread()).decode("utf-8", "replace")
-                        _log("upstream_error", session=sid,
+                        _log("upstream_error", session=proj_sid,
                              status=r.status_code, url=url, body=text[:2000])
                         yield (
                             f"event: error\ndata: "
@@ -1729,17 +1731,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         upstream_failure_msg = (
                             f"upstream {r.status_code}: {text[:200]}")
                     else:
-                        _SESSION_ERROR_STREAK[sid] = 0
+                        _SESSION_ERROR_STREAK[proj_sid] = 0
                         async for chunk in r.aiter_raw():
                             bytes_out += len(chunk)
                             if CFG.stall_watchdog_enabled:
-                                _stall.mark_event(sid, conv_sid=conv_sid)
+                                _stall.mark_event(proj_sid, conv_sid=conv_sid)
                             # Soft-completion accumulator (no-keepalive path).
                             # LLM classifier runs at stream end.
                             if CFG.soft_completion_gate_enabled:
                                 try:
                                     from . import soft_completion as _sc
-                                    _sc.accumulate_chunk(sid, chunk)
+                                    _sc.accumulate_chunk(proj_sid, chunk)
                                 except Exception:  # noqa: BLE001
                                     pass
                             # NOTE: stream rewrite intercept is wired in
@@ -1758,8 +1760,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             for out in translator.flush():
                                 yield out
     except httpx.HTTPError as e:
-        _SESSION_ERROR_STREAK[sid] += 1
-        _log("stream_error", session=sid, error=str(e),
+        _SESSION_ERROR_STREAK[proj_sid] += 1
+        _log("stream_error", session=proj_sid, error=str(e),
              error_type=type(e).__name__, bytes_yielded=bytes_out)
         status = 0
         yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n".encode()
@@ -1783,19 +1785,19 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 # Only escalate if THIS session has now had multiple
                 # consecutive errors (≥ retry_count + 1). The first
                 # error sets the streak; subsequent errors trip escalation.
-                if _SESSION_ERROR_STREAK[sid] > CFG.upstream_retry_count:
+                if _SESSION_ERROR_STREAK[proj_sid] > CFG.upstream_retry_count:
                     _erg.force_next_to_frontier(
                         erg_key,
-                        f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[sid]}")
-                    _phase_set(sid, RequestPhase.escalated_to_frontier,
+                        f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[proj_sid]}")
+                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
                                trace.request_id if trace is not None else "")
-                    _log("stream_error_escalating_to_frontier", session=sid,
-                         streak=_SESSION_ERROR_STREAK[sid])
+                    _log("stream_error_escalating_to_frontier", session=proj_sid,
+                         streak=_SESSION_ERROR_STREAK[proj_sid])
                 else:
-                    _phase_set(sid, RequestPhase.retrying,
+                    _phase_set(proj_sid, RequestPhase.retrying,
                                trace.request_id if trace is not None else "")
                     _log("stream_error_will_retry_same_backend",
-                         session=sid, streak=_SESSION_ERROR_STREAK[sid])
+                         session=proj_sid, streak=_SESSION_ERROR_STREAK[proj_sid])
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1807,7 +1809,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 from . import forensics as _fx
                 forensics_dir = CFG.log_dir.parent / "forensics"
                 _fx.write_forensics_dump(
-                    forensics_dir, sid,
+                    forensics_dir, proj_sid,
                     trigger="stream_error",
                     response_buffer="",
                     timing={"elapsed_s": round(time.time() - started, 3)},
@@ -1815,7 +1817,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                            "error_type": type(e).__name__,
                            "url": url,
                            "bytes_yielded": bytes_out,
-                           "session_error_streak": _SESSION_ERROR_STREAK[sid]},
+                           "session_error_streak": _SESSION_ERROR_STREAK[proj_sid]},
                     max_dumps=CFG.forensics_max_dumps,
                 )
             except Exception:  # noqa: BLE001
@@ -1833,11 +1835,11 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     finally:
         if CFG.stall_watchdog_enabled:
             try:
-                _stall.clear(sid)
+                _stall.clear(proj_sid)
             except Exception:  # noqa: BLE001
                 pass
         elapsed = round(time.time() - started, 3)
-        _log("stream_done", session=sid, route=decision.route, bytes=bytes_out,
+        _log("stream_done", session=proj_sid, route=decision.route, bytes=bytes_out,
              translated=bool(translator),
              elapsed_s=elapsed,
              keepalives=keepalives_emitted)
@@ -1850,7 +1852,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 and status == 200
                 and bytes_out > 0
                 and not upstream_failed):
-            _phase_set(sid, RequestPhase.post_stream_classifying,
+            _phase_set(proj_sid, RequestPhase.post_stream_classifying,
                        trace.request_id if trace is not None else "")
             try:
                 from . import soft_completion as _sc
@@ -1863,7 +1865,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 # and not yet refilled — leading to spurious "no_buffer"
                 # / "short_text text_chars=0" skips. Closure-capture the
                 # snapshot so the dict isn't consulted later.
-                buffer_snapshot = _sc._OUTPUT_BUFFER.get(sid, "")
+                buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
                 # Extract semantic context from the request body for
                 # the new classifier. The body has the entire
                 # conversation history; mine it for user goal +
@@ -1876,14 +1878,14 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 tool_summary_snapshot = _sc.extract_tool_summary(body_input)
 
                 async def _bg_classify():
-                    _log("soft_completion_classify_started", session=sid,
+                    _log("soft_completion_classify_started", session=proj_sid,
                          buffer_chars_at_spawn=len(buffer_snapshot),
                          user_goal_chars=len(user_goal_snapshot),
                          tracker_chars=len(tracker_snapshot),
                          tool_summary=tool_summary_snapshot[:120])
                     try:
                         diag = await _sc.classify_at_stream_end_diag(
-                            sid,
+                            proj_sid,
                             local_base_url=CFG.local.base_url,
                             local_model=CFG.local.model,
                             api_key=api_key,
@@ -1906,7 +1908,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         # following branches always fires:
                         if diag.result is not None:
                             _log("soft_completion_classified",
-                                 session=sid,
+                                 session=proj_sid,
                                  soft_punt=diag.result.soft_punt,
                                  p=diag.result.p,
                                  reason=diag.result.reason,
@@ -1921,15 +1923,15 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 try:
                                     forensics_dir = CFG.log_dir.parent / "forensics"
                                     p = _sc.write_punt_forensics(
-                                        sid, forensics_dir, diag.result, diag,
+                                        proj_sid, forensics_dir, diag.result, diag,
                                         max_dumps=CFG.forensics_max_dumps)
                                     if p:
                                         _log("forensics_dump_written",
-                                             session=sid, trigger="punt",
+                                             session=proj_sid, trigger="punt",
                                              path=p)
                                 except Exception as fe:  # noqa: BLE001
                                     _log("forensics_dump_error",
-                                         session=sid, error=str(fe))
+                                         session=proj_sid, error=str(fe))
                             # C-4 hybrid: actively poke the codex.app
                             # session via `codex exec resume` side
                             # process. Turns the auto_force_frontier flag
@@ -1955,10 +1957,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                         max_per_minute=CFG.exec_resume_max_per_minute,
                                         timeout_s=CFG.exec_resume_timeout_s,
                                         log_dir=log_dir,
-                                        proj_sid=sid,
+                                        proj_sid=proj_sid,
                                     )
                                     _log("exec_resume_poke",
-                                         session=sid,
+                                         session=proj_sid,
                                          status=rec.status,
                                          reason=rec.reason,
                                          pid=rec.pid,
@@ -1967,10 +1969,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                          p=diag.result.p)
                                 except Exception as xe:  # noqa: BLE001
                                     _log("exec_resume_poke_error",
-                                         session=sid, error=str(xe))
+                                         session=proj_sid, error=str(xe))
                         elif diag.skipped_reason:
                             _log("soft_completion_classify_skipped",
-                                 session=sid,
+                                 session=proj_sid,
                                  reason=diag.skipped_reason,
                                  finish_reason=diag.finish_reason,
                                  extracted_text_chars=diag.extracted_text_chars,
@@ -1979,7 +1981,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                  raw_tail=diag.raw_buffer_tail)
                         elif diag.backend_error:
                             _log("soft_completion_classify_backend_error",
-                                 session=sid,
+                                 session=proj_sid,
                                  error=diag.backend_error,
                                  status=diag.backend_status,
                                  extracted_text_chars=diag.extracted_text_chars)
@@ -1987,17 +1989,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             # Parse failure — backend returned 200 but
                             # content didn't yield a verdict.
                             _log("soft_completion_classify_parse_failed",
-                                 session=sid,
+                                 session=proj_sid,
                                  status=diag.backend_status,
                                  raw_preview=diag.raw_content_preview,
                                  extracted_text_chars=diag.extracted_text_chars)
                     except Exception as e:  # noqa: BLE001
                         _log("soft_completion_classify_error",
-                             session=sid, error=str(e))
+                             session=proj_sid, error=str(e))
                 asyncio.create_task(_bg_classify())
             except Exception as e:  # noqa: BLE001
                 _log("soft_completion_classify_spawn_error",
-                     session=sid, error=str(e))
+                     session=proj_sid, error=str(e))
         # Empty-response guard: parse upstream's usage block from buffer
         # tail; if completion_tokens too low + finish_reason normal,
         # flag this session so the NEXT request gets routed to frontier.
@@ -2008,12 +2010,12 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             try:
                 from . import empty_response_guard as _erg
                 from . import soft_completion as _sc
-                buf_for_check = _sc._OUTPUT_BUFFER.get(sid, "")
+                buf_for_check = _sc._OUTPUT_BUFFER.get(proj_sid, "")
                 info = _erg.maybe_flag_empty_response(
                     erg_key, buf_for_check,
                     min_completion_tokens=CFG.empty_response_min_completion_tokens)
                 if info is not None:
-                    _log("empty_response_detected", session=sid,
+                    _log("empty_response_detected", session=proj_sid,
                          completion_tokens=info.get("completion_tokens"),
                          finish_reason=info.get("finish_reason"),
                          reason=info.get("reason"))
@@ -2027,7 +2029,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             forensics_dir = CFG.log_dir.parent / "forensics"
                             path = _fx.write_forensics_dump(
                                 forensics_dir,
-                                sid,
+                                proj_sid,
                                 trigger="empty_response",
                                 response_buffer=buf_for_check,
                                 timing={
@@ -2045,14 +2047,14 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             )
                             if path:
                                 _log("forensics_dump_written",
-                                     session=sid, trigger="empty_response",
+                                     session=proj_sid, trigger="empty_response",
                                      path=str(path), file=path.name)
                         except Exception as fe:  # noqa: BLE001
                             _log("forensics_dump_error",
-                                 session=sid, error=str(fe))
+                                 session=proj_sid, error=str(fe))
             except Exception as e:  # noqa: BLE001
                 _log("empty_response_guard_error",
-                     session=sid, error=str(e))
+                     session=proj_sid, error=str(e))
         if trace is not None:
             trace.status = status
             trace.bytes_out = bytes_out
@@ -2062,7 +2064,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.elapsed_s = elapsed
             trace.keepalives_emitted = keepalives_emitted
             trace.emit(CFG.log_dir)
-        _phase_set(sid,
+        _phase_set(proj_sid,
                    RequestPhase.stalled if upstream_failed else RequestPhase.done,
                    trace.request_id if trace is not None else "")
 
