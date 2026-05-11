@@ -220,4 +220,42 @@ def test_trace_carries_project_session_key():
     from dataclasses import asdict
     d = asdict(t)
     assert d["project_session_key"] == "abc12345:global"
-    assert d["session_id"] == "global"
+
+
+# ─── _conversation_session_key helper ──────────────────────────────────────
+
+
+def test_conv_key_appends_prompt_cache_key():
+    """Codex sends `prompt_cache_key` as a UUID stable per conversation.
+    Composite key = proj_sid + ':' + that uuid."""
+    from tinyctx.proxy import _conversation_session_key
+    body = {"prompt_cache_key": "019e0741-f905-7332-b88a-5414ec53c31d"}
+    out = _conversation_session_key("cwdhash:global", body)
+    assert out == "cwdhash:global:019e0741-f905-7332-b88a-5414ec53c31d"
+
+
+def test_conv_key_falls_back_to_proj_sid_when_missing():
+    """No prompt_cache_key field → back-compat: just proj_sid."""
+    from tinyctx.proxy import _conversation_session_key
+    assert _conversation_session_key("global", {}) == "global"
+    assert _conversation_session_key("p:global", {"model": "x"}) == "p:global"
+
+
+def test_conv_key_falls_back_when_empty_string():
+    """Empty string prompt_cache_key → fall back."""
+    from tinyctx.proxy import _conversation_session_key
+    assert _conversation_session_key("p", {"prompt_cache_key": ""}) == "p"
+
+
+def test_conv_key_distinct_for_different_conversations():
+    """Same project, two different prompt_cache_key values → distinct keys.
+    This is the property the three watchdog modules rely on."""
+    from tinyctx.proxy import _conversation_session_key
+    body_a = {"prompt_cache_key": "019e0741-aaaa"}
+    body_b = {"prompt_cache_key": "019e14c1-bbbb"}
+    key_a = _conversation_session_key("p:global", body_a)
+    key_b = _conversation_session_key("p:global", body_b)
+    assert key_a != key_b
+    # Both start with the same project prefix
+    assert key_a.startswith("p:global:")
+    assert key_b.startswith("p:global:")

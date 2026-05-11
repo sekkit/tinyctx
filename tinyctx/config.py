@@ -268,6 +268,17 @@ class Config:
     # 0.0 to disable auto-derivation and force use of the absolute
     # `proactive_compact_threshold` value above.
     proactive_compact_safe_fraction: float = 0.75
+    # tinyctx adds its own injections to every forwarded request:
+    # bundled agent rules, advisor hint, scout context, tool catalog
+    # padding, etc. Live trace 2026-05-10 measured a ~30K-token gap
+    # between `est_input_tokens` (user body alone) and
+    # `forwarded_tokens_est` (what upstream actually receives). The
+    # proactive_compact gate is checked against `est_input_tokens`, so
+    # without this buffer it under-estimates by exactly that overhead
+    # and never trips until the upstream itself crosses the budget.
+    # `effective_proactive_compact_threshold` subtracts this from the
+    # derived threshold so the gate compares apples to apples.
+    proactive_compact_overhead_buffer: int = 25_000
     # Number of recent turns kept verbatim during proactive truncation.
     proactive_compact_recent_keep: int = 8
     # When true, summary uses one local-model call per session-summary cache
@@ -699,21 +710,29 @@ def effective_proactive_compact_threshold(cfg: "Config") -> int:
     Resolution order:
       1. If `frontier.context_window > 0` AND
          `proactive_compact_safe_fraction > 0`:
-         return int(context_window * safe_fraction)
-      2. Else: return cfg.proactive_compact_threshold (absolute fallback)
+         base = int(context_window * safe_fraction)
+      2. Else: base = cfg.proactive_compact_threshold (absolute fallback)
+
+    The returned value is `base - proactive_compact_overhead_buffer`,
+    clamped to >= 0. The buffer accounts for tinyctx's own injections
+    (agent rules, advisor hint, scout, tool catalog) that inflate the
+    forwarded payload above the user-body `est_input_tokens` that the
+    gate is checked against — without it the gate under-fires by
+    roughly the overhead amount.
 
     Returning 0 disables proactive_compact entirely. The proxy treats 0
     as "skip the gate".
-
-    This lets users switch frontier models (gpt-5.5 → gemini-2.5 →
-    smaller) and have the threshold track context_window automatically,
-    without rewiring config every time.
     """
     cw = getattr(cfg.frontier, "context_window", 0) or 0
     sf = cfg.proactive_compact_safe_fraction
     if cw > 0 and sf > 0:
-        return int(cw * sf)
-    return int(cfg.proactive_compact_threshold or 0)
+        base = int(cw * sf)
+    else:
+        base = int(cfg.proactive_compact_threshold or 0)
+    if base <= 0:
+        return 0
+    buffer = int(getattr(cfg, "proactive_compact_overhead_buffer", 0) or 0)
+    return max(0, base - buffer)
 
 
 def load_config() -> Config:

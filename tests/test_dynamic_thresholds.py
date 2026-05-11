@@ -17,7 +17,8 @@ from tinyctx.config import (
 
 def _make_cfg(*, frontier_ctx: int = 0,
               safe_fraction: float = 0.75,
-              absolute_fallback: int = 200_000) -> Config:
+              absolute_fallback: int = 200_000,
+              overhead_buffer: int = 0) -> Config:
     cfg = Config()
     cfg.frontier = BackendCfg(
         base_url="https://example.com",
@@ -27,6 +28,7 @@ def _make_cfg(*, frontier_ctx: int = 0,
     )
     cfg.proactive_compact_safe_fraction = safe_fraction
     cfg.proactive_compact_threshold = absolute_fallback
+    cfg.proactive_compact_overhead_buffer = overhead_buffer
     return cfg
 
 
@@ -93,4 +95,45 @@ def test_default_frontier_ships_with_codex_gpt55_context_window():
     # Default frontier.context_window matches codex.app's hardcoded
     # 272000 for gpt-5.5. If this changes, update the test.
     assert cfg.frontier.context_window == 272_000
-    assert effective_proactive_compact_threshold(cfg) == int(272_000 * 0.75)
+    expected = int(272_000 * 0.75) - cfg.proactive_compact_overhead_buffer
+    assert effective_proactive_compact_threshold(cfg) == expected
+
+
+# ─── Bug 5: tinyctx overhead-buffer calibration ────────────────────────────
+
+
+def test_overhead_buffer_subtracted_from_dynamic_threshold():
+    """tinyctx adds ~25K of overhead (agent rules, advisor hint, scout,
+    tool catalog) to every forwarded request. The gate measures user-body
+    `est_input_tokens`, so the threshold must compensate by lowering by
+    that overhead — otherwise the gate under-fires by exactly the gap."""
+    cfg = _make_cfg(frontier_ctx=272_000, safe_fraction=0.75,
+                    overhead_buffer=25_000)
+    # base = 204_000; effective = 204_000 - 25_000 = 179_000
+    assert effective_proactive_compact_threshold(cfg) == 179_000
+
+
+def test_overhead_buffer_subtracted_from_absolute_fallback():
+    """Buffer applies to the absolute-fallback path too — users who set
+    a custom threshold and a context_window=0 still get the calibration."""
+    cfg = _make_cfg(frontier_ctx=0, safe_fraction=0.75,
+                    absolute_fallback=200_000, overhead_buffer=25_000)
+    assert effective_proactive_compact_threshold(cfg) == 175_000
+
+
+def test_overhead_buffer_clamps_at_zero():
+    """Pathological config (buffer > base) clamps to 0, NOT negative —
+    proxy treats 0 as 'disable gate'."""
+    cfg = _make_cfg(frontier_ctx=128_000, safe_fraction=0.5,
+                    overhead_buffer=200_000)
+    # base = 64_000; buffer = 200_000; clamp to 0
+    assert effective_proactive_compact_threshold(cfg) == 0
+
+
+def test_default_overhead_buffer_is_calibrated():
+    """The default value must be in the right ballpark — too small and
+    the gate still under-fires, too large and it fires prematurely.
+    Observed gap from live trace 2026-05-10 was ~30K; default sits at
+    25K to absorb most of it while leaving a small safety margin."""
+    cfg = Config()
+    assert 10_000 <= cfg.proactive_compact_overhead_buffer <= 50_000

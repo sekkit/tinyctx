@@ -270,6 +270,44 @@ def reset_state(proj_sid: str | None = None) -> None:
     _LAST_BUDGET_REMINDER_FIRED.pop(proj_sid, None)
 
 
+def reset_compaction_state(conv_sid: str | None,
+                             proj_sid: str | None = None) -> None:
+    """Clear injection budget + budget-reminder flag for a conversation
+    after tinyctx observes a compaction boundary. The strategy index is
+    NOT cleared — strategy rotation is independent of conversation length
+    and there's no benefit to resetting it.
+
+    When `proj_sid` is supplied AND differs from `conv_sid`, also sweep
+    every per-conv key prefixed by `f"{proj_sid}:"` — necessary because
+    codex's compaction handoff request may omit `prompt_cache_key`,
+    degrading `conv_sid` to just `proj_sid`, while normal-turn keys for
+    the SAME project look like `"proj_sid:cache_key"`. Without the sweep,
+    pre-compaction counters survive across the boundary.
+
+    No-op when `conv_sid` is falsy so callers that lost conv_sid scope
+    can still call this without guards.
+    """
+    if not conv_sid:
+        return
+    _INJECTION_COUNT_PER_SESSION.pop(conv_sid, None)
+    _LAST_BUDGET_REMINDER_FIRED.pop(conv_sid, None)
+    # Codex's compaction-handoff request may omit `prompt_cache_key`,
+    # degrading `conv_sid` to `proj_sid`. Normal-turn keys for this
+    # project look like `f"{proj_sid}:{cache_key}"` so the single pop
+    # above wouldn't reach them. When the caller flags this case by
+    # passing `proj_sid == conv_sid`, sweep every per-conv key prefixed
+    # by `f"{proj_sid}:"`. When conv_sid is precise (`"proj:cache"`),
+    # the single pop is enough and we don't disturb sibling conversations.
+    if proj_sid and proj_sid == conv_sid:
+        prefix = f"{proj_sid}:"
+        for k in list(_INJECTION_COUNT_PER_SESSION.keys()):
+            if k.startswith(prefix):
+                _INJECTION_COUNT_PER_SESSION.pop(k, None)
+        for k in list(_LAST_BUDGET_REMINDER_FIRED.keys()):
+            if k.startswith(prefix):
+                _LAST_BUDGET_REMINDER_FIRED.pop(k, None)
+
+
 def state_snapshot(proj_sid: str,
                     max_injections: int = 20) -> dict[str, Any]:
     count = _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0)

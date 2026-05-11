@@ -98,6 +98,7 @@ def maybe_inject_stuck_reminder(body: dict[str, Any],
                                  turn_trigger: int = 80,
                                  turn_gap: int = 50,
                                  advisor_grace_s: float = 600.0,
+                                 advisor_scope_sid: str | None = None,
                                  ) -> tuple[dict[str, Any], bool]:
     """Append a stuck-loop `<system-reminder>` to `body.input` when the
     session has run long without convergence. No-op when:
@@ -106,15 +107,27 @@ def maybe_inject_stuck_reminder(body: dict[str, Any],
       - an advisor was invoked within `advisor_grace_s` seconds
       - body has no `input` array (malformed; skip silently)
 
+    `proj_sid` here is the SCOPE for the reminder gate — the caller
+    decides whether it's per-project or per-conversation. Pass a
+    conversation-scoped key so a new codex thread (whose `turn_count`
+    resets to 0) is not blocked by a stale `_LAST_REMINDER_TURN` from
+    the previous thread.
+
+    `advisor_scope_sid` (optional) decouples the advisor grace lookup
+    from the reminder gate. Pass the project-scoped key so advisor
+    activity in any sub-thread quiets nudges across the project; if
+    None, falls back to `proj_sid` (back-compat).
+
     Returns `(new_body, was_injected)`. The original body is not mutated.
     Trace records `stuck_reminder_injected` + `stuck_turn_count_at_inject`
     on injection so we can correlate effectiveness later.
     """
+    advisor_key = advisor_scope_sid if advisor_scope_sid is not None else proj_sid
     if turn_count < turn_trigger:
         return body, False
     if turn_count - _LAST_REMINDER_TURN[proj_sid] < turn_gap:
         return body, False
-    if time.time() - _LAST_ADVISOR_TS[proj_sid] < advisor_grace_s:
+    if time.time() - _LAST_ADVISOR_TS[advisor_key] < advisor_grace_s:
         return body, False
 
     items = body.get("input")
@@ -155,6 +168,41 @@ def reset_state(proj_sid: str | None = None) -> None:
         return
     _LAST_REMINDER_TURN.pop(proj_sid, None)
     _LAST_ADVISOR_TS.pop(proj_sid, None)
+
+
+def reset_compaction_state(conv_sid: str | None,
+                             proj_sid: str | None = None) -> None:
+    """Clear the per-conversation reminder-turn baseline after tinyctx
+    observes a compaction boundary. Codex's turn_count may keep
+    climbing across compaction, but the practical "have we recently
+    nudged this conversation about being stuck" question is best
+    answered against a clean post-compaction baseline.
+
+    When `proj_sid` is supplied AND differs from `conv_sid`, also sweep
+    every per-conv key prefixed by `f"{proj_sid}:"` — codex's compaction
+    handoff request may omit `prompt_cache_key`, degrading `conv_sid`
+    to just `proj_sid`, while normal-turn keys look like
+    `"proj_sid:cache_key"`. Without the sweep, pre-compaction baselines
+    survive across the boundary.
+
+    Advisor grace timestamp is preserved — advisor activity remains
+    relevant regardless of compaction.
+
+    No-op when `conv_sid` is falsy.
+    """
+    if not conv_sid:
+        return
+    _LAST_REMINDER_TURN.pop(conv_sid, None)
+    # Codex's compaction-handoff request may omit `prompt_cache_key`,
+    # degrading `conv_sid` to `proj_sid`. Normal-turn keys for this
+    # project look like `f"{proj_sid}:{cache_key}"` so the single pop
+    # above wouldn't reach them. Sweep prefix-matching keys only when
+    # the caller flags the degenerate case via `proj_sid == conv_sid`.
+    if proj_sid and proj_sid == conv_sid:
+        prefix = f"{proj_sid}:"
+        for k in list(_LAST_REMINDER_TURN.keys()):
+            if k.startswith(prefix):
+                _LAST_REMINDER_TURN.pop(k, None)
 
 
 def state_snapshot(proj_sid: str) -> dict[str, Any]:

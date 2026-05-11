@@ -602,7 +602,8 @@ def test_classify_short_circuits_tool_calls_without_llm():
 
 
 def test_classify_short_text_threshold_50():
-    """Short text + finish=stop → skip without LLM (brief confirmation)."""
+    """Short text + finish=stop → skip without LLM (brief confirmation).
+    Uses default stop_text_threshold=50 — backward-compat path."""
     from tinyctx import soft_completion
     soft_completion.reset_state()
     # 30 chars of text + finish=stop (< 50 threshold)
@@ -621,6 +622,66 @@ def test_classify_short_text_threshold_50():
     assert diag.skipped_reason == "short_text"
     assert diag.finish_reason == "stop"
     assert diag.extracted_text_chars < 50
+
+
+def test_classify_stop_with_low_floor_does_not_skip_short_text():
+    """User directive C (2026-05-10): with stop_text_threshold=1, every
+    finish=stop should be classified — even very short text. Verifies
+    short_text short-circuit no longer fires for stop. Reaches the
+    backend (which we point at an unreachable host so it errors → diag.
+    backend_error populated, not skipped_reason)."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = (
+        'data: {"choices":[{"delta":{"content":"Done."},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+    )
+    soft_completion.accumulate_chunk("p2", sse.encode())
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p2",
+            local_base_url="http://127.0.0.1:1/v1",
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7,
+            short_text_threshold=50,
+            stop_text_threshold=1))
+    # Did NOT short-circuit on short_text — proceeded to backend call
+    assert diag.skipped_reason == ""
+    assert diag.finish_reason == "stop"
+    # Backend unreachable, so diag captures the connect failure
+    assert diag.backend_error != ""
+
+
+def test_classify_length_finish_still_uses_short_text_threshold():
+    """finish=length / incomplete keep the legacy 50-char floor — those
+    are upstream truncations, not agent decisions, so short fragments
+    are unlikely to be real punts."""
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    sse = (
+        'data: {"choices":[{"delta":{"content":"trunc"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}\n\n'
+    )
+    soft_completion.accumulate_chunk("p3", sse.encode())
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p3",
+            local_base_url="http://127.0.0.1:1/v1",
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7,
+            short_text_threshold=50,
+            stop_text_threshold=1))
+    assert diag.skipped_reason == "short_text"
+    assert diag.finish_reason == "length"
+
+
+def test_default_config_has_low_stop_text_threshold():
+    from tinyctx.config import Config
+    cfg = Config()
+    assert cfg.soft_completion_short_text_threshold == 50
+    assert cfg.soft_completion_stop_text_threshold == 1
 
 
 def test_classify_user_content_includes_finish_reason_metadata():
@@ -896,3 +957,65 @@ def test_accumulate_tolerates_malformed_utf8():
     soft_completion.reset_state()
     soft_completion.accumulate_chunk("p1", b"\xe4 incomplete utf8")
     # Should not raise; chunk is silently coerced via errors='ignore'
+
+
+# ─── Bug D: conv_sid plumbing for soft-completion force-frontier flag ─────
+
+
+def test_force_frontier_flag_uses_conv_sid_when_supplied():
+    """The async classifier's force-frontier flag must be set under
+    conv_sid (matching the proxy's consume-side conv_sid-first check),
+    NOT under proj_sid. Otherwise a soft-punt classification from one
+    conversation can force-route a sibling conversation's next request."""
+    from tinyctx import soft_completion, empty_response_guard
+    soft_completion.reset_state()
+    empty_response_guard.reset_state()
+    proj = "global"
+    conv = f"{proj}:conv-1"
+
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk(proj, sse.encode())
+
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 0.95, "reason": "premature done"}')
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                proj,
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7,
+                force_frontier_threshold=0.85,
+                conv_sid=conv))
+        # Flag scoped to conv_sid — NOT to proj_sid.
+        assert empty_response_guard.peek_force_frontier(conv) is not None
+        assert empty_response_guard.peek_force_frontier(proj) is None
+    finally:
+        httpd.shutdown()
+
+
+def test_force_frontier_flag_falls_back_to_proj_sid_without_conv_sid():
+    """Back-compat: callers (or test paths) that don't pass conv_sid
+    still set the flag under proj_sid, preserving the legacy behavior
+    that test_auto_force_frontier_fires_on_high_p_punt depends on."""
+    from tinyctx import soft_completion, empty_response_guard
+    soft_completion.reset_state()
+    empty_response_guard.reset_state()
+
+    sse = 'data: {"delta":"' + 'x' * 250 + '"}\n\n'
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    httpd, port = _spawn_fake_backend(
+        '{"soft_punt": true, "p": 0.95, "reason": "premature done"}')
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url=f"http://127.0.0.1:{port}/v1",
+                local_model="fake",
+                threshold=0.7,
+                force_frontier_threshold=0.85))
+        # No conv_sid → flag lands under proj_sid as before.
+        assert empty_response_guard.peek_force_frontier("p1") is not None
+    finally:
+        httpd.shutdown()

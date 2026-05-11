@@ -184,3 +184,77 @@ def test_default_config_enabled_with_sane_threshold():
     # Threshold low enough to catch the 1-token failure mode but high
     # enough to allow brief acks ("OK", "Done.")
     assert 1 <= cfg.empty_response_min_completion_tokens <= 20
+
+
+# ─── multi-conversation isolation (conv_sid scoping) ─────────────────────
+
+
+def test_force_frontier_isolated_by_conversation():
+    """Flag set under one conv_sid must NOT be consumed by a different
+    conv_sid in the same project. Observed bug: user opened a fresh
+    conversation asking for gpt-5.4-mini and got force-routed to gpt-5.5
+    because an old flag from the previous conversation was still set."""
+    from tinyctx import empty_response_guard
+    empty_response_guard.reset_state()
+    proj = "cwd-hash:global"
+    conv_a = f"{proj}:019e0741-aaaa"
+    conv_b = f"{proj}:019e14c1-bbbb"
+    empty_response_guard.force_next_to_frontier(conv_a, "test")
+    assert empty_response_guard.consume_force_frontier(conv_b) is None
+    info = empty_response_guard.consume_force_frontier(conv_a)
+    assert info is not None
+
+
+def test_advisor_sub_thread_force_frontier_isolated():
+    """Force-frontier flag on advisor sub-thread (its own prompt_cache_key)
+    must NOT trigger force-frontier on the parent thread's next turn."""
+    from tinyctx import empty_response_guard
+    empty_response_guard.reset_state()
+    main = "proj:main-uuid"
+    advisor = "proj:advisor-uuid"
+    empty_response_guard.force_next_to_frontier(advisor, "advisor empty")
+    assert empty_response_guard.consume_force_frontier(main) is None
+
+
+def test_back_compat_when_no_conversation_id():
+    """When proxy falls back to proj_sid (no prompt_cache_key in body),
+    the flag still sets + consumes correctly — old usage keeps working."""
+    from tinyctx import empty_response_guard
+    empty_response_guard.reset_state()
+    empty_response_guard.force_next_to_frontier("proj-only", "manual")
+    info = empty_response_guard.consume_force_frontier("proj-only")
+    assert info is not None
+
+
+# ─── Bug B: consuming a conv_sid flag clears dangling proj_sid flag ──────
+
+
+def test_consume_conv_sid_flag_also_clears_proj_sid_flag():
+    """Mirrors the proxy.py consume path: when conv_sid flag is consumed
+    (returns truthy) we also unconditionally clear the proj_sid flag for
+    the same project. Without this, a dangling proj_sid flag set by
+    e.g. exec_resume / stall escalation that happened AFTER the conv_sid
+    flag would be picked up later by a DIFFERENT conversation's fallback
+    and force-route it for no reason."""
+    from tinyctx import empty_response_guard as _erg
+    _erg.reset_state()
+    proj_sid = "global"
+    conv_sid = f"{proj_sid}:conv-1"
+    # Both flags set: stall under conv_sid, then exec_resume under proj_sid.
+    _erg.force_next_to_frontier(conv_sid, "stall under conv")
+    _erg.force_next_to_frontier(proj_sid, "exec_resume under proj")
+    # Simulate proxy.py consume sequence.
+    force_info = _erg.consume_force_frontier(conv_sid)
+    if force_info is None and conv_sid != proj_sid:
+        force_info = _erg.consume_force_frontier(proj_sid)
+    elif force_info is not None and conv_sid != proj_sid:
+        _erg.reset_state(proj_sid)
+    assert force_info is not None
+    # The proj_sid flag is gone now — a different conversation's fallback
+    # must NOT find it.
+    other_conv = f"{proj_sid}:conv-2"
+    leftover = _erg.consume_force_frontier(proj_sid)
+    assert leftover is None
+    # And from the perspective of conv-2's exact same fallback chain:
+    assert _erg.consume_force_frontier(other_conv) is None
+    assert _erg.consume_force_frontier(proj_sid) is None

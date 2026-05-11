@@ -481,6 +481,7 @@ async def classify_at_stream_end(
         api_key: str | None = None,
         timeout_s: float = 30.0,
         threshold: float = 0.7,
+        conv_sid: str | None = None,
 ) -> ClassifyResult | None:
     """Run the LLM behavioral classifier against the accumulated stream
     buffer for `proj_sid`. Sets the per-session flag if verdict is
@@ -496,7 +497,8 @@ async def classify_at_stream_end(
     Never raises — silent fallback (no flag set) on backend error."""
     diag = await classify_at_stream_end_diag(
         proj_sid, local_base_url, local_model,
-        api_key=api_key, timeout_s=timeout_s, threshold=threshold)
+        api_key=api_key, timeout_s=timeout_s, threshold=threshold,
+        conv_sid=conv_sid)
     return diag.result
 
 
@@ -513,6 +515,9 @@ async def classify_at_stream_end_diag(
         progress_tracker: str = "",
         tool_summary: str = "",
         force_frontier_threshold: float = 1.01,  # 1.01 = effectively disabled
+        short_text_threshold: int = 50,
+        stop_text_threshold: int = 50,
+        conv_sid: str | None = None,
 ) -> ClassifyDiag:
     """Same as `classify_at_stream_end` but returns a `ClassifyDiag`
     capturing why the call returned None (for logging in the proxy
@@ -551,12 +556,17 @@ async def classify_at_stream_end_diag(
 
     text = _extract_text_from_buffer(raw)
     diag.extracted_text_chars = len(text)
-    # Short-text short-circuit: brief progress notes / acknowledgments
-    # don't carry enough signal for the classifier. 50-char threshold
-    # (lowered from 200 since we're now also using finish_reason as
-    # signal — short text + finish=stop is a brief confirmation, not
-    # a punt).
-    if len(text) < 50:
+    # Short-text short-circuit. Two thresholds because finish=stop and
+    # finish=length/incomplete have different signal density:
+    #   - finish=stop: agent decided to end the turn. Even very short
+    #     text ("Done." / "好的。") can be a real soft-punt to the user.
+    #     User directive C: classify ALL stops, no lower bound (effective
+    #     stop_text_threshold=1).
+    #   - finish=length/incomplete: stream was truncated by the upstream,
+    #     not the agent. Short text more likely indicates a partial
+    #     fragment than a real punt — keep the legacy 50-char floor.
+    floor = stop_text_threshold if finish == "stop" else short_text_threshold
+    if len(text) < floor:
         diag.skipped_reason = "short_text"
         return diag
 
@@ -635,8 +645,13 @@ async def classify_at_stream_end_diag(
         if result.p >= force_frontier_threshold:
             try:
                 from . import empty_response_guard as _erg
+                # Scope force-frontier escalation to the per-conversation
+                # key when known; the consumption site in proxy.py checks
+                # conv_sid first. Falls back to proj_sid for callers that
+                # haven't been migrated to pass conv_sid (back-compat).
+                flag_key = conv_sid if conv_sid else proj_sid
                 _erg.force_next_to_frontier(
-                    proj_sid,
+                    flag_key,
                     f"soft_punt p={result.p:.2f}: {result.reason[:60]}")
             except Exception:  # noqa: BLE001 — guard must never break classifier
                 pass

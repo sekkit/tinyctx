@@ -474,9 +474,8 @@ def test_proxy_passes_prompt_tiers_and_proj_sid_to_poke():
     the tier system + force_frontier-on-exhaustion fallback never
     trigger. Live trace 2026-05-10: linter added the tier system but
     the wiring is incomplete; this test guards the connection."""
-    import inspect
     from pathlib import Path
-    src = Path("/Users/sekkit/dev/tinyctx/tinyctx/proxy.py").read_text()
+    src = (Path(__file__).resolve().parent.parent / "tinyctx" / "proxy.py").read_text()
     # Find the _xr.poke( ... ) call site
     idx = src.find("_xr.poke(")
     assert idx != -1, "proxy.py must call _xr.poke(...) somewhere"

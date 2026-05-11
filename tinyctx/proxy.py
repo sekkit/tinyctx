@@ -339,6 +339,34 @@ def _project_session_key(request: Request, sid: str) -> str:
     return f"{cwd_hash}:{sid}"
 
 
+def _conversation_session_key(proj_sid: str, body: dict[str, Any]) -> str:
+    """Conversation-scoped composite key for per-thread state.
+
+    `proj_sid` is project-level (default "global" + cwd hash), so it
+    collapses every conversation in one project to the same key. Three
+    modules rely on per-conversation isolation: synthetic_continue's
+    injection counter, empty_response_guard's force-frontier flag, and
+    stuck_loop's per-turn reminder gate. Without conversation scoping
+    they leak across thread boundaries (a fresh conversation inherits
+    the previous one's budget) and across concurrent advisor sub-threads
+    (advisor activity bumps the main thread's counter).
+
+    Codex sends `prompt_cache_key` — a UUID stable across all turns of
+    one conversation/thread and distinct for separate threads (advisor
+    sub-threads spawn with their own key). It's stripped before being
+    forwarded upstream (see sanitize._DEFAULT_STRIP_FIELDS) so this only
+    reads the pristine incoming body.
+
+    Returns `f"{proj_sid}:{prompt_cache_key}"` when present, else just
+    `proj_sid` (back-compat: callers / older clients without the field
+    keep the old project-scoped behavior).
+    """
+    cck = body.get("prompt_cache_key") if isinstance(body, dict) else None
+    if not isinstance(cck, str) or not cck:
+        return proj_sid
+    return f"{proj_sid}:{cck}"
+
+
 _STALL_WATCHDOG_TASK: asyncio.Task | None = None
 
 
@@ -352,19 +380,24 @@ async def _start_stall_watchdog_on_startup() -> None:
     if not CFG.stall_watchdog_enabled:
         return
 
-    async def _on_stall(proj_sid: str) -> None:
+    async def _on_stall(proj_sid: str, conv_sid: str | None = None) -> None:
+        # Prefer conv_sid so the force-frontier flag scopes to ONE
+        # conversation; falling back to proj_sid only if conv_sid wasn't
+        # captured (older mark_event call sites or chat-completions path).
+        escalate_key = conv_sid if conv_sid else proj_sid
         try:
             _phase_set(proj_sid, RequestPhase.stalled, "")
         except Exception:  # noqa: BLE001
             pass
         try:
             from . import empty_response_guard as _erg
-            _erg.force_next_to_frontier(proj_sid, "mid_stream_stall")
+            _erg.force_next_to_frontier(escalate_key, "mid_stream_stall")
             _phase_set(proj_sid, RequestPhase.escalated_to_frontier, "")
         except Exception:  # noqa: BLE001
             pass
         try:
-            _log("stall_kill", session=proj_sid,
+            _log("stall_kill", session=proj_sid, conv_sid=conv_sid,
+                 escalate_key=escalate_key,
                  threshold_s=CFG.stall_threshold_s)
         except Exception:  # noqa: BLE001
             pass
@@ -377,7 +410,9 @@ async def _start_stall_watchdog_on_startup() -> None:
                     trigger="stall_kill",
                     response_buffer="",
                     extra={"threshold_s": CFG.stall_threshold_s,
-                           "escalation": "force_next_to_frontier"},
+                           "escalation": "force_next_to_frontier",
+                           "escalate_key": escalate_key,
+                           "conv_sid": conv_sid},
                     max_dumps=CFG.forensics_max_dumps,
                 )
             except Exception:  # noqa: BLE001
@@ -472,6 +507,12 @@ async def responses(request: Request) -> Any:
     # the user-visible session id is the codex one (not the prefix-hashed
     # composite).
     proj_sid = _project_session_key(request, sid)
+    # conv_sid scopes per-conversation state (synthetic_continue counter,
+    # empty_response_guard flag, stuck_loop reminder gate). Derived from
+    # `prompt_cache_key` which codex sends per-thread (stable across turns
+    # of one conversation, distinct for advisor sub-threads). Falls back
+    # to proj_sid when the field is absent so old behavior is preserved.
+    conv_sid = _conversation_session_key(proj_sid, body)
     trace = RequestTrace(session_id=sid)
     trace.project_session_key = proj_sid
     _phase_set(proj_sid, RequestPhase.received, trace.request_id)
@@ -531,7 +572,20 @@ async def responses(request: Request) -> Any:
     if CFG.empty_response_guard_enabled:
         try:
             from . import empty_response_guard as _erg
-            force_info = _erg.consume_force_frontier(proj_sid)
+            # Try conv-scoped key first; fall back to proj-scoped so flags
+            # set by mid-stream stall or upstream-error escalation (which
+            # don't have body access) still trigger frontier escalation.
+            force_info = _erg.consume_force_frontier(conv_sid)
+            if force_info is None and conv_sid != proj_sid:
+                force_info = _erg.consume_force_frontier(proj_sid)
+            elif force_info is not None and conv_sid != proj_sid:
+                # Consuming any flag for this proj_sid clears ALL flags
+                # under it (conv_sid-keyed + proj_sid-keyed). Without this,
+                # a dangling proj_sid flag (e.g. exec_resume set it later
+                # for the same project) would be consumed by a DIFFERENT
+                # conversation's next request via the fallback above —
+                # force-routing it for no reason.
+                _erg.reset_state(proj_sid)
             if force_info is not None:
                 decision = Decision(
                     "frontier",
@@ -566,7 +620,10 @@ async def responses(request: Request) -> Any:
         trace.forced_by_client_model = True
         # The agent invoked advisor — note timestamp so the stuck-loop
         # watchdog skips its grace window and doesn't nudge the parent
-        # session right after the agent already escalated.
+        # session right after the agent already escalated. Mark under
+        # proj_sid so any conversation in this project (incl. the parent
+        # that triggered the advisor) sees the grace; advisor's own
+        # conv_sid is separate and its watchdog state stays isolated.
         try:
             from . import stuck_loop
             stuck_loop.mark_advisor_call(proj_sid)
@@ -624,6 +681,24 @@ async def responses(request: Request) -> Any:
     trace.turn_count = decision.turn_count
     trace.error_streak = streak
 
+    # Compaction boundary: codex emitted a handoff-summary request, so
+    # the conversation's effective context is about to be rebuilt. Reset
+    # per-conversation counters that should be measured against the
+    # POST-compaction conversation, not the pre-compaction one. Without
+    # this, a session that accumulated N injections pre-compaction would
+    # trip the P2 budget cap (N + small_post_compact_count >= max) on
+    # otherwise-healthy compacted sessions.
+    if decision.is_compaction:
+        try:
+            from . import synthetic_continue as _syn_budget
+            from . import stuck_loop as _stuck
+            _syn_budget.reset_compaction_state(conv_sid, proj_sid=proj_sid)
+            _stuck.reset_compaction_state(conv_sid, proj_sid=proj_sid)
+            _log("compaction_state_reset", session=sid,
+                 conv_sid=conv_sid, trigger="incoming_is_compaction")
+        except Exception as e:  # noqa: BLE001
+            _log("compaction_reset_error", session=sid, error=str(e))
+
     # Stuck-loop watchdog: when turn_count climbs past the trigger
     # without a recent advisor call, append a `<system-reminder>` to
     # the input tail asking the agent to either consult advisor or
@@ -635,11 +710,18 @@ async def responses(request: Request) -> Any:
             and not trace.forced_by_client_model):
         try:
             from . import stuck_loop
+            # Key the reminder gate by conv_sid so a fresh conversation
+            # (codex turn_count resets to 0) doesn't get blocked by a
+            # stale `_LAST_REMINDER_TURN` from the previous conversation
+            # (e.g. 175 → `0 - 175 = -175 < 50` would skip forever).
+            # Advisor grace stays project-scoped so advisor activity in
+            # any sub-thread quiets nudges across all conversations.
             body, was_injected = stuck_loop.maybe_inject_stuck_reminder(
-                body, proj_sid, decision.turn_count,
+                body, conv_sid, decision.turn_count,
                 turn_trigger=CFG.stuck_loop_turn_trigger,
                 turn_gap=CFG.stuck_loop_turn_gap,
                 advisor_grace_s=CFG.stuck_loop_advisor_grace_s,
+                advisor_scope_sid=proj_sid,
             )
             if was_injected:
                 trace.stuck_reminder_injected = True
@@ -653,19 +735,19 @@ async def responses(request: Request) -> Any:
     # P2: injection-budget exhaustion reminder. When synthetic_continue
     # tripped its budget on the previous turn, append a one-shot
     # `<system-reminder>` warning the agent that tinyctx auto-continued
-    # N times and may have been wrong. The counter is keyed by `sid`
-    # because the stream-rewrite path increments under `sid` (matching
-    # the existing empty_response_guard pattern in _stream_proxy).
+    # N times and may have been wrong. Keyed by conv_sid so a fresh
+    # conversation in the same project starts with a clean budget
+    # instead of inheriting the previous thread's exhausted counter.
     # The flag is consumed on use so this never repeats next turn.
     if not decision.is_compaction and not trace.forced_by_client_model:
         try:
             from . import synthetic_continue as _syn_budget
-            inj_count = _syn_budget.injection_count(sid)
+            inj_count = _syn_budget.injection_count(conv_sid)
             if (inj_count >= CFG.max_continue_injections_per_session
                     and inj_count > 0):
                 body, was_budget_inj = (
                     _syn_budget.maybe_inject_budget_reminder(
-                        body, sid, inj_count))
+                        body, conv_sid, inj_count))
                 if was_budget_inj:
                     _log("budget_exhausted_reminder_injected",
                          session=sid, proj_sid=proj_sid,
@@ -830,6 +912,20 @@ async def responses(request: Request) -> Any:
             trace.proactive_compact_middle_compacted = pc_info.get("middle_items_compacted", 0)
             trace.proactive_compact_synthetic_calls = pc_info.get("synthetic_call_stubs", 0)
             _log("proactive_compact", session=sid, **pc_info)
+            # Outgoing-side compaction boundary: tinyctx itself truncated
+            # the middle of body.input. The post-truncation conversation
+            # is effectively a fresh context for the upstream model, so
+            # reset per-conversation injection budget + stuck-loop turn
+            # baseline to avoid premature P2 cap on healthy sessions.
+            try:
+                from . import synthetic_continue as _syn_budget
+                from . import stuck_loop as _stuck
+                _syn_budget.reset_compaction_state(conv_sid, proj_sid=proj_sid)
+                _stuck.reset_compaction_state(conv_sid, proj_sid=proj_sid)
+                _log("compaction_state_reset", session=sid,
+                     conv_sid=conv_sid, trigger="proactive_compact_applied")
+            except Exception as e:  # noqa: BLE001
+                _log("compaction_reset_error", session=sid, error=str(e))
     else:
         trace.proactive_compact_applied = False
         trace.proactive_compact_reason = (
@@ -1085,7 +1181,8 @@ async def responses(request: Request) -> Any:
                           translate_tool_calls=backend.translate_tool_calls,
                           chat_to_responses=(backend.wire_api != "responses"),
                           trace=trace,
-                          cwd=request.headers.get("x-codex-cwd") or "")
+                          cwd=request.headers.get("x-codex-cwd") or "",
+                          conv_sid=conv_sid)
 
 
 @APP.post("/v1/chat/completions")
@@ -1101,6 +1198,7 @@ async def chat_completions(request: Request) -> Any:
 
     sid = _session_id(request, body)
     proj_sid = _project_session_key(request, sid)
+    conv_sid = _conversation_session_key(proj_sid, body)
     streak = _SESSION_ERROR_STREAK[proj_sid]
     decision = decide(body, CFG, error_streak=streak)
     backend = _select_backend(decision)
@@ -1116,7 +1214,8 @@ async def chat_completions(request: Request) -> Any:
     url = backend.base_url.rstrip("/") + "/chat/completions"
     return await _forward(url, headers, body, bool(body.get("stream", False)),
                           proj_sid, decision,
-                          translate_tool_calls=backend.translate_tool_calls)
+                          translate_tool_calls=backend.translate_tool_calls,
+                          conv_sid=conv_sid)
 
 
 def _forward_headers(request: Request, backend: BackendCfg) -> dict[str, str]:
@@ -1140,7 +1239,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                    *, translate_tool_calls: bool = False,
                    chat_to_responses: bool = False,
                    trace: RequestTrace | None = None,
-                   cwd: str = "") -> Any:
+                   cwd: str = "",
+                   conv_sid: str | None = None) -> Any:
     # write=180s gives headroom for multi-megabyte request bodies on
     # slow uplinks. With a 2MB body and a stalled TCP send-window, the
     # old write=60s would fire before any keepalive could rescue the
@@ -1164,7 +1264,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                           translate_tool_calls=translate_tool_calls,
                           chat_to_responses=chat_to_responses,
                           trace=trace,
-                          cwd=cwd),
+                          cwd=cwd,
+                          conv_sid=conv_sid),
             media_type="text/event-stream",
         )
     started = time.time()
@@ -1225,7 +1326,13 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         translate_tool_calls: bool = False,
                         chat_to_responses: bool = False,
                         trace: RequestTrace | None = None,
-                        cwd: str = "") -> AsyncIterator[bytes]:
+                        cwd: str = "",
+                        conv_sid: str | None = None) -> AsyncIterator[bytes]:
+    # conv_sid is the per-conversation scope key for synthetic_continue
+    # injection budget and empty_response_guard flagging. Falls back to
+    # sid (which is itself proj_sid) when not provided by callers that
+    # haven't been migrated — preserves old project-scoped behavior.
+    erg_key = conv_sid if conv_sid is not None else sid
     started = time.time()
     bytes_out = 0
     status = 200
@@ -1396,7 +1503,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         status_code, err_body = payload
                         status = status_code
                         if CFG.stall_watchdog_enabled:
-                            _stall.mark_event(sid)
+                            _stall.mark_event(sid, conv_sid=conv_sid)
                         if err_body is not None:
                             _SESSION_ERROR_STREAK[sid] += 1
                             _log("upstream_error", session=sid,
@@ -1435,7 +1542,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     # tag is None → real response-body chunk
                     bytes_out += len(payload)
                     if CFG.stall_watchdog_enabled:
-                        _stall.mark_event(sid)
+                        _stall.mark_event(sid, conv_sid=conv_sid)
                     # Soft-completion accumulator: just buffer the bytes,
                     # the LLM behavioral classifier runs ONCE at stream
                     # end (see finally block below). We don't decide
@@ -1514,17 +1621,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             # analysis confirmed codex silently drops it.
                             from . import synthetic_continue as _syn
                             inj_events, strategy = _syn.build_continue_injection(
-                                sid,
+                                erg_key,
                                 max_injections=CFG.max_continue_injections_per_session,
                             )
                             if strategy["label"] == "budget_exhausted":
                                 from . import empty_response_guard as _erg_budget
                                 _erg_budget.force_next_to_frontier(
-                                    sid, "injection_budget_exhausted")
+                                    erg_key, "injection_budget_exhausted")
                                 _log("soft_completion_stream_rewrite_budget_exhausted",
                                      session=sid,
                                      p=diag.result.p,
-                                     injection_count=_syn.injection_count(sid),
+                                     injection_count=_syn.injection_count(erg_key),
                                      max_injections=CFG.max_continue_injections_per_session)
                             else:
                                 for evt in inj_events:
@@ -1536,7 +1643,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                      strategy=strategy["label"],
                                      tool_name=strategy["tool_name"],
                                      task_chars=len(task_body),
-                                     injection_count=_syn.injection_count(sid))
+                                     injection_count=_syn.injection_count(erg_key))
                             if trace is not None:
                                 trace.soft_completion_gate_injected = True
                                 trace.soft_completion_gate_pattern = (
@@ -1626,7 +1733,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         async for chunk in r.aiter_raw():
                             bytes_out += len(chunk)
                             if CFG.stall_watchdog_enabled:
-                                _stall.mark_event(sid)
+                                _stall.mark_event(sid, conv_sid=conv_sid)
                             # Soft-completion accumulator (no-keepalive path).
                             # LLM classifier runs at stream end.
                             if CFG.soft_completion_gate_enabled:
@@ -1678,7 +1785,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 # error sets the streak; subsequent errors trip escalation.
                 if _SESSION_ERROR_STREAK[sid] > CFG.upstream_retry_count:
                     _erg.force_next_to_frontier(
-                        sid,
+                        erg_key,
                         f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[sid]}")
                     _phase_set(sid, RequestPhase.escalated_to_frontier,
                                trace.request_id if trace is not None else "")
@@ -1792,6 +1899,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 else 1.01),
                             short_text_threshold=CFG.soft_completion_short_text_threshold,
                             stop_text_threshold=CFG.soft_completion_stop_text_threshold,
+                            conv_sid=conv_sid,
                         )
                         # Always log the outcome — even None paths, so
                         # silent-skip cases are diagnosable. One of the
@@ -1902,7 +2010,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 from . import soft_completion as _sc
                 buf_for_check = _sc._OUTPUT_BUFFER.get(sid, "")
                 info = _erg.maybe_flag_empty_response(
-                    sid, buf_for_check,
+                    erg_key, buf_for_check,
                     min_completion_tokens=CFG.empty_response_min_completion_tokens)
                 if info is not None:
                     _log("empty_response_detected", session=sid,

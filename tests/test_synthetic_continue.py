@@ -246,3 +246,163 @@ def test_config_default_max_continue_injections():
     cfg = Config()
     assert cfg.max_continue_injections_per_session > 0
     assert cfg.max_continue_injections_per_session <= 100
+
+
+# ─── multi-conversation isolation (conv_sid scoping) ─────────────────────
+
+
+def test_injection_count_isolated_by_conversation():
+    """Two conversations under the same project (different conv_sid keys)
+    must NOT share their injection budget counter — a new conversation
+    starts with a fresh budget."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    proj = "cwd-hash:global"
+    conv_a = f"{proj}:019e0741-aaaa"
+    conv_b = f"{proj}:019e14c1-bbbb"
+    for _ in range(5):
+        _syn.build_continue_injection(conv_a, max_injections=20)
+    assert _syn.injection_count(conv_a) == 5
+    assert _syn.injection_count(conv_b) == 0
+    _syn.build_continue_injection(conv_b, max_injections=20)
+    assert _syn.injection_count(conv_a) == 5
+    assert _syn.injection_count(conv_b) == 1
+
+
+def test_advisor_sub_thread_does_not_pollute_main_thread():
+    """Advisor sub-thread carries its own prompt_cache_key → its own
+    conv_sid. Bumping advisor's counter must leave the parent thread's
+    counter untouched."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    proj = "p"
+    main = f"{proj}:main-uuid"
+    advisor = f"{proj}:advisor-uuid"
+    for _ in range(3):
+        _syn.build_continue_injection(main, max_injections=20)
+    for _ in range(7):
+        _syn.build_continue_injection(advisor, max_injections=20)
+    assert _syn.injection_count(main) == 3
+    assert _syn.injection_count(advisor) == 7
+
+
+def test_back_compat_when_no_conversation_id():
+    """When proxy falls back to proj_sid (no prompt_cache_key in body),
+    the counter still increments and the budget still enforces — old
+    single-conversation usage keeps working."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    proj = "global"  # no conv key suffix
+    for _ in range(3):
+        _syn.build_continue_injection(proj, max_injections=3)
+    assert _syn.is_over_budget(proj, max_injections=3)
+
+
+# ─── Bug 4: compaction-boundary reset for injection budget ────────────────
+
+
+def test_reset_compaction_state_clears_injection_count():
+    """Pre-compaction injections shouldn't count against the post-
+    compaction budget — the conversation effectively restarted."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    conv = "p:conv-a"
+    for _ in range(18):
+        _syn.build_continue_injection(conv, max_injections=20)
+    assert _syn.injection_count(conv) == 18
+    _syn.reset_compaction_state(conv)
+    assert _syn.injection_count(conv) == 0
+    # And new injections start clean
+    _syn.build_continue_injection(conv, max_injections=20)
+    assert _syn.injection_count(conv) == 1
+
+
+def test_reset_compaction_state_clears_budget_reminder_flag():
+    """The one-shot budget-reminder flag must reset too, otherwise the
+    post-compaction conversation can't surface another budget-exhausted
+    nudge if it cycles through the budget again."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    conv = "p:conv-a"
+    body = {"input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "x"}]}]}
+    _, fired = _syn.maybe_inject_budget_reminder(body, conv, count=20)
+    assert fired is True
+    _syn.reset_compaction_state(conv)
+    # After compaction, the gate is free to fire again
+    _, fired2 = _syn.maybe_inject_budget_reminder(body, conv, count=20)
+    assert fired2 is True
+
+
+def test_reset_compaction_state_isolated_per_conversation():
+    """Compaction in conv A must NOT touch conv B's counters."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    proj = "p"
+    conv_a = f"{proj}:aaa"
+    conv_b = f"{proj}:bbb"
+    for _ in range(5):
+        _syn.build_continue_injection(conv_a, max_injections=20)
+    for _ in range(7):
+        _syn.build_continue_injection(conv_b, max_injections=20)
+    _syn.reset_compaction_state(conv_a)
+    assert _syn.injection_count(conv_a) == 0
+    assert _syn.injection_count(conv_b) == 7
+
+
+def test_reset_compaction_state_handles_none_gracefully():
+    """conv_sid may be None/empty — call must be a no-op without raising."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    _syn.reset_compaction_state(None)
+    _syn.reset_compaction_state("")
+    # No exception — done.
+
+
+def test_reset_compaction_state_prefix_sweeps_when_proj_sid_supplied():
+    """Codex's compaction-handoff request can omit `prompt_cache_key`,
+    degrading conv_sid to proj_sid for that one request. But normal-turn
+    keys for the SAME project look like `f"{proj_sid}:{cache_key}"`. The
+    naive `pop(proj_sid)` clears nothing under those keys. When the
+    caller supplies `proj_sid`, every key matching `proj_sid` OR
+    `f"{proj_sid}:..."` must be cleared; other projects untouched."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    _syn._INJECTION_COUNT_PER_SESSION["global:abc"] = 5
+    _syn._INJECTION_COUNT_PER_SESSION["global:def"] = 3
+    _syn._INJECTION_COUNT_PER_SESSION["other:xyz"] = 7
+    _syn._LAST_BUDGET_REMINDER_FIRED["global:abc"] = True
+    _syn._LAST_BUDGET_REMINDER_FIRED["other:xyz"] = True
+    # Compaction handoff body lacks prompt_cache_key so conv_sid degrades
+    # to proj_sid ("global"). Caller supplies both.
+    _syn.reset_compaction_state("global", proj_sid="global")
+    assert "global:abc" not in _syn._INJECTION_COUNT_PER_SESSION
+    assert "global:def" not in _syn._INJECTION_COUNT_PER_SESSION
+    assert _syn._INJECTION_COUNT_PER_SESSION.get("other:xyz") == 7
+    assert "global:abc" not in _syn._LAST_BUDGET_REMINDER_FIRED
+    assert _syn._LAST_BUDGET_REMINDER_FIRED.get("other:xyz") is True
+
+
+def test_reset_compaction_state_prefix_sweep_also_clears_bare_proj_sid_entry():
+    """A flag stored DIRECTLY under `proj_sid` (legacy path / cold-start
+    compaction with no prior conv_sid) must also be cleared by the
+    prefix sweep, alongside per-conv entries."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    _syn._INJECTION_COUNT_PER_SESSION["global"] = 9
+    _syn._INJECTION_COUNT_PER_SESSION["global:c1"] = 4
+    _syn.reset_compaction_state("global", proj_sid="global")
+    assert "global" not in _syn._INJECTION_COUNT_PER_SESSION
+    assert "global:c1" not in _syn._INJECTION_COUNT_PER_SESSION
+
+
+def test_reset_compaction_state_back_compat_single_arg_still_pops_conv_sid_only():
+    """Old callers that only pass conv_sid must still work — no prefix
+    sweep happens without proj_sid, only the exact key is popped."""
+    from tinyctx import synthetic_continue as _syn
+    _syn.reset_state()
+    _syn._INJECTION_COUNT_PER_SESSION["global:abc"] = 5
+    _syn._INJECTION_COUNT_PER_SESSION["global:def"] = 3
+    _syn.reset_compaction_state("global:abc")
+    assert "global:abc" not in _syn._INJECTION_COUNT_PER_SESSION
+    assert _syn._INJECTION_COUNT_PER_SESSION.get("global:def") == 3
