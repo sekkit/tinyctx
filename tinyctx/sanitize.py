@@ -38,6 +38,16 @@ _REASONING_ITEM_TYPES = {"reasoning", "reasoning_summary", "thinking"}
 _TOOL_CALL_TYPES = {"function_call", "tool_use", "mcp_call"}
 _TOOL_RESULT_TYPES = {"function_call_output", "tool_result", "mcp_result"}
 
+# Output-style items the Responses API requires to be paired with a prior
+# matching call-style item carrying the same `call_id`. Superset of
+# `_TOOL_RESULT_TYPES` — adds the Codex 0.128+ tool-search shape, which
+# we don't synthesize stubs for (we just drop orphans). See
+# `drop_orphan_tool_outputs` below.
+_ORPHAN_PAIR_OUTPUT_TYPES = (
+    _TOOL_RESULT_TYPES | {"tool_search_output"})
+_ORPHAN_PAIR_CALL_TYPES = (
+    _TOOL_CALL_TYPES | {"tool_search_call"})
+
 _DEDUP_PLACEHOLDER = "[tinyctx: identical call deduped — see later turn]"
 _FAILED_PURGE_PLACEHOLDER = "[tinyctx: failed input purged after N turns]"
 
@@ -1206,6 +1216,65 @@ def trim_tools_for_frontier(
     info["tools_after"] = len(kept)
     info["kept_names"] = sorted({t.get("name","") for t in kept if isinstance(t, dict)})
     info["dropped_names"] = sorted(dropped_names)
+    return out, info
+
+
+def drop_orphan_tool_outputs(
+    body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Final preflight: remove orphan tool-output items from `body.input`.
+
+    The Responses API rejects an output item (function_call_output,
+    tool_result, mcp_result, tool_search_output) whose `call_id` has no
+    matching call item earlier in the input. chatgpt.com codex backend
+    returns HTTP 400:
+        "No tool call found for tool search output with call_id ..."
+
+    Orphans can arise from several upstream sources we don't fully
+    control: proactive_compact eliding the matching call from the
+    middle (handled for function_call types via stub synthesis; not
+    handled for tool_search_call), codex client reordering, history
+    dedup placeholders, or upstream client bugs. This pass is a
+    belt-and-suspenders defense that runs after every other sanitize
+    step so it catches orphans regardless of cause.
+
+    Asymmetry note: an orphan CALL without a matching output is benign
+    per OpenAI semantics (means the call didn't produce output yet, or
+    the output is in this turn's response). We do NOT drop those.
+
+    Returns (new_body, info). info keys:
+        applied: bool   — at least one orphan dropped
+        dropped: int    — count of orphan items removed
+        call_ids: list  — orphan call_ids dropped (for logging)
+    """
+    info: dict[str, Any] = {"applied": False, "dropped": 0, "call_ids": []}
+    items = body.get("input")
+    if not isinstance(items, list):
+        return body, info
+    call_ids = {
+        it.get("call_id") or it.get("id")
+        for it in items
+        if isinstance(it, dict)
+        and it.get("type") in _ORPHAN_PAIR_CALL_TYPES
+    }
+    call_ids.discard(None)
+    call_ids.discard("")
+    new_items: list = []
+    dropped_call_ids: list[str] = []
+    for it in items:
+        if isinstance(it, dict) and it.get("type") in _ORPHAN_PAIR_OUTPUT_TYPES:
+            cid = it.get("call_id") or it.get("id") or ""
+            if cid and cid not in call_ids:
+                dropped_call_ids.append(cid)
+                continue
+        new_items.append(it)
+    if not dropped_call_ids:
+        return body, info
+    out = dict(body)
+    out["input"] = new_items
+    info["applied"] = True
+    info["dropped"] = len(dropped_call_ids)
+    info["call_ids"] = dropped_call_ids
     return out, info
 
 

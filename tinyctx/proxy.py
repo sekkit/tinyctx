@@ -51,6 +51,7 @@ from .sanitize import (
     CacheAwareMutator,
     cap_responses_fields,
     dedup_tool_calls,
+    drop_orphan_tool_outputs,
     inject_responses_defaults,
     normalize_for_chat,
     proactive_compact,
@@ -1161,6 +1162,17 @@ async def responses(request: Request) -> Any:
         trace.forwarded_breakdown = breakdown
     except Exception:  # noqa: BLE001 — instrumentation must never fail forward
         pass
+
+    # Final preflight: drop orphan tool-output items whose call_id has no
+    # matching call earlier in body.input. Catches residuals from
+    # proactive_compact (tool_search_call elided from middle), client
+    # reordering, or upstream bugs. chatgpt.com 400s on these.
+    if CFG.drop_orphan_tool_outputs:
+        forward_body, _orphan_info = drop_orphan_tool_outputs(forward_body)
+        if _orphan_info["applied"]:
+            _log("orphan_tool_output_dropped", session=sid,
+                 dropped=_orphan_info["dropped"],
+                 call_ids=_orphan_info["call_ids"])
 
     # Capture request snapshot for forensics. When an empty response or
     # high-confidence PUNT triggers later, write_forensics_dump will pair

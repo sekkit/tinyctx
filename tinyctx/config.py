@@ -205,6 +205,15 @@ class Config:
     # them. Avoids the "encrypted content could not be decrypted" crash.
     sanitize_encrypted_content: bool = True
 
+    # Final preflight defense: drop tool-output items (function_call_output,
+    # tool_result, mcp_result, tool_search_output) whose call_id has no
+    # matching call item earlier in body.input. chatgpt.com codex backend
+    # 400s on orphans with "No tool call found for tool search output with
+    # call_id ...". Orphans can leak through proactive_compact (when the
+    # matching call is a tool_search_call we don't synthesize a stub for),
+    # client reordering, or upstream bugs. Default ON.
+    drop_orphan_tool_outputs: bool = True
+
     # Rewrite `body.input[*].role` values that strict local OpenAI-compat
     # backends reject. codex 0.128+ emits `role="developer"` for system-level
     # instructions; older / community LMStudio builds (and the remote tunnel
