@@ -26,6 +26,246 @@ def _env(name: str, default: str | None = None) -> str | None:
     return v if v not in (None, "") else default
 
 
+# ---------------------------------------------------------------------------
+# Namespaced views (P8)
+#
+# Config grew organically to 50+ top-level flags spanning routing, retry,
+# stall detection, compaction, forensics, guards, etc. The flat layout
+# makes discovery hard (which flags are related?). P8 introduces *view*
+# proxies — `cfg.routing`, `cfg.stall`, `cfg.retry`, `cfg.compact`,
+# `cfg.guards`, `cfg.stuck_loop`, `cfg.forensics` — that surface related
+# flags under a single namespace.
+#
+# Critical: BACK-COMPAT IS NON-NEGOTIABLE. The views do NOT own the
+# storage; they forward both reads and writes back to the canonical
+# top-level Config attributes. This means:
+#
+#   * Existing call sites (`cfg.force_route`, `cfg.proactive_compact_threshold`,
+#     ...) keep working unchanged.
+#   * TOML deserialization (`setattr(cfg, k, v)` on flat keys from the
+#     [server] / [routing] / [local] / [frontier] sections) keeps working.
+#   * New code can use the more legible nested form: `cfg.routing.force_route`.
+#   * ~/.tinyctx/config.toml requires NO user migration — the file format
+#     is unchanged.
+#
+# The mapping from view-attribute → top-level-attribute is declared per
+# view via the `_FIELD_MAP` class var. Unknown attributes raise
+# AttributeError (no silent typo swallow).
+# ---------------------------------------------------------------------------
+
+
+class _NSView:
+    """Base for namespaced views over a parent Config.
+
+    Subclasses declare `_FIELD_MAP: dict[str, str]` mapping the view's
+    short attribute name → the canonical Config attribute name. The
+    view holds a weak-style reference to its parent Config and forwards
+    attribute access in both directions.
+    """
+
+    _FIELD_MAP: dict[str, str] = {}
+
+    __slots__ = ("_parent",)
+
+    def __init__(self, parent: "Config") -> None:
+        # __slots__ + bypass __setattr__ for the parent ref.
+        object.__setattr__(self, "_parent", parent)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only called for misses on _FIELD_MAP / _parent / dunder paths.
+        fmap = type(self)._FIELD_MAP
+        if name in fmap:
+            return getattr(self._parent, fmap[name])
+        raise AttributeError(
+            f"{type(self).__name__!s} has no attribute {name!r} "
+            f"(known: {sorted(fmap)})"
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        fmap = type(self)._FIELD_MAP
+        if name in fmap:
+            setattr(self._parent, fmap[name], value)
+            return
+        # No silent extension — surface the typo.
+        raise AttributeError(
+            f"{type(self).__name__!s} has no settable attribute {name!r} "
+            f"(known: {sorted(fmap)})"
+        )
+
+    def __repr__(self) -> str:  # debug-friendly
+        items = ", ".join(
+            f"{k}={getattr(self._parent, v, '?')!r}"
+            for k, v in type(self)._FIELD_MAP.items()
+        )
+        return f"{type(self).__name__}({items})"
+
+
+class RoutingView(_NSView):
+    """Routing thresholds and overrides.
+
+    Groups flags that influence the local-vs-frontier route decision
+    (see `tinyctx/router.py`). Forwards to top-level Config attributes;
+    TOML section `[routing]` already targets these flat keys.
+
+    Fields:
+      force_route: One of {"auto","local","frontier"} — admin pin.
+      escalate_on_error_streak: After N consecutive tool failures, escalate.
+      escalate_input_tokens: Absolute token threshold for size-based
+        escalation. 0 = disabled (Advisor-Strategy default).
+      redirect_compaction_to_local: Route codex's compaction handoff
+        prompt to local. The highest-leverage cost win.
+      self_classify_threshold: Local model's P(escalate) cutoff.
+    """
+
+    _FIELD_MAP = {
+        "force_route": "force_route",
+        "escalate_on_error_streak": "escalate_on_error_streak",
+        "escalate_input_tokens": "escalate_input_tokens",
+        "redirect_compaction_to_local": "redirect_compaction_to_local",
+        "self_classify_threshold": "self_classify_threshold",
+    }
+
+
+class StallView(_NSView):
+    """Mid-stream stall watchdog + SSE keepalive.
+
+    See `tinyctx/stall_watchdog.py` and `tinyctx/stream_relay.py`.
+
+    Fields:
+      stall_watchdog_enabled: Master switch.
+      stall_threshold_s: Seconds without upstream events before declaring stall.
+      stall_check_interval_s: Watchdog wakeup cadence.
+      stream_keepalive_interval_s: SSE comment cadence to keep clients alive.
+    """
+
+    _FIELD_MAP = {
+        "stall_watchdog_enabled": "stall_watchdog_enabled",
+        "stall_threshold_s": "stall_threshold_s",
+        "stall_check_interval_s": "stall_check_interval_s",
+        "stream_keepalive_interval_s": "stream_keepalive_interval_s",
+    }
+
+
+class RetryView(_NSView):
+    """Unified retry policy (see `tinyctx/retry_policy.py`).
+
+    Fields:
+      upstream_retry_enabled: Master switch for mid-stream retry.
+      upstream_retry_count: Same-backend retry budget per request.
+      upstream_retry_max_bytes_yielded: Above this, retry is unsafe
+        (content already partially sent to client).
+      retry_on_local_4xx_escalate_frontier: On local 400/422, try
+        frontier (chatgpt.com is more permissive about codex shapes).
+      retry_on_frontier_4xx: Off by default — frontier 4xx rarely
+        succeeds on retry with the same body.
+      max_total_retries_per_request: Hard safety cap across all retry
+        kinds for a single request.
+    """
+
+    _FIELD_MAP = {
+        "upstream_retry_enabled": "upstream_retry_enabled",
+        "upstream_retry_count": "upstream_retry_count",
+        "upstream_retry_max_bytes_yielded": "upstream_retry_max_bytes_yielded",
+        "retry_on_local_4xx_escalate_frontier": "retry_on_local_4xx_escalate_frontier",
+        "retry_on_frontier_4xx": "retry_on_frontier_4xx",
+        "max_total_retries_per_request": "max_total_retries_per_request",
+    }
+
+
+class CompactView(_NSView):
+    """Proactive history compaction thresholds and policy.
+
+    See `effective_proactive_compact_threshold()` for the resolution
+    algorithm. Threshold derivation prefers
+    `frontier.context_window * safe_fraction` and falls back to the
+    absolute `proactive_compact_threshold`.
+
+    Fields:
+      proactive_compact_threshold: Absolute fallback threshold (tokens).
+      proactive_compact_overhead_buffer: Subtracted from the derived
+        threshold to account for tinyctx's own injections.
+      proactive_compact_only_on_frontier: Skip for local route (1M ctx).
+      proactive_compact_safe_fraction: Fraction of frontier.context_window
+        used as trigger. 0.0 = disable auto-derivation.
+      proactive_compact_recent_keep: Number of recent turns kept verbatim.
+      proactive_compact_use_summarizer: Use LLM call vs deterministic
+        placeholder.
+    """
+
+    _FIELD_MAP = {
+        "proactive_compact_threshold": "proactive_compact_threshold",
+        "proactive_compact_overhead_buffer": "proactive_compact_overhead_buffer",
+        "proactive_compact_only_on_frontier": "proactive_compact_only_on_frontier",
+        "proactive_compact_safe_fraction": "proactive_compact_safe_fraction",
+        "proactive_compact_recent_keep": "proactive_compact_recent_keep",
+        "proactive_compact_use_summarizer": "proactive_compact_use_summarizer",
+    }
+
+
+class GuardsView(_NSView):
+    """Request-body guards: continue-injection budget, role rewrites,
+    orphan tool-output drop, unknown-tool-call protection.
+
+    Fields:
+      max_continue_injections_per_session: Per-session synthetic-continue
+        budget before tinyctx stops nudging and force-frontiers.
+      local_role_rewrite_enabled: Rewrite `role="developer"` -> `system`
+        for strict local OpenAI-compat backends.
+      local_role_rewrite_map: Source-role -> target-role mapping.
+      drop_orphan_tool_outputs: Strip tool-output items whose call_id has
+        no matching call earlier in body.input (chatgpt.com 400s on
+        orphans).
+      unknown_tool_call_protection: Replace local-model function_calls
+        whose name isn't in the codex tool registry with a benign
+        `shell ["echo", ...]` stub so the session self-corrects.
+    """
+
+    _FIELD_MAP = {
+        "max_continue_injections_per_session": "max_continue_injections_per_session",
+        "local_role_rewrite_enabled": "local_role_rewrite_enabled",
+        "local_role_rewrite_map": "local_role_rewrite_map",
+        "drop_orphan_tool_outputs": "drop_orphan_tool_outputs",
+        "unknown_tool_call_protection": "unknown_tool_call_protection",
+    }
+
+
+class StuckLoopView(_NSView):
+    """Stuck-loop watchdog (see `tinyctx/stuck_loop.py`).
+
+    Note: the view uses SHORT names (`turn_trigger`, `turn_gap`,
+    `advisor_grace_s`) while the underlying Config attributes keep their
+    `stuck_loop_` prefix for back-compat with existing call sites.
+
+    Fields:
+      turn_trigger: Minimum turn_count before a session is "stuck".
+      turn_gap: Minimum turns between consecutive watchdog reminders.
+      advisor_grace_s: Skip nudge if advisor was called within this many
+        seconds.
+    """
+
+    _FIELD_MAP = {
+        "turn_trigger": "stuck_loop_turn_trigger",
+        "turn_gap": "stuck_loop_turn_gap",
+        "advisor_grace_s": "stuck_loop_advisor_grace_s",
+    }
+
+
+class ForensicsView(_NSView):
+    """Forensic dump policy (see `tinyctx/forensics.py`).
+
+    Fields:
+      forensics_enabled: Master switch.
+      forensics_capture_errors: Dump on upstream errors / stream errors.
+      forensics_capture_punts: Dump on high-confidence PUNT verdicts.
+    """
+
+    _FIELD_MAP = {
+        "forensics_enabled": "forensics_enabled",
+        "forensics_capture_errors": "forensics_capture_errors",
+        "forensics_capture_punts": "forensics_capture_punts",
+    }
+
+
 @dataclass
 class BackendCfg:
     base_url: str
@@ -764,6 +1004,31 @@ class Config:
 
     # Verbose JSONL logging
     verbose: bool = field(default_factory=lambda: (_env("TINYCTX_VERBOSE", "1") or "1") == "1")
+
+    # ── P8 namespaced views over related top-level flags ────────────────
+    # These do NOT own storage; they forward attribute access to the
+    # canonical fields above so old call sites (`cfg.force_route`, etc.)
+    # and TOML parsing (flat keys) keep working untouched. New code can
+    # use the more legible nested form (`cfg.routing.force_route`).
+    # Constructed in `__post_init__`.
+    routing: "RoutingView" = field(init=False, repr=False)
+    stall: "StallView" = field(init=False, repr=False)
+    retry: "RetryView" = field(init=False, repr=False)
+    compact: "CompactView" = field(init=False, repr=False)
+    guards: "GuardsView" = field(init=False, repr=False)
+    stuck_loop: "StuckLoopView" = field(init=False, repr=False)
+    forensics: "ForensicsView" = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Bind one view-per-instance so mutating one Config cannot bleed
+        # into another (see test_namespace_views_are_per_instance).
+        self.routing = RoutingView(self)
+        self.stall = StallView(self)
+        self.retry = RetryView(self)
+        self.compact = CompactView(self)
+        self.guards = GuardsView(self)
+        self.stuck_loop = StuckLoopView(self)
+        self.forensics = ForensicsView(self)
 
 
 def effective_proactive_compact_threshold(cfg: "Config") -> int:
