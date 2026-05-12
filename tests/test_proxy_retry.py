@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 from unittest.mock import patch
 
@@ -769,3 +770,259 @@ class TestRequestRetryState:
         s.record_escalation()
         assert s.attempts_used == 1
         assert s.escalations_used == 1
+
+
+# ─── stall-timer reset on retry boundary ─────────────────────────────────
+#
+# Diagnosed 2026-05-12: a request was wedged with phase=stalled for ~80s
+# with no events. Sequence: LMStudio 400 at T+14.6s → retry_escalate to
+# frontier → frontier silently awaits first byte. The LAST mark_event was
+# at T+14.6s (the 400 arrival), so stall_watchdog wouldn't fire until
+# T+14.6+180 = T+194.6s. Codex's own client-side idle timeout fires first
+# (~60-120s) and the user sees "task interrupted".
+#
+# Fix: every time the retry layer escalates or retries, call mark_event
+# to reset the 180s stall window for the NEW upstream attempt.
+
+
+class TestRetryResetsStallTimer:
+    """Each retry attempt (same backend or escalate) must reset the stall
+    watchdog's last-event timestamp via mark_event(proj_sid, conv_sid).
+    Otherwise the watchdog won't fire on the new attempt's silence until
+    `(time-of-previous-failure + 180s)` — far too late."""
+
+    @pytest.mark.asyncio
+    async def test_forward_nonstream_retry_calls_mark_event(self, proxy_module):
+        from tinyctx import stall_watchdog as _sw
+        _sw.reset_state()
+        # Spy on mark_event.
+        calls: list[tuple[str, str | None]] = []
+        real_mark = _sw.mark_event
+
+        def spy_mark(proj_sid, conv_sid=None):
+            calls.append((proj_sid, conv_sid))
+            return real_mark(proj_sid, conv_sid=conv_sid)
+
+        responses = [
+            (400, {"error": {"message": "schema mismatch"}}),  # local 400
+            (200, {"id": "resp", "output": [], "tag": "frontier_ok"}),
+        ]
+        post_fn, state = _make_mock_post(responses)
+        with patch.object(httpx.AsyncClient, "post", post_fn), \
+             patch.object(proxy_module._stall, "mark_event", spy_mark):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-retry-mark")
+            await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json"},
+                {"model": "qwen-test", "input": []},
+                is_stream=False,
+                sid="s-retry-mark",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-retry-mark",
+            )
+        # Two upstream attempts (local 400 → frontier escalate).
+        assert len(state["calls"]) == 2
+        # mark_event must have been called for proj_sid=s-retry-mark
+        # at least once on the retry boundary, with conv_sid=conv-retry-mark.
+        mark_calls = [(p, c) for (p, c) in calls if p == "s-retry-mark"]
+        assert mark_calls, (
+            "expected mark_event(proj_sid='s-retry-mark', ...) to be called "
+            "on the retry boundary so the stall watchdog's 180s window "
+            f"resets for the new attempt; got calls={calls}"
+        )
+        # And the conv_sid must be plumbed through.
+        assert any(c == "conv-retry-mark" for (_, c) in mark_calls), (
+            f"expected at least one mark_event call with "
+            f"conv_sid='conv-retry-mark'; got mark_calls={mark_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_retry_calls_mark_event(
+            self, proxy_module, monkeypatch):
+        """The CRITICAL ordering: mark_event must be called BEFORE the
+        next upstream stream attempt opens. Without this, the watchdog
+        won't fire on the new attempt's silence until
+        `(time-of-previous-failure + 180s)` — leaving codex to time out
+        first."""
+        from tinyctx import stall_watchdog as _sw
+        monkeypatch.setattr(proxy_module.CFG,
+                            "stream_keepalive_interval_s", 1.0)
+        _sw.reset_state()
+        # Shared event log: ("mark", proj, conv) or ("stream", url).
+        events: list[tuple] = []
+        real_mark = _sw.mark_event
+
+        def spy_mark(proj_sid, conv_sid=None):
+            events.append(("mark", proj_sid, conv_sid))
+            return real_mark(proj_sid, conv_sid=conv_sid)
+
+        scripts = [
+            ("err", 400, b'{"error":"schema mismatch"}'),  # local 400
+            ("ok", [b'event: response.completed\ndata: {"type":"response.completed"}\n\n']),
+        ]
+        stream_fn_inner, state = _make_mock_stream(scripts)
+
+        def spy_stream(self, method, url, **kwargs):
+            events.append(("stream", url))
+            return stream_fn_inner(self, method, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "stream", spy_stream), \
+             patch.object(proxy_module._stall, "mark_event", spy_mark):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-stream-retry-mark")
+            sr = await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json"},
+                {"model": "qwen-test", "input": []},
+                is_stream=True,
+                sid="s-stream-retry-mark",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-stream-retry-mark",
+            )
+            await _drain_stream(sr)
+        assert len(state["calls"]) == 2, (
+            f"expected 2 upstream stream attempts; got {state['calls']}"
+        )
+        # Find the indices of the two stream calls and any mark_event
+        # call for this proj_sid that falls BETWEEN them.
+        stream_idxs = [i for i, e in enumerate(events) if e[0] == "stream"]
+        assert len(stream_idxs) == 2
+        between = [
+            e for e in events[stream_idxs[0] + 1: stream_idxs[1]]
+            if e[0] == "mark" and e[1] == "s-stream-retry-mark"
+        ]
+        assert between, (
+            "expected mark_event(proj_sid='s-stream-retry-mark', ...) to "
+            "be called AFTER the first (failed) upstream attempt and "
+            "BEFORE the retry attempt opens, so the stall watchdog's "
+            "180s window resets for the new attempt. "
+            f"Got events between attempts: "
+            f"{events[stream_idxs[0] + 1: stream_idxs[1]]}"
+        )
+        # And conv_sid must be plumbed through.
+        assert any(c == "conv-stream-retry-mark"
+                   for (_, _, c) in between), (
+            f"expected the between-attempts mark_event to carry "
+            f"conv_sid='conv-stream-retry-mark'; got {between}"
+        )
+
+
+# ─── early keepalive on stream open (pre-first-upstream-byte) ────────────
+#
+# Diagnosed 2026-05-12 alongside the stall-timer reset bug: even with
+# the producer-side keepalive (which fires every keepalive_interval s
+# while the queue is idle), at the default interval of 15s codex's
+# client-side idle timeout can fire BEFORE the first keepalive ever
+# emits. Fix: emit one keepalive frame IMMEDIATELY when the SSE
+# response generator opens, so codex sees activity within < 1s of
+# response open — independent of how long the upstream takes to send
+# its first byte.
+
+
+class TestEarlyKeepaliveOnStreamOpen:
+    """Within the first ~1s of response.open the consumer must observe
+    at least one byte (a keepalive comment frame), even if upstream takes
+    much longer than keepalive_interval to produce its first byte."""
+
+    @pytest.mark.asyncio
+    async def test_initial_keepalive_emitted_before_first_upstream_byte(
+            self, proxy_module, monkeypatch):
+        from tinyctx import stall_watchdog as _sw
+        # Use a LARGE keepalive_interval so the existing
+        # "idle-loop keepalive" cannot rescue the test — only an
+        # explicit pre-loop initial keepalive can produce bytes within
+        # the 1s assertion window.
+        monkeypatch.setattr(proxy_module.CFG,
+                            "stream_keepalive_interval_s", 30.0)
+        _sw.reset_state()
+
+        started = asyncio.Event()
+
+        class _HangingThenComplete:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, started_event: asyncio.Event):
+                self._started = started_event
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def aread(self):
+                return b""
+
+            async def aiter_raw(self):
+                self._started.set()
+                # Block for longer than the assertion window.
+                await asyncio.sleep(5.0)
+                yield (b'event: response.completed\n'
+                       b'data: {"type":"response.completed"}\n\n')
+
+        def stream_fn(self, method, url, **kwargs):
+            return _HangingThenComplete(started)
+
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-early-ka")
+            sr = await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json"},
+                {"model": "qwen-test", "input": []},
+                is_stream=True,
+                sid="s-early-ka",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-early-ka",
+            )
+
+            t_start = time.monotonic()
+            first_byte_t: float | None = None
+            collected = bytearray()
+
+            async def _drain():
+                nonlocal first_byte_t
+                async for chunk in sr.body_iterator:
+                    b = (chunk if isinstance(chunk, (bytes, bytearray))
+                         else str(chunk).encode())
+                    if first_byte_t is None and b:
+                        first_byte_t = time.monotonic() - t_start
+                    collected.extend(b)
+
+            drain_task = asyncio.create_task(_drain())
+            try:
+                await asyncio.wait_for(drain_task, timeout=8.0)
+            except asyncio.CancelledError:
+                pass
+
+        assert first_byte_t is not None, (
+            "no bytes ever observed by the consumer — drain hung"
+        )
+        # With KA=30s and upstream-first-byte-delay=5s, an idle-loop
+        # keepalive cannot fire within 1s. Only an explicit pre-loop
+        # initial keepalive can produce bytes that early.
+        assert first_byte_t < 1.0, (
+            f"first byte observed at t={first_byte_t:.2f}s — expected "
+            f"< 1.0s if initial keepalive fires immediately on stream "
+            f"open. With keepalive_interval=30s, this proves no early "
+            f"keepalive is being emitted."
+        )
+        # And the first bytes should be a structurally-valid SSE
+        # keepalive comment (lines starting with `:` are SSE comments
+        # ignored by spec-compliant parsers).
+        first_chunk = bytes(collected).split(b"\n\n", 1)[0]
+        assert first_chunk.startswith(b":"), (
+            f"first bytes must be an SSE comment frame (starting with "
+            f"':'); got: {first_chunk[:80]!r}"
+        )

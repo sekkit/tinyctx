@@ -1464,6 +1464,16 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                  request_id=trace.request_id if trace is not None else "",
                  conn_error=conn_error,
                  elapsed_s=round(time.time() - attempt_started, 3))
+            # Reset the stall watchdog's last-event timestamp on the
+            # retry boundary so the new attempt gets a fresh threshold
+            # window. Without this, a 14s LMStudio 400 followed by a
+            # silent frontier wait would let stall_watchdog's countdown
+            # use the OLD `mark_event` from the 400 arrival — and codex's
+            # client-side idle timeout would fire first.
+            try:
+                _stall.mark_event(sid, conv_sid=conv_sid)
+            except Exception:  # noqa: BLE001
+                pass
             if action.backoff_s > 0:
                 try:
                     await asyncio.sleep(action.backoff_s)
@@ -1795,6 +1805,16 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                              request_id=request_id,
                              conn_error=conn_error,
                              elapsed_s=round(time.time() - attempt_started, 3))
+                        # Reset the stall watchdog's last-event timestamp
+                        # on the retry boundary so the new upstream attempt
+                        # gets a fresh threshold window. Without this, the
+                        # countdown still references the FAILED attempt's
+                        # last event, and a silent retry can run out the
+                        # 180s before the watchdog ever fires.
+                        try:
+                            _stall.mark_event(proj_sid, conv_sid=conv_sid)
+                        except Exception:  # noqa: BLE001
+                            pass
                         if action.backoff_s > 0:
                             try:
                                 await asyncio.sleep(action.backoff_s)
@@ -1837,6 +1857,19 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     _stall.register_task(proj_sid, producer)
                 except Exception:  # noqa: BLE001
                     pass
+            # Initial keepalive: emit one SSE comment frame IMMEDIATELY
+            # on stream open, BEFORE waiting for the first upstream byte.
+            # The idle-loop keepalive below only fires after
+            # `keepalive_interval` seconds of silence — with the default
+            # 15s interval, codex's client-side idle timeout (or any TCP
+            # middlebox) can disconnect first when the upstream takes
+            # >15s to deliver its first byte (large-context cold-start,
+            # post-retry frontier wait). Emitting one keepalive frame at
+            # t≈0 guarantees codex sees activity within the first turn
+            # of the event loop, independent of upstream latency. SSE
+            # comments are ignored by spec-compliant clients.
+            yield b": tinyctx keepalive\n\n"
+            keepalives_emitted += 1
             try:
                 while True:
                     try:
