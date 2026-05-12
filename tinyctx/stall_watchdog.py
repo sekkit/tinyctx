@@ -18,16 +18,16 @@ configurable threshold (default 180s).
 
 Mechanism
 ─────────
-Per-session last-event state lives in `_LAST_EVENT` keyed by proj_sid;
-each entry stores both the monotonic timestamp and (optionally) the
-conv_sid the caller supplied at `mark_event` time so the stall callback
-can scope force-frontier escalation to one conversation rather than the
-whole project. The proxy's SSE relay calls `mark_event(proj_sid, conv_sid)`
-each time it sees a parsed upstream event. A background asyncio task polls every
+Per-session last-event state lives under SessionState namespace
+`stall_watchdog` key `last_event` keyed by proj_sid; each entry stores
+both the monotonic timestamp and (optionally) the conv_sid the caller
+supplied at `mark_event` time so the stall callback can scope force-
+frontier escalation to one conversation rather than the whole project.
+The proxy's SSE relay calls `mark_event(proj_sid, conv_sid)` each time
+it sees a parsed upstream event. A background asyncio task polls every
 `check_interval_s` seconds and fires `on_stall(proj_sid)` for any
 session whose last event was longer than `threshold_s` ago. After
-firing, the session is removed from the dict to prevent re-firing on
-the next poll.
+firing, the session is removed so it doesn't re-fire on the next poll.
 
 `time.monotonic()` is used throughout — wall-clock can jump (NTP, DST,
 suspend/resume) and would fire spurious stalls.
@@ -46,6 +46,16 @@ then emits a clean SSE terminator (status=incomplete) so codex's SSE
 parser sees a structurally valid close and re-prompts; meanwhile the
 existing `force_next_to_frontier` flag stays set as belt+suspenders so
 the codex-driven follow-up routes to frontier.
+
+State storage
+─────────────
+P2 migration: `_LAST_EVENT` lives in `tinyctx.session_state` under
+namespace `stall_watchdog` key `last_event` (one dict value per
+proj_sid). `_ACTIVE_TASKS` stays a module-local dict — asyncio.Task
+handles are not serializable state. The legacy `_LAST_EVENT` attribute
+is preserved as a `_SessionStateDictView` shim so tests that poke
+`_LAST_EVENT[sid]["ts"]` directly continue to work (the shim returns
+the underlying dict by reference so in-place mutation propagates).
 """
 from __future__ import annotations
 
@@ -53,10 +63,73 @@ import asyncio
 import inspect
 import logging
 import time
-from typing import Any, Awaitable, Callable, Union
+from typing import Any, Awaitable, Callable, Iterator, Union
+
+from . import session_state
 
 
 _LOG = logging.getLogger("tinyctx.stall_watchdog")
+
+
+# ─── SessionState namespace + compaction reset policy ─────────────────────
+
+_NS = "stall_watchdog"
+_K_LAST_EVENT = "last_event"
+
+# Compaction clears stale stall data — a stale `last_event` shouldn't
+# carry over across the boundary since the post-compaction request is a
+# fresh stream and the watchdog will re-mark it.
+session_state.register_compaction_reset(_NS, [_K_LAST_EVENT])
+
+
+# ─── legacy dict view ──────────────────────────────────────────────────────
+
+
+class _LastEventDictView:
+    """Read/write proxy over SessionState for the legacy `_LAST_EVENT`
+    attribute. `view[sid]` returns the underlying entry dict by
+    reference so callers (and tests) that mutate `view[sid]["ts"] = ...`
+    in place propagate the change back to SessionState storage.
+    """
+
+    __slots__ = ()
+
+    def __iter__(self) -> Iterator[str]:
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if _K_LAST_EVENT in by_ns.get(_NS, {}):
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def __contains__(self, sid: Any) -> bool:
+        return session_state.get(sid, _NS, _K_LAST_EVENT) is not None
+
+    def __getitem__(self, sid: Any) -> dict[str, Any]:
+        val = session_state.get(sid, _NS, _K_LAST_EVENT)
+        if val is None:
+            raise KeyError(sid)
+        return val  # by-reference: mutation propagates to storage
+
+    def __setitem__(self, sid: Any, value: dict[str, Any]) -> None:
+        session_state.set(sid, _NS, _K_LAST_EVENT, value)
+
+    def __delitem__(self, sid: Any) -> None:
+        session_state.clear(sid, _NS, _K_LAST_EVENT)
+
+    def get(self, sid: Any, default: Any = None) -> Any:
+        val = session_state.get(sid, _NS, _K_LAST_EVENT)
+        return default if val is None else val
+
+    def pop(self, sid: Any, default: Any = None) -> Any:
+        existing = session_state.consume(sid, _NS, _K_LAST_EVENT)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, _K_LAST_EVENT)
+
 
 # Per-session state: {sid: {"ts": monotonic, "conv_sid": str | None}}.
 # `sid` is the proj_sid the watchdog loop iterates over; `conv_sid` is
@@ -64,7 +137,7 @@ _LOG = logging.getLogger("tinyctx.stall_watchdog")
 # `mark_event` time. The stall callback prefers conv_sid (precise — only
 # that conversation's next request gets force-routed) and falls back to
 # the iterated sid when conv_sid wasn't supplied.
-_LAST_EVENT: dict[str, dict[str, Any]] = {}
+_LAST_EVENT = _LastEventDictView()
 
 
 # Per-session in-flight relay task handle. The proxy's `_stream_proxy`
@@ -73,6 +146,9 @@ _LAST_EVENT: dict[str, dict[str, Any]] = {}
 # to actually cancel the wedged upstream task — without it, the watchdog
 # can only flag the NEXT turn, leaving the current request hung until
 # codex's own idle timeout fires (observed: ~9 minutes).
+#
+# NOT migrated to SessionState: asyncio.Task is a runtime handle, not
+# serializable state. Stays a plain module-level dict.
 _ACTIVE_TASKS: dict[str, "asyncio.Task"] = {}
 
 
@@ -117,14 +193,17 @@ def mark_event(proj_sid: str, conv_sid: str | None = None) -> None:
     an earlier one)."""
     if not proj_sid:
         return
-    entry = _LAST_EVENT.get(proj_sid)
     now = time.monotonic()
+    entry = session_state.get(proj_sid, _NS, _K_LAST_EVENT)
     if entry is None:
-        _LAST_EVENT[proj_sid] = {"ts": now, "conv_sid": conv_sid}
+        session_state.set(proj_sid, _NS, _K_LAST_EVENT,
+                          {"ts": now, "conv_sid": conv_sid})
         return
     entry["ts"] = now
     if conv_sid is not None:
         entry["conv_sid"] = conv_sid
+    # entry is held by reference inside SessionState — in-place mutation
+    # already persisted; no re-set needed.
 
 
 def check_stalled(proj_sid: str, threshold_s: float) -> bool:
@@ -133,7 +212,7 @@ def check_stalled(proj_sid: str, threshold_s: float) -> bool:
     (no false positive on cold sessions)."""
     if not proj_sid:
         return False
-    entry = _LAST_EVENT.get(proj_sid)
+    entry = session_state.get(proj_sid, _NS, _K_LAST_EVENT)
     if entry is None:
         return False
     return (time.monotonic() - entry["ts"]) > threshold_s
@@ -142,7 +221,7 @@ def check_stalled(proj_sid: str, threshold_s: float) -> bool:
 def seconds_since_event(proj_sid: str) -> float | None:
     """Elapsed seconds since the last event for this session; None if
     no event recorded. For dashboard display."""
-    entry = _LAST_EVENT.get(proj_sid)
+    entry = session_state.get(proj_sid, _NS, _K_LAST_EVENT)
     if entry is None:
         return None
     return time.monotonic() - entry["ts"]
@@ -152,7 +231,7 @@ def get_conv_sid(proj_sid: str) -> str | None:
     """Return the conv_sid associated with `proj_sid`'s last event,
     or None if either no event was recorded or the caller never supplied
     a conv_sid. Used by the stall callback to scope escalation."""
-    entry = _LAST_EVENT.get(proj_sid)
+    entry = session_state.get(proj_sid, _NS, _K_LAST_EVENT)
     if entry is None:
         return None
     return entry.get("conv_sid")
@@ -164,7 +243,7 @@ def clear(proj_sid: str) -> None:
     a stale entry and fire a spurious stall."""
     if not proj_sid:
         return
-    _LAST_EVENT.pop(proj_sid, None)
+    session_state.clear(proj_sid, _NS, _K_LAST_EVENT)
 
 
 # ─── active-task registry (cancel-and-retry on stall) ──────────────────────
@@ -285,9 +364,9 @@ def start_watchdog(check_interval_s: float,
                         # Snapshot conv_sid BEFORE pop so the callback can
                         # scope escalation to one conversation. Pop next
                         # so a callback that touches state doesn't re-fire.
-                        entry = _LAST_EVENT.get(sid) or {}
+                        entry = session_state.get(sid, _NS, _K_LAST_EVENT) or {}
                         conv_sid = entry.get("conv_sid")
-                        _LAST_EVENT.pop(sid, None)
+                        session_state.clear(sid, _NS, _K_LAST_EVENT)
                         try:
                             result = (on_stall(sid, conv_sid)
                                       if accepts_conv_sid
@@ -319,9 +398,15 @@ def state_snapshot() -> dict[str, dict[str, Any]]:
     """All tracked sessions with elapsed-since-last-event + the stored
     conv_sid (None when caller didn't supply one). For dashboard."""
     now = time.monotonic()
-    return {sid: {"seconds_since_event": now - entry["ts"],
-                  "conv_sid": entry.get("conv_sid")}
-            for sid, entry in _LAST_EVENT.items()}
+    out: dict[str, dict[str, Any]] = {}
+    snap = session_state.snapshot()
+    for sid, by_ns in snap.items():
+        entry = by_ns.get(_NS, {}).get(_K_LAST_EVENT)
+        if entry is None:
+            continue
+        out[sid] = {"seconds_since_event": now - entry["ts"],
+                    "conv_sid": entry.get("conv_sid")}
+    return out
 
 
 def reset_state(proj_sid: str | None = None) -> None:
@@ -330,8 +415,9 @@ def reset_state(proj_sid: str | None = None) -> None:
     for the affected scope — tests that build a fresh `_ACTIVE_TASKS`
     don't leak stale handles into the next test."""
     if proj_sid is None:
-        _LAST_EVENT.clear()
+        for sid in list(_LAST_EVENT.keys()):
+            session_state.clear(sid, _NS, _K_LAST_EVENT)
         _ACTIVE_TASKS.clear()
         return
-    _LAST_EVENT.pop(proj_sid, None)
+    session_state.clear(proj_sid, _NS, _K_LAST_EVENT)
     _ACTIVE_TASKS.pop(proj_sid, None)

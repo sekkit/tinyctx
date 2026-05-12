@@ -385,3 +385,42 @@ def test_reset_compaction_state_back_compat_single_arg_preserves_state():
     stuck_loop.reset_compaction_state("global:abc")
     assert stuck_loop._LAST_REMINDER_TURN.get("global:abc") == 50
     assert stuck_loop._LAST_REMINDER_TURN.get("global:def") == 80
+
+
+# ─── SessionState integration (P2 migration) ─────────────────────────────
+
+
+def test_session_state_reset_compaction_preserves_stuck_loop_keys():
+    """The stuck_loop namespace registers an EMPTY compaction-reset list
+    (per 09b1946 saga: clearing reminder-turn caused rapid double-nag).
+    Calling `session_state.reset_compaction(proj_sid)` directly must
+    leave both reminder-turn and advisor-ts untouched."""
+    from tinyctx import stuck_loop, session_state
+    stuck_loop.reset_state()
+    conv = "compaction-conv"
+    stuck_loop._LAST_REMINDER_TURN[conv] = 175
+    stuck_loop.mark_advisor_call(conv)
+    advisor_ts_before = stuck_loop._LAST_ADVISOR_TS[conv]
+    assert advisor_ts_before > 0
+
+    session_state.reset_compaction(conv)
+
+    assert stuck_loop._LAST_REMINDER_TURN[conv] == 175
+    assert stuck_loop._LAST_ADVISOR_TS[conv] == advisor_ts_before
+
+
+def test_snapshot_includes_stuck_loop_namespace():
+    """SessionState's snapshot exposes both keys this module writes —
+    dashboards reading SessionState directly see what the module sees."""
+    from tinyctx import stuck_loop, session_state
+    stuck_loop.reset_state()
+    conv = "snapshot-conv"
+    body = {"input": [{"role": "user", "content": "x"}]}
+    stuck_loop.maybe_inject_stuck_reminder(
+        body, conv, turn_count=100, turn_trigger=80, turn_gap=50)
+    stuck_loop.mark_advisor_call(conv)
+
+    snap = session_state.snapshot(conv)
+    assert "stuck_loop" in snap
+    assert snap["stuck_loop"]["last_reminder_turn"] == 100
+    assert snap["stuck_loop"]["last_advisor_ts"] > 0

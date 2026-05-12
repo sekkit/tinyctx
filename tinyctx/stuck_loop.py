@@ -39,20 +39,104 @@ Idempotency
 Injection is keyed off `_LAST_REMINDER_TURN[proj_sid]`. A retry of the
 same turn won't re-inject (same `turn_count`). State is per-project-
 session-key for multi-project isolation, same as `_SESSION_ERROR_STREAK`.
+
+State storage
+─────────────
+P2 migration: state lives in `tinyctx.session_state` under namespace
+`stuck_loop` keys `last_reminder_turn` and `last_advisor_ts`. The
+legacy `_LAST_REMINDER_TURN` and `_LAST_ADVISOR_TS` module attributes
+are preserved as `_SessionStateDictView` shims so tests that poke them
+directly continue to work. NEITHER key is registered for compaction
+reset (per 09b1946 saga fix: clearing reminder-turn caused rapid
+double-nag; advisor activity remains relevant across compaction).
 """
 from __future__ import annotations
 
 import time
-from collections import defaultdict
-from typing import Any
+from typing import Any, Iterator
+
+from . import session_state
 
 
-# ─── per-session state ─────────────────────────────────────────────────────
+# ─── SessionState namespace + compaction reset policy ─────────────────────
+
+_NS = "stuck_loop"
+_K_LAST_REMINDER_TURN = "last_reminder_turn"
+_K_LAST_ADVISOR_TS = "last_advisor_ts"
+
+# Intentionally EMPTY: per 09b1946 saga fix, neither last_reminder_turn
+# nor last_advisor_ts is cleared on compaction. Codex's monotonic turn
+# counter survives compaction, so the gate semantics still hold; advisor
+# activity also remains relevant. Clearing either causes rapid double-nag.
+session_state.register_compaction_reset(_NS, [])
+
+
+# ─── legacy dict views ────────────────────────────────────────────────────
+
+
+class _SessionStateDictView:
+    """Read/write proxy that maps `view[proj_sid]` to a single SessionState
+    key under namespace `stuck_loop`. Returns `_default` (typed-zero) for
+    missing keys to preserve the original defaultdict semantics."""
+
+    __slots__ = ("_key", "_default")
+
+    def __init__(self, key: str, default: Any) -> None:
+        self._key = key
+        self._default = default
+
+    def __iter__(self) -> Iterator[str]:
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if self._key in by_ns.get(_NS, {}):
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def items(self) -> list[tuple[str, Any]]:
+        snap = session_state.snapshot()
+        out: list[tuple[str, Any]] = []
+        for sid, by_ns in snap.items():
+            if self._key in by_ns.get(_NS, {}):
+                out.append((sid, by_ns[_NS][self._key]))
+        return out
+
+    def values(self) -> list[Any]:
+        return [v for _, v in self.items()]
+
+    def __contains__(self, proj_sid: Any) -> bool:
+        snap_ns = session_state.snapshot(proj_sid).get(_NS, {})
+        return self._key in snap_ns
+
+    def __getitem__(self, proj_sid: Any) -> Any:
+        val = session_state.get(proj_sid, _NS, self._key)
+        return self._default if val is None else val
+
+    def __setitem__(self, proj_sid: Any, value: Any) -> None:
+        session_state.set(proj_sid, _NS, self._key, value)
+
+    def __delitem__(self, proj_sid: Any) -> None:
+        session_state.clear(proj_sid, _NS, self._key)
+
+    def get(self, proj_sid: Any, default: Any = None) -> Any:
+        val = session_state.get(proj_sid, _NS, self._key)
+        return default if val is None else val
+
+    def pop(self, proj_sid: Any, default: Any = None) -> Any:
+        existing = session_state.consume(proj_sid, _NS, self._key)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, self._key)
+
+
 # Module-level dicts; per-process (proxy is single-process). Keys are
 # `proj_sid` (composite project + session key) so projects don't share state.
 
-_LAST_REMINDER_TURN: dict[str, int] = defaultdict(int)
-_LAST_ADVISOR_TS: dict[str, float] = defaultdict(float)
+_LAST_REMINDER_TURN = _SessionStateDictView(_K_LAST_REMINDER_TURN, default=0)
+_LAST_ADVISOR_TS = _SessionStateDictView(_K_LAST_ADVISOR_TS, default=0.0)
 
 
 # ─── reminder text ─────────────────────────────────────────────────────────
@@ -125,9 +209,12 @@ def maybe_inject_stuck_reminder(body: dict[str, Any],
     advisor_key = advisor_scope_sid if advisor_scope_sid is not None else proj_sid
     if turn_count < turn_trigger:
         return body, False
-    if turn_count - _LAST_REMINDER_TURN[proj_sid] < turn_gap:
+    last_turn = int(session_state.get(proj_sid, _NS, _K_LAST_REMINDER_TURN, 0))
+    if turn_count - last_turn < turn_gap:
         return body, False
-    if time.time() - _LAST_ADVISOR_TS[advisor_key] < advisor_grace_s:
+    last_advisor_ts = float(session_state.get(
+        advisor_key, _NS, _K_LAST_ADVISOR_TS, 0.0))
+    if time.time() - last_advisor_ts < advisor_grace_s:
         return body, False
 
     items = body.get("input")
@@ -146,7 +233,7 @@ def maybe_inject_stuck_reminder(body: dict[str, Any],
     })
     out = dict(body)
     out["input"] = new_items
-    _LAST_REMINDER_TURN[proj_sid] = turn_count
+    session_state.set(proj_sid, _NS, _K_LAST_REMINDER_TURN, turn_count)
     return out, True
 
 
@@ -156,18 +243,20 @@ def mark_advisor_call(proj_sid: str) -> None:
     already escalated. Called by the proxy when it sees a request with
     `requested_model == "tinyctx-frontier"` (advisor sub-agent route)
     or any other explicit frontier-route signal."""
-    _LAST_ADVISOR_TS[proj_sid] = time.time()
+    session_state.set(proj_sid, _NS, _K_LAST_ADVISOR_TS, time.time())
 
 
 def reset_state(proj_sid: str | None = None) -> None:
     """Test/dev helper. With no arg, clear all sessions; with a key,
     clear just that session's reminder + advisor timing."""
     if proj_sid is None:
-        _LAST_REMINDER_TURN.clear()
-        _LAST_ADVISOR_TS.clear()
+        for sid in list(_LAST_REMINDER_TURN.keys()):
+            session_state.clear(sid, _NS, _K_LAST_REMINDER_TURN)
+        for sid in list(_LAST_ADVISOR_TS.keys()):
+            session_state.clear(sid, _NS, _K_LAST_ADVISOR_TS)
         return
-    _LAST_REMINDER_TURN.pop(proj_sid, None)
-    _LAST_ADVISOR_TS.pop(proj_sid, None)
+    session_state.clear(proj_sid, _NS, _K_LAST_REMINDER_TURN)
+    session_state.clear(proj_sid, _NS, _K_LAST_ADVISOR_TS)
 
 
 def reset_compaction_state(conv_sid: str | None,
@@ -204,10 +293,13 @@ def reset_compaction_state(conv_sid: str | None,
 
 def state_snapshot(proj_sid: str) -> dict[str, Any]:
     """Test/dev helper to inspect per-session watchdog state."""
+    last_turn = int(session_state.get(
+        proj_sid, _NS, _K_LAST_REMINDER_TURN, 0))
+    last_advisor_ts = float(session_state.get(
+        proj_sid, _NS, _K_LAST_ADVISOR_TS, 0.0))
     return {
-        "last_reminder_turn": _LAST_REMINDER_TURN.get(proj_sid, 0),
-        "last_advisor_ts": _LAST_ADVISOR_TS.get(proj_sid, 0.0),
+        "last_reminder_turn": last_turn,
+        "last_advisor_ts": last_advisor_ts,
         "seconds_since_advisor": (
-            time.time() - _LAST_ADVISOR_TS[proj_sid]
-            if _LAST_ADVISOR_TS.get(proj_sid) else None),
+            time.time() - last_advisor_ts if last_advisor_ts else None),
     }

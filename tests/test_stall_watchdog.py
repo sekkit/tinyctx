@@ -681,3 +681,43 @@ def test_stall_cancelled_error_carries_context():
     assert e.conv_sid == "projZ:conv-1"
     assert e.elapsed_silent_s == 42.0
     assert "stall" in str(e)
+
+
+# ─── SessionState integration (P2 migration) ─────────────────────────────
+
+
+def test_session_state_reset_compaction_clears_last_event():
+    """stall_watchdog registers `last_event` for compaction reset: stale
+    stall-tracking data shouldn't carry over across a compaction
+    boundary, since the post-compaction request is a fresh stream that
+    will re-mark itself.
+
+    Reaches into `sw.session_state` (the actual module instance the
+    `sw` import bound to) rather than importing `session_state`
+    independently — test_keepalive deletes + reimports tinyctx modules,
+    which would otherwise leave us with a fresh session_state binding
+    that doesn't share `_STATE` with `sw`'s view."""
+    sw.mark_event("projA", conv_sid="projA:conv-1")
+    assert sw.seconds_since_event("projA") is not None
+
+    sw.session_state.reset_compaction("projA")
+
+    # last_event must be cleared by compaction
+    assert sw.seconds_since_event("projA") is None
+    assert sw.get_conv_sid("projA") is None
+    assert sw.check_stalled("projA", threshold_s=0.0001) is False
+
+
+def test_snapshot_includes_stall_watchdog_namespace():
+    """SessionState's snapshot exposes the `last_event` entry under the
+    `stall_watchdog` namespace — dashboards reading SessionState see what
+    the module sees. Reads through `sw.session_state` to stay aligned
+    with sw's storage view (see prior test's note)."""
+    sw.mark_event("projZ", conv_sid="projZ:conv-x")
+
+    snap = sw.session_state.snapshot("projZ")
+    assert "stall_watchdog" in snap
+    assert "last_event" in snap["stall_watchdog"]
+    entry = snap["stall_watchdog"]["last_event"]
+    assert entry["conv_sid"] == "projZ:conv-x"
+    assert "ts" in entry

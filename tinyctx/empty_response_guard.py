@@ -17,7 +17,8 @@ Mechanism
    `usage` block. Extract `completion_tokens` (and `finish_reason`).
 2. If `completion_tokens` is very small (< threshold, default 5) AND
    `finish_reason` indicates a normal stop (`stop` or `length`), set
-   the per-session `_FORCE_NEXT_TO_FRONTIER` flag.
+   the per-session force-frontier flag under SessionState namespace
+   `empty_response_guard` key `force_next_to_frontier`.
 3. On the next `/v1/responses` request from codex for the same session,
    the proxy reads the flag, forces `route=frontier` (bypassing the
    self-classifier and route heuristic), and clears the flag.
@@ -34,19 +35,97 @@ For testing or manual recovery (e.g. an empty response that happened
 before this code was deployed), call `force_next_to_frontier(proj_sid)`
 directly. The next request to that session will be routed to frontier
 regardless of body shape.
+
+State storage
+─────────────
+P2 migration: state lives in `tinyctx.session_state` under namespace
+`empty_response_guard` key `force_next_to_frontier`. The legacy
+`_FORCE_NEXT_TO_FRONTIER` module attribute is preserved as a
+`_SessionStateDictView` so any caller that pokes it directly continues
+to work. The flag is NOT registered for compaction reset — it's a
+one-shot consumed on the next request, so the existing consume path
+clears it naturally. Registering it would risk dropping a freshly-set
+flag if a compaction lands between detection and consume.
 """
 from __future__ import annotations
 
-import json
 import re
 import time
-from collections import defaultdict
-from typing import Any
+from typing import Any, Iterator
+
+from . import session_state
 
 
-# ─── per-session state ─────────────────────────────────────────────────────
+# ─── SessionState namespace ────────────────────────────────────────────────
 
-_FORCE_NEXT_TO_FRONTIER: dict[str, dict[str, Any]] = defaultdict(dict)
+_NS = "empty_response_guard"
+_K_FORCE = "force_next_to_frontier"
+
+# No compaction reset — the flag is a one-shot consumed on next request.
+# Registering empty list is still useful to make the namespace explicit
+# in reset_compaction iteration order.
+session_state.register_compaction_reset(_NS, [])
+
+
+# ─── legacy dict view ──────────────────────────────────────────────────────
+
+
+class _SessionStateDictView:
+    """Read/write proxy that maps `view[proj_sid]` to a single SessionState
+    key under namespace `empty_response_guard`. Only the operations
+    actually used by callers and tests are implemented."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+
+    def __iter__(self) -> Iterator[str]:
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            val = by_ns.get(_NS, {}).get(self._key)
+            if val:
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def items(self) -> list[tuple[str, Any]]:
+        out: list[tuple[str, Any]] = []
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            val = by_ns.get(_NS, {}).get(self._key)
+            if val:
+                out.append((sid, val))
+        return out
+
+    def __contains__(self, proj_sid: Any) -> bool:
+        return bool(session_state.get(proj_sid, _NS, self._key))
+
+    def __getitem__(self, proj_sid: Any) -> Any:
+        val = session_state.get(proj_sid, _NS, self._key)
+        return val if val is not None else {}
+
+    def __setitem__(self, proj_sid: Any, value: Any) -> None:
+        session_state.set(proj_sid, _NS, self._key, value)
+
+    def __delitem__(self, proj_sid: Any) -> None:
+        session_state.clear(proj_sid, _NS, self._key)
+
+    def get(self, proj_sid: Any, default: Any = None) -> Any:
+        val = session_state.get(proj_sid, _NS, self._key)
+        return default if val is None else val
+
+    def pop(self, proj_sid: Any, default: Any = None) -> Any:
+        existing = session_state.consume(proj_sid, _NS, self._key)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, self._key)
+
+
+_FORCE_NEXT_TO_FRONTIER = _SessionStateDictView(_K_FORCE)
 # Each entry: {"set_at": ts, "reason": str, "completion_tokens": int}
 
 
@@ -143,7 +222,7 @@ def maybe_flag_empty_response(
         "completion_tokens": completion,
         "finish_reason": finish,
     }
-    _FORCE_NEXT_TO_FRONTIER[proj_sid] = info
+    session_state.set(proj_sid, _NS, _K_FORCE, info)
     return info
 
 
@@ -153,13 +232,13 @@ def maybe_flag_empty_response(
 def consume_force_frontier(proj_sid: str) -> dict[str, Any] | None:
     """Atomically check + clear the flag. If set, returns the info dict
     (caller forces frontier route this turn); else None (normal routing)."""
-    info = _FORCE_NEXT_TO_FRONTIER.pop(proj_sid, None)
+    info = session_state.consume(proj_sid, _NS, _K_FORCE)
     return info if info else None
 
 
 def peek_force_frontier(proj_sid: str) -> dict[str, Any] | None:
     """Look at the flag without consuming it. For dashboard display."""
-    info = _FORCE_NEXT_TO_FRONTIER.get(proj_sid)
+    info = session_state.get(proj_sid, _NS, _K_FORCE)
     return dict(info) if info else None
 
 
@@ -168,12 +247,12 @@ def force_next_to_frontier(proj_sid: str, reason: str = "manual") -> None:
     empty response was observed BEFORE this code was deployed and
     you want the next turn forced to frontier without waiting for
     a fresh empty response."""
-    _FORCE_NEXT_TO_FRONTIER[proj_sid] = {
+    session_state.set(proj_sid, _NS, _K_FORCE, {
         "set_at": time.time(),
         "reason": f"manual: {reason}",
         "completion_tokens": -1,
         "finish_reason": "manual",
-    }
+    })
 
 
 # ─── test/dev helpers ─────────────────────────────────────────────────────
@@ -181,13 +260,18 @@ def force_next_to_frontier(proj_sid: str, reason: str = "manual") -> None:
 
 def reset_state(proj_sid: str | None = None) -> None:
     if proj_sid is None:
-        _FORCE_NEXT_TO_FRONTIER.clear()
+        for sid in list(_FORCE_NEXT_TO_FRONTIER.keys()):
+            session_state.clear(sid, _NS, _K_FORCE)
         return
-    _FORCE_NEXT_TO_FRONTIER.pop(proj_sid, None)
+    session_state.clear(proj_sid, _NS, _K_FORCE)
 
 
 def state_snapshot() -> dict[str, dict[str, Any]]:
     """Inspect all flagged sessions. For dashboard."""
-    return {sid: dict(info)
-            for sid, info in _FORCE_NEXT_TO_FRONTIER.items()
-            if info}
+    out: dict[str, dict[str, Any]] = {}
+    snap = session_state.snapshot()
+    for sid, by_ns in snap.items():
+        val = by_ns.get(_NS, {}).get(_K_FORCE)
+        if val:
+            out[sid] = dict(val)
+    return out

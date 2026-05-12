@@ -258,3 +258,43 @@ def test_consume_conv_sid_flag_also_clears_proj_sid_flag():
     # And from the perspective of conv-2's exact same fallback chain:
     assert _erg.consume_force_frontier(other_conv) is None
     assert _erg.consume_force_frontier(proj_sid) is None
+
+
+# ─── SessionState integration (P2 migration) ─────────────────────────────
+
+
+def test_compaction_reset_does_not_drop_force_frontier_flag():
+    """The force-frontier flag is a one-shot consumed on next request, so
+    it MUST survive a compaction boundary that lands between detection
+    and the next codex request. P2 contract: the namespace is registered
+    with an empty compaction-reset key list, so `reset_compaction(...)`
+    leaves the flag intact."""
+    from tinyctx import empty_response_guard, session_state
+    empty_response_guard.reset_state()
+    proj = "compaction-conv-sid"
+    empty_response_guard.force_next_to_frontier(proj, "pre-compaction empty")
+    assert empty_response_guard.peek_force_frontier(proj) is not None
+
+    # Simulate the compaction boundary
+    session_state.reset_compaction(proj)
+
+    # Flag must still be present — next request will consume it.
+    info = empty_response_guard.peek_force_frontier(proj)
+    assert info is not None
+    assert "pre-compaction empty" in info["reason"]
+
+
+def test_snapshot_includes_empty_response_guard_namespace():
+    """SessionState's snapshot exposes the namespace + key the module
+    uses, so dashboards / forensic tools that read SessionState directly
+    see the same flag the module-level helpers see."""
+    from tinyctx import empty_response_guard, session_state
+    empty_response_guard.reset_state()
+    proj = "snapshot-proj-sid"
+    empty_response_guard.force_next_to_frontier(proj, "snapshot check")
+
+    snap = session_state.snapshot(proj)
+    assert "empty_response_guard" in snap
+    assert "force_next_to_frontier" in snap["empty_response_guard"]
+    assert "snapshot check" in snap["empty_response_guard"][
+        "force_next_to_frontier"]["reason"]
