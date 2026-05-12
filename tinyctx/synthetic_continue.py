@@ -29,43 +29,117 @@ Per-session strategy rotation
 ─────────────────────────────
 On EACH soft-completion-driven injection for a session, pick the NEXT
 untried strategy. After cycling through all, start over (maybe a later
-attempt works; conditions can change). Tracker is `_NEXT_STRATEGY_IDX`.
+attempt works; conditions can change). Tracker lives in SessionState
+under namespace ``synthetic_continue`` key ``strategy_idx``.
 
 Per-session injection budget
 ────────────────────────────
-`_INJECTION_COUNT_PER_SESSION` caps how many synthetic continues we
-inject for one session. When over budget, `build_continue_injection`
-returns the `budget_exhausted` sentinel; the caller is expected to
-escalate (force frontier on next turn) and to inject a one-shot
-`<system-reminder>` warning the agent that auto-continue ran out — a
-genuine "agent finished" outcome should be reviewed manually instead
-of nudged forever.
+SessionState namespace ``synthetic_continue`` key ``injection_count``
+caps how many synthetic continues we inject for one session. When over
+budget, `build_continue_injection` returns the `budget_exhausted`
+sentinel; the caller is expected to escalate (force frontier on next
+turn) and to inject a one-shot `<system-reminder>` warning the agent
+that auto-continue ran out — a genuine "agent finished" outcome should
+be reviewed manually instead of nudged forever.
+
+State storage
+─────────────
+This module is the P1 pilot for the unified `tinyctx.session_state`
+container. The legacy `_INJECTION_COUNT_PER_SESSION` and
+`_LAST_BUDGET_REMINDER_FIRED` module attributes are kept (live views
+over `session_state` keyed by `synthetic_continue.injection_count` /
+`budget_reminder_fired`) so external tests that wrote to them continue
+to work.
 """
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
+from . import session_state
 
-# Per-session counter of which strategy to try next. Rotates 0..N-1
-# then back to 0. A future enhancement could detect which strategies
-# successfully dispatched and prefer those, but rotation is a fine
-# default.
-_NEXT_STRATEGY_IDX: dict[str, int] = defaultdict(int)
+# ─── SessionState namespace + compaction reset policy ────────────────────
+
+_NS = "synthetic_continue"
+_K_STRATEGY_IDX = "strategy_idx"
+_K_INJECTION_COUNT = "injection_count"
+_K_BUDGET_REMINDER_FIRED = "budget_reminder_fired"
+
+# Compaction clears injection_count + budget_reminder_fired but NOT
+# strategy_idx (rotation is independent of conversation length).
+session_state.register_compaction_reset(
+    _NS, [_K_INJECTION_COUNT, _K_BUDGET_REMINDER_FIRED]
+)
 
 
-# Per-session count of synthetic-continue injections. Caps runaway
-# loops where soft_completion mis-classifies and we keep injecting
-# forever. Default cap is the caller-provided `max_injections`.
-_INJECTION_COUNT_PER_SESSION: dict[str, int] = defaultdict(int)
+# ─── live dict views over session_state ──────────────────────────────────
+# The previous implementation used module-level `dict[str, int]` /
+# `dict[str, bool]` containers. Some tests (and possibly other modules)
+# write to them or inspect them by key. `_SessionStateDictView` is a
+# minimal dict-shaped proxy that forwards every operation to
+# `session_state` so the legacy attributes keep working without
+# duplicating state.
 
 
-# Per-session flag tracking whether the budget-exhausted system-
-# reminder has already been injected. One-shot per exhaustion event so
-# we don't append the warning every turn.
-_LAST_BUDGET_REMINDER_FIRED: dict[str, bool] = defaultdict(bool)
+class _SessionStateDictView:
+    """Read/write proxy that maps `view[conv_sid]` to a single
+    SessionState key. Only the operations actually used by the legacy
+    code paths and the existing tests are implemented."""
+
+    __slots__ = ("_key", "_default")
+
+    def __init__(self, key: str, default: Any) -> None:
+        self._key = key
+        self._default = default
+
+    def __iter__(self) -> Iterator[str]:
+        # Iterate every conv_sid that has a non-default value for this
+        # key under the synthetic_continue namespace.
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if self._key in by_ns.get(_NS, {}):
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def __contains__(self, conv_sid: Any) -> bool:
+        snap_ns = session_state.snapshot(conv_sid).get(_NS, {})
+        return self._key in snap_ns
+
+    def __getitem__(self, conv_sid: Any) -> Any:
+        val = session_state.get(conv_sid, _NS, self._key)
+        return self._default if val is None else val
+
+    def __setitem__(self, conv_sid: Any, value: Any) -> None:
+        session_state.set(conv_sid, _NS, self._key, value)
+
+    def __delitem__(self, conv_sid: Any) -> None:
+        session_state.clear(conv_sid, _NS, self._key)
+
+    def get(self, conv_sid: Any, default: Any = None) -> Any:
+        val = session_state.get(conv_sid, _NS, self._key)
+        return default if val is None else val
+
+    def pop(self, conv_sid: Any, default: Any = None) -> Any:
+        existing = session_state.get(conv_sid, _NS, self._key)
+        session_state.clear(conv_sid, _NS, self._key)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        # Walk every conv that has a value for this key and drop it.
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, self._key)
+
+
+_NEXT_STRATEGY_IDX = _SessionStateDictView(_K_STRATEGY_IDX, default=0)
+_INJECTION_COUNT_PER_SESSION = _SessionStateDictView(
+    _K_INJECTION_COUNT, default=0
+)
+_LAST_BUDGET_REMINDER_FIRED = _SessionStateDictView(
+    _K_BUDGET_REMINDER_FIRED, default=False
+)
 
 
 # Strategy registry. Each entry: tool_name codex dispatches + the
@@ -100,8 +174,8 @@ STRATEGIES: list[dict[str, Any]] = [
 def pick_next_strategy(proj_sid: str) -> dict[str, Any]:
     """Return the next strategy for this session, rotating through the
     list. Always returns a strategy (rotates back to 0 after exhausting)."""
-    idx = _NEXT_STRATEGY_IDX[proj_sid] % len(STRATEGIES)
-    _NEXT_STRATEGY_IDX[proj_sid] = (idx + 1) % len(STRATEGIES)
+    idx = int(session_state.get(proj_sid, _NS, _K_STRATEGY_IDX, 0)) % len(STRATEGIES)
+    session_state.set(proj_sid, _NS, _K_STRATEGY_IDX, (idx + 1) % len(STRATEGIES))
     return STRATEGIES[idx]
 
 
@@ -109,18 +183,18 @@ def reset_strategy_index(proj_sid: str) -> None:
     """Reset rotation back to strategy 0 — call when a strategy is
     confirmed working (e.g. observed function_call_output from codex
     matching one of our synthetic ids in the next request)."""
-    _NEXT_STRATEGY_IDX[proj_sid] = 0
+    session_state.set(proj_sid, _NS, _K_STRATEGY_IDX, 0)
 
 
 # ─── injection budget ────────────────────────────────────────────────────
 
 
 def injection_count(proj_sid: str) -> int:
-    return _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0)
+    return int(session_state.get(proj_sid, _NS, _K_INJECTION_COUNT, 0))
 
 
 def is_over_budget(proj_sid: str, max_injections: int) -> bool:
-    return _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0) >= max_injections
+    return injection_count(proj_sid) >= max_injections
 
 
 # ─── synthetic SSE event builder ──────────────────────────────────────────
@@ -189,7 +263,7 @@ def build_continue_injection(
     (events, strategy_used). The proxy yields events into the response
     stream; the strategy dict goes into log/forensics.
 
-    When `_INJECTION_COUNT_PER_SESSION[proj_sid] >= max_injections`,
+    When the per-session injection_count has reached `max_injections`,
     returns `([], {"label": "budget_exhausted", ...})` and does not
     increment the counter. Caller should escalate to frontier and inject
     `build_budget_exhausted_reminder` text on the next request.
@@ -197,7 +271,7 @@ def build_continue_injection(
     if is_over_budget(proj_sid, max_injections):
         return [], {"label": "budget_exhausted", "tool_name": "", "args": {}}
     strategy = pick_next_strategy(proj_sid)
-    _INJECTION_COUNT_PER_SESSION[proj_sid] += 1
+    session_state.increment(proj_sid, _NS, _K_INJECTION_COUNT)
     events = synthetic_tool_call_events(
         strategy["tool_name"], strategy["args"])
     return events, strategy
@@ -236,7 +310,7 @@ def maybe_inject_budget_reminder(
     per exhaustion. Subsequent calls for the same session return
     `(body, False)` until `reset_state(proj_sid)` clears the flag.
     Mirrors stuck_loop's API."""
-    if _LAST_BUDGET_REMINDER_FIRED.get(proj_sid):
+    if session_state.get(proj_sid, _NS, _K_BUDGET_REMINDER_FIRED, False):
         return body, False
     items = body.get("input")
     if not isinstance(items, list):
@@ -252,7 +326,7 @@ def maybe_inject_budget_reminder(
     })
     out = dict(body)
     out["input"] = new_items
-    _LAST_BUDGET_REMINDER_FIRED[proj_sid] = True
+    session_state.set(proj_sid, _NS, _K_BUDGET_REMINDER_FIRED, True)
     return out, True
 
 
@@ -260,14 +334,23 @@ def maybe_inject_budget_reminder(
 
 
 def reset_state(proj_sid: str | None = None) -> None:
+    """Clear all synthetic_continue state. When `proj_sid` is None, wipe
+    every conv_sid's state under this namespace; otherwise clear only
+    that session's three keys."""
     if proj_sid is None:
-        _NEXT_STRATEGY_IDX.clear()
-        _INJECTION_COUNT_PER_SESSION.clear()
-        _LAST_BUDGET_REMINDER_FIRED.clear()
+        # Clear this namespace across all conv_sids tracked in
+        # SessionState. We don't call reset_all() because other
+        # namespaces (other modules) may have unrelated state.
+        for sid in list(_NEXT_STRATEGY_IDX.keys()):
+            session_state.clear(sid, _NS, _K_STRATEGY_IDX)
+        for sid in list(_INJECTION_COUNT_PER_SESSION.keys()):
+            session_state.clear(sid, _NS, _K_INJECTION_COUNT)
+        for sid in list(_LAST_BUDGET_REMINDER_FIRED.keys()):
+            session_state.clear(sid, _NS, _K_BUDGET_REMINDER_FIRED)
         return
-    _NEXT_STRATEGY_IDX.pop(proj_sid, None)
-    _INJECTION_COUNT_PER_SESSION.pop(proj_sid, None)
-    _LAST_BUDGET_REMINDER_FIRED.pop(proj_sid, None)
+    session_state.clear(proj_sid, _NS, _K_STRATEGY_IDX)
+    session_state.clear(proj_sid, _NS, _K_INJECTION_COUNT)
+    session_state.clear(proj_sid, _NS, _K_BUDGET_REMINDER_FIRED)
 
 
 def reset_compaction_state(conv_sid: str | None,
@@ -289,32 +372,26 @@ def reset_compaction_state(conv_sid: str | None,
     """
     if not conv_sid:
         return
-    _INJECTION_COUNT_PER_SESSION.pop(conv_sid, None)
-    _LAST_BUDGET_REMINDER_FIRED.pop(conv_sid, None)
-    # Codex's compaction-handoff request may omit `prompt_cache_key`,
-    # degrading `conv_sid` to `proj_sid`. Normal-turn keys for this
-    # project look like `f"{proj_sid}:{cache_key}"` so the single pop
-    # above wouldn't reach them. When the caller flags this case by
-    # passing `proj_sid == conv_sid`, sweep every per-conv key prefixed
-    # by `f"{proj_sid}:"`. When conv_sid is precise (`"proj:cache"`),
-    # the single pop is enough and we don't disturb sibling conversations.
+    # Per-namespace compaction reset for the exact conv_sid.
+    session_state.reset_compaction(conv_sid)
+
+    # When the compaction-handoff request degraded `conv_sid` to
+    # `proj_sid`, also sweep all sibling per-conv keys.
     if proj_sid and proj_sid == conv_sid:
         prefix = f"{proj_sid}:"
-        for k in list(_INJECTION_COUNT_PER_SESSION.keys()):
-            if k.startswith(prefix):
-                _INJECTION_COUNT_PER_SESSION.pop(k, None)
-        for k in list(_LAST_BUDGET_REMINDER_FIRED.keys()):
-            if k.startswith(prefix):
-                _LAST_BUDGET_REMINDER_FIRED.pop(k, None)
+        for sid in session_state.keys_with_prefix(prefix):
+            session_state.reset_compaction(sid)
 
 
 def state_snapshot(proj_sid: str,
                     max_injections: int = 20) -> dict[str, Any]:
-    count = _INJECTION_COUNT_PER_SESSION.get(proj_sid, 0)
+    count = injection_count(proj_sid)
     return {
-        "next_strategy_idx": _NEXT_STRATEGY_IDX.get(proj_sid, 0),
+        "next_strategy_idx": int(
+            session_state.get(proj_sid, _NS, _K_STRATEGY_IDX, 0)),
         "available_strategies": [s["label"] for s in STRATEGIES],
         "injection_count": count,
         "over_budget": count >= max_injections,
-        "budget_reminder_fired": _LAST_BUDGET_REMINDER_FIRED.get(proj_sid, False),
+        "budget_reminder_fired": bool(
+            session_state.get(proj_sid, _NS, _K_BUDGET_REMINDER_FIRED, False)),
     }
