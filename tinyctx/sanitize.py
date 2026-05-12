@@ -877,6 +877,17 @@ class CacheAwareMutator:
 _PROACTIVE_SUMMARY_CACHE: dict[tuple[str, int], str] = {}
 _PROACTIVE_CACHE_BUCKET_SIZE: int = 20
 
+# Tool names whose latest call+output should be pinned through compaction.
+# `update_plan` is codex's built-in plan tracker; others (TodoWrite, etc.)
+# carry the same "what is the agent doing" semantic and would also bleed
+# the agent if compacted away. Add new ones here if downstream agents
+# adopt their own tracker tool. Order does not matter; the lookup scans
+# backwards for the latest call whose name is in this set.
+_TRACKER_TOOL_NAMES: frozenset[str] = frozenset({
+    "update_plan",
+    "TodoWrite",
+})
+
 
 def _hash_items(items: list) -> str:
     blob = json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)
@@ -1006,6 +1017,92 @@ def proactive_compact(
     middle = rest[:-recent_keep]
     tail = rest[-recent_keep:]
 
+    # ── Goal + tracker pinning ────────────────────────────────────────
+    # The old logic compacted EVERYTHING in `middle` into a summary item.
+    # Two specific item types must NOT be lost regardless of position,
+    # otherwise the post-compact agent loses grounding:
+    #
+    #   1. The first `role: "user"` message — the original task goal.
+    #      Without it the agent has no idea what it was asked to do; the
+    #      summary alone (especially when summarizer failed) is just
+    #      "[N older turns omitted]" with zero intent recovered.
+    #   2. The latest `update_plan` function_call + its function_call_output
+    #      — the agent's plan/tracker. Without it the agent either
+    #      re-plans blindly or surfaces to the user.
+    #
+    # Pinning algorithm:
+    #   - identify pin candidates by walking `middle` (head and tail items
+    #     are already preserved verbatim, no pinning work needed there)
+    #   - first user message: forward scan, first item with role=="user"
+    #   - latest tracker: backward scan, latest function_call with name
+    #     in _TRACKER_TOOL_NAMES; ALSO grab its paired function_call_output
+    #     (by call_id) so we don't orphan either half
+    #   - extract those items from middle (preserving order) and insert
+    #     them right after the summary item (before the tail).
+    #
+    # If a pin candidate is already in head or tail, we don't re-extract
+    # it from middle (it's already preserved).
+    pinned_from_middle: list = []
+    pinned_indices: set[int] = set()
+    # First user message = the user's original goal. We pin from middle
+    # ONLY when no user msg lives in head (head is preserved in original
+    # order, so a user msg there IS the first one). User msgs in tail are
+    # recent follow-ups, not the original goal — they don't count as
+    # already-preserving the goal.
+    user_in_head = any(
+        isinstance(it, dict) and it.get("role") == "user"
+        for it in head
+    )
+    if not user_in_head:
+        for i, it in enumerate(middle):
+            if isinstance(it, dict) and it.get("role") == "user":
+                pinned_indices.add(i)
+                break
+
+    # Latest tracker call in middle
+    latest_tracker_call_idx: int | None = None
+    latest_tracker_call_id: str = ""
+    for i in range(len(middle) - 1, -1, -1):
+        it = middle[i]
+        if (isinstance(it, dict)
+                and it.get("type") in _TOOL_CALL_TYPES
+                and it.get("name") in _TRACKER_TOOL_NAMES):
+            latest_tracker_call_idx = i
+            latest_tracker_call_id = it.get("call_id") or it.get("id") or ""
+            break
+
+    if latest_tracker_call_idx is not None:
+        # Check head/tail for an existing tracker call — if a fresher one
+        # is already there, no need to pin from middle.
+        tracker_in_head_or_tail = any(
+            isinstance(it, dict)
+            and it.get("type") in _TOOL_CALL_TYPES
+            and it.get("name") in _TRACKER_TOOL_NAMES
+            for it in head + tail
+        )
+        if not tracker_in_head_or_tail:
+            pinned_indices.add(latest_tracker_call_idx)
+            # Find its paired function_call_output (search after the call)
+            if latest_tracker_call_id:
+                for j in range(latest_tracker_call_idx + 1, len(middle)):
+                    it = middle[j]
+                    if (isinstance(it, dict)
+                            and it.get("type") in _TOOL_RESULT_TYPES
+                            and (it.get("call_id") or it.get("id"))
+                                == latest_tracker_call_id):
+                        pinned_indices.add(j)
+                        break
+
+    # Build pinned_from_middle in original order so the LLM sees the
+    # goal before the tracker (matches conversation chronology).
+    # We keep `middle` itself intact — the pinned items still appear in
+    # the summarizer blob (belt + suspenders: the goal/tracker show up
+    # both verbatim AND inside the summary). The pinned items are
+    # inserted into the FINAL out["input"] as their own verbatim copy.
+    if pinned_indices:
+        for i in sorted(pinned_indices):
+            pinned_from_middle.append(middle[i])
+
     # Tool-call/output pairing repair. The Responses API requires every
     # `function_call_output` to have a matching `function_call` somewhere
     # earlier in the input. Slicing the middle away can leave orphan
@@ -1118,7 +1215,12 @@ def proactive_compact(
     }
 
     out = deepcopy(body)
-    out["input"] = head + [summary_item] + tail
+    # Pinned items (first user goal + latest tracker pair) go between the
+    # summary item and the tail — i.e. they sit in chronological order
+    # AFTER the summary explains "these older turns got compacted, but
+    # these specific items are kept verbatim because they carry the goal
+    # and current tracker state."
+    out["input"] = head + [summary_item] + pinned_from_middle + tail
 
     info["applied"] = True
     info["reason"] = (f"est_tokens={est_tokens} >= {threshold_tokens}, "
@@ -1126,11 +1228,14 @@ def proactive_compact(
                       f"({'cached' if cached else 'fresh'} summary"
                       + (f", {synthetic_calls} synthetic call stubs"
                          if synthetic_calls else "")
+                      + (f", {len(pinned_from_middle)} pinned items"
+                         if pinned_from_middle else "")
                       + ")")
     info["items_after"] = len(out["input"])
     info["middle_items_compacted"] = len(middle)
     info["cached"] = cached
     info["synthetic_call_stubs"] = synthetic_calls
+    info["pinned_items"] = len(pinned_from_middle)
     return out, info
 
 

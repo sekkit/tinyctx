@@ -114,21 +114,28 @@ def test_proactive_compact_truncates_middle_default_placeholder():
     )
     assert info["applied"] is True
     assert info["items_before"] == n_before
-    # head=0 (no system items) + 1 summary + 8 recent = 9
-    assert info["items_after"] == 9
+    # head=0 (no system items) + 1 summary + 1 pinned first user msg
+    # + 8 recent = 10. Pinning adds the user-goal item back outside the
+    # compaction window so the post-compact agent retains intent.
+    assert info["items_after"] == 10
     assert info["middle_items_compacted"] == n_before - 8
     assert "compacted" in info["reason"]
     assert info["cached"] is False
+    assert info["pinned_items"] == 1
 
     # Last 8 items should be the same as the original last 8.
     assert out["input"][-8:] == body["input"][-8:]
-    # The summary item is in the middle.
-    summary_item = out["input"][-9]
+    # The summary item sits before the pinned items and tail.
+    summary_item = out["input"][0]
     assert summary_item["role"] == "user"
     assert summary_item["type"] == "message"
     text = summary_item["content"][0]["text"]
     assert "tinyctx auto-compact" in text
     assert "older turns" in text or "omitted to fit context" in text
+    # The pinned first user message sits between summary and tail.
+    pinned = out["input"][1]
+    assert pinned["role"] == "user"
+    assert pinned["content"][0]["text"] == "user turn 0"
 
 
 def test_proactive_compact_keeps_system_head_items():
@@ -149,8 +156,11 @@ def test_proactive_compact_keeps_system_head_items():
     assert out["input"][1]["role"] == "user"
     text = out["input"][1]["content"][0]["text"]
     assert "tinyctx auto-compact" in text
-    # Then 8 recent
-    assert len(out["input"]) == 1 + 1 + 8
+    # Then 1 pinned first user msg + 8 recent
+    assert len(out["input"]) == 1 + 1 + 1 + 8
+    # Pinned first user msg lives between summary and tail.
+    assert out["input"][2]["role"] == "user"
+    assert out["input"][2]["content"][0]["text"] == "user turn 0"
 
 
 def test_proactive_compact_caches_summary_for_same_middle():
@@ -187,7 +197,10 @@ def test_proactive_compact_uses_summarizer_when_provided():
         summarizer=fake_summarizer,
     )
     assert info["applied"] is True
-    summary_text = out["input"][-9]["content"][0]["text"]
+    # Summary item is now at index 0 (no head items in _make_body
+    # without with_system_head). The 1 pinned user msg sits between
+    # summary and the 8-item tail; final layout is [summary, pin, *tail].
+    summary_text = out["input"][0]["content"][0]["text"]
     assert "FAKE SUMMARY" in summary_text
     # Summarizer was given a blob with the middle turns
     assert "user turn 0" in captured_blob["blob"]
@@ -208,7 +221,8 @@ def test_proactive_compact_summarizer_failure_falls_back_to_placeholder():
     )
     # NEVER fail the request — only quality regression
     assert info["applied"] is True
-    summary_text = out["input"][-9]["content"][0]["text"]
+    # Summary item is at index 0 (no head items); see truncate test.
+    summary_text = out["input"][0]["content"][0]["text"]
     assert "backend dead" in summary_text or "summarizer failed" in summary_text
 
 
@@ -396,7 +410,8 @@ def test_proactive_compact_with_summarizer_uses_real_summary():
         summarizer=my_summarizer,
     )
     assert info["applied"] is True
-    summary_text = out["input"][-9]["content"][0]["text"]
+    # Summary item is at index 0 (no head items); see truncate test.
+    summary_text = out["input"][0]["content"][0]["text"]
     # Real summary should appear in the prepended user item
     assert "SLAM module" in summary_text
     assert "Main.kt:42" in summary_text
@@ -433,3 +448,216 @@ def test_clear_proactive_cache_session_scoped():
         summarizer=s1_summarizer,
     )
     assert info3["cached"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Goal + tracker pinning (regression: live 34m51s session lost both after
+# proactive_compact ran, advisor had to ask the user to restate the task)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_proactive_compact_preserves_first_user_message():
+    """The first `role: "user"` item in body.input carries the user's
+    original task goal. proactive_compact MUST keep it intact regardless
+    of where it sits in the input list — otherwise the post-compact agent
+    has no idea what it was asked to do."""
+    clear_proactive_cache()
+    items: list = []
+    # Codex prepends a developer/instructions item first
+    items.append({"type": "message", "role": "developer",
+                  "content": [{"type": "input_text", "text": "agent rules"}]})
+    # Then the FIRST user message — the actual goal
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text",
+                               "text": "FIX_BUG_X please refactor the SLAM module"}]})
+    # Lots of middle work
+    for i in range(500):
+        items.append({"type": "function_call",
+                      "call_id": f"c{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"c{i}", "output": f"r{i}"})
+    # A trailing follow-up user message in the tail
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "any update?"}]})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="goal-pin-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    text_concat = json.dumps(out["input"])
+    assert "FIX_BUG_X" in text_concat, (
+        "the first user message (original task goal) MUST survive compaction; "
+        "after compaction the post-compact agent has no way to recover the "
+        "user's intent. Items_after=" + str(info.get("items_after"))
+    )
+
+
+def test_proactive_compact_preserves_latest_update_plan():
+    """The latest `update_plan` function_call (and its paired
+    function_call_output) holds the agent's plan/tracker state. Losing it
+    forces the agent to either re-plan blindly or surface to the user
+    (which is the production bug we are fixing)."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "developer",
+                  "content": [{"type": "input_text", "text": "rules"}]})
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "goal text"}]})
+    # 200 plain calls before the plan
+    for i in range(200):
+        items.append({"type": "function_call",
+                      "call_id": f"pre{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"pre{i}", "output": "ok"})
+    # The latest update_plan call + output
+    items.append({"type": "function_call", "call_id": "plan_1",
+                  "name": "update_plan",
+                  "arguments": '{"plan":["UNIQUE_PLAN_MARKER step a","step b"]}'})
+    items.append({"type": "function_call_output", "call_id": "plan_1",
+                  "output": '{"ok":true,"plan_id":"PLAN_OUTPUT_MARKER"}'})
+    # 200 more calls AFTER the plan, so the plan ends up in the middle
+    for i in range(200):
+        items.append({"type": "function_call",
+                      "call_id": f"post{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"post{i}", "output": "ok"})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="plan-pin-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    text_concat = json.dumps(out["input"])
+    assert "UNIQUE_PLAN_MARKER" in text_concat, (
+        "the latest update_plan tracker MUST survive compaction; without it "
+        "the post-compact agent loses its plan state. "
+        "Items_after=" + str(info.get("items_after"))
+    )
+    assert "PLAN_OUTPUT_MARKER" in text_concat, (
+        "the paired update_plan function_call_output must be pinned together "
+        "with its function_call — pinning only one half leaves an orphan "
+        "that the orphan-tool-output pass drops."
+    )
+
+
+def test_proactive_compact_preserves_only_latest_update_plan():
+    """When multiple update_plan calls happened in the middle, only the
+    LATEST one needs to be pinned (older trackers are obsolete)."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "goal"}]})
+    # Plan v1
+    items.append({"type": "function_call", "call_id": "plan_A",
+                  "name": "update_plan",
+                  "arguments": '{"plan":["OLD_PLAN_V1"]}'})
+    items.append({"type": "function_call_output", "call_id": "plan_A",
+                  "output": "ok"})
+    # 100 middle calls
+    for i in range(100):
+        items.append({"type": "function_call",
+                      "call_id": f"m{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"m{i}", "output": "x"})
+    # Plan v2 (latest)
+    items.append({"type": "function_call", "call_id": "plan_B",
+                  "name": "update_plan",
+                  "arguments": '{"plan":["LATEST_PLAN_V2"]}'})
+    items.append({"type": "function_call_output", "call_id": "plan_B",
+                  "output": "ok"})
+    # 100 more middle calls
+    for i in range(100):
+        items.append({"type": "function_call",
+                      "call_id": f"n{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"n{i}", "output": "x"})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="latest-plan-only", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    text_concat = json.dumps(out["input"])
+    assert "LATEST_PLAN_V2" in text_concat, (
+        "latest update_plan MUST survive"
+    )
+    # OLD_PLAN_V1 may or may not survive — we don't pin obsolete trackers.
+    # We only check the LATEST one is kept.
+
+
+def test_proactive_compact_no_user_msg_no_update_plan_does_not_break():
+    """Edge case: body has no role=user item and no update_plan call.
+    Pinning lookups return None; compaction must still work as before."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "developer",
+                  "content": [{"type": "input_text", "text": "rules"}]})
+    for i in range(30):
+        items.append({"type": "function_call",
+                      "call_id": f"c{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"c{i}", "output": "r"})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="no-pins-edge", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    # head (developer) + summary + 8 tail; pin set is empty so nothing
+    # extra is added.
+    assert info["items_after"] == 1 + 1 + 8
+
+
+def test_proactive_compact_summary_blob_includes_goal_and_tracker():
+    """When a summarizer is provided, the blob it receives must contain
+    BOTH the first user message (goal) and the latest update_plan content
+    so the summary text itself carries the goal+tracker — even if the
+    pinning logic somehow loses them downstream."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text",
+                               "text": "GOAL_IN_BLOB please do X"}]})
+    items.append({"type": "function_call", "call_id": "plan_x",
+                  "name": "update_plan",
+                  "arguments": '{"plan":["TRACKER_IN_BLOB"]}'})
+    items.append({"type": "function_call_output", "call_id": "plan_x",
+                  "output": "ok"})
+    for i in range(60):
+        items.append({"type": "function_call",
+                      "call_id": f"c{i}", "name": "exec_command",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output",
+                      "call_id": f"c{i}", "output": "r"})
+
+    captured: dict = {}
+
+    def fake_summarizer(blob: str) -> str:
+        captured["blob"] = blob
+        return "FAKE"
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    proactive_compact(
+        body, session_id="blob-content-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+        summarizer=fake_summarizer,
+    )
+    blob = captured.get("blob", "")
+    assert "GOAL_IN_BLOB" in blob, (
+        "the summarizer blob must include the first user message so the "
+        "produced summary carries the user's goal explicitly"
+    )
+    assert "TRACKER_IN_BLOB" in blob, (
+        "the summarizer blob must include the latest update_plan args so "
+        "the produced summary carries the tracker explicitly"
+    )
