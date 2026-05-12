@@ -598,78 +598,10 @@ async def responses(request: Request) -> Any:
     except Exception:  # noqa: BLE001
         pass
 
-    # Plan persistence: save any update_plan / TodoWrite tracker
-    # currently in body.input to disk (per-cwd), and inject the
-    # persisted plan when this is a fresh thread (turn_count==0)
-    # — bridges context across codex thread boundaries.
-    if CFG.plan_persistence_enabled:
-        try:
-            from . import plan_persistence as _pp
-            cwd_hdr = request.headers.get("x-codex-cwd") or ""
-            state_dir = CFG.log_dir.parent / "state"
-            # Save current plan if any
-            plan_now = _pp.extract_plan_text(body)
-            if plan_now:
-                saved = _pp.save_plan(state_dir, cwd_hdr, plan_now,
-                                       session_id=sid,
-                                       turn_count=decision.turn_count)
-                if saved:
-                    _log("plan_persistence_saved", session=sid,
-                         cwd=cwd_hdr[:120], turn_count=decision.turn_count)
-            # Inject persisted plan on fresh thread
-            if decision.turn_count == 0:
-                pdata = _pp.load_plan(state_dir, cwd_hdr,
-                                       ttl_s=CFG.plan_persistence_ttl_s)
-                if pdata is not None:
-                    body, was_inj = _pp.inject_plan(body, pdata)
-                    if was_inj:
-                        _log("plan_persistence_injected",
-                             session=sid, cwd=cwd_hdr[:120],
-                             prev_turn_count=pdata.get("turn_count_at_save"),
-                             updated=pdata.get("updated_at_iso"))
-        except Exception as e:  # noqa: BLE001
-            _log("plan_persistence_error", session=sid, error=str(e))
-
-    # Empty-response guard: if the previous turn for this session
-    # returned an effectively empty response (e.g., DeepSeek silently
-    # degraded under long context), force this turn to frontier so
-    # the user gets a real answer. One-shot per detection — flag is
-    # consumed here. See tinyctx/empty_response_guard.py.
-    if CFG.empty_response_guard_enabled:
-        try:
-            from . import empty_response_guard as _erg
-            # Try conv-scoped key first; fall back to proj-scoped so flags
-            # set by mid-stream stall or upstream-error escalation (which
-            # don't have body access) still trigger frontier escalation.
-            force_info = _erg.consume_force_frontier(conv_sid)
-            if force_info is None and conv_sid != proj_sid:
-                force_info = _erg.consume_force_frontier(proj_sid)
-            elif force_info is not None and conv_sid != proj_sid:
-                # Consuming any flag for this proj_sid clears ALL flags
-                # under it (conv_sid-keyed + proj_sid-keyed). Without this,
-                # a dangling proj_sid flag (e.g. exec_resume set it later
-                # for the same project) would be consumed by a DIFFERENT
-                # conversation's next request via the fallback above —
-                # force-routing it for no reason.
-                _erg.reset_state(proj_sid)
-            if force_info is not None:
-                decision = Decision(
-                    "frontier",
-                    f"empty-response guard: {force_info.get('reason', '?')[:80]}",
-                    is_compaction=decision.is_compaction,
-                    est_input_tokens=decision.est_input_tokens,
-                    turn_count=decision.turn_count,
-                )
-                backend = CFG.frontier
-                _phase_set(proj_sid, RequestPhase.empty_guarded, trace.request_id)
-                _log("empty_response_guard_forced_frontier",
-                     session=sid, proj_sid=proj_sid,
-                     prev_completion_tokens=force_info.get("completion_tokens"),
-                     prev_finish_reason=force_info.get("finish_reason"))
-        except Exception as e:  # noqa: BLE001 — guard must never block
-            _log("empty_response_guard_error", session=sid, error=str(e))
-
     # Allow client to force a specific route via the model id sent.
+    # Done before the guard pipeline so the body-mutating guards (stuck,
+    # budget, soft) see `forced_by_client_model` in their context and
+    # skip themselves on advisor sub-threads.
     requested_model = (body.get("model") or "").lower()
     trace.requested_model = requested_model
     if requested_model == "tinyctx-local":
@@ -695,6 +627,138 @@ async def responses(request: Request) -> Any:
             stuck_loop.mark_advisor_call(proj_sid)
         except Exception:  # noqa: BLE001 — instrumentation only
             pass
+
+    # Pre-flight guard pipeline. Replaces the previously-inline calls
+    # into empty_response_guard / stuck_loop / synthetic_continue /
+    # soft_completion / plan_persistence. Each guard is a small class
+    # in tinyctx/guards.py wrapping the existing module function. The
+    # pipeline runs guards in priority order; ForceFrontierGuard's
+    # `force_route` decision is applied to `decision`/`backend` AFTER
+    # the pipeline returns. Per-guard trace fields and `_phase_set`
+    # calls are restored from the result list below to preserve the
+    # observability the old inline code emitted.
+    try:
+        from .guards import (
+            BudgetReminderGuard,
+            ForceFrontierGuard,
+            GuardContext,
+            GuardPipeline,
+            PlanPersistenceInjector,
+            SoftCompletionGate,
+            StuckLoopGuard,
+        )
+        cwd_hdr = request.headers.get("x-codex-cwd") or ""
+        state_dir = CFG.log_dir.parent / "state"
+        active_guards: list[Any] = []
+        if CFG.empty_response_guard_enabled:
+            active_guards.append(ForceFrontierGuard())
+        # Budget reminder is always enabled (its skip-gates live inside
+        # the guard); same gating shape as before.
+        active_guards.append(BudgetReminderGuard(
+            max_injections=CFG.max_continue_injections_per_session))
+        if CFG.stuck_loop_watchdog_enabled:
+            active_guards.append(StuckLoopGuard(
+                turn_trigger=CFG.stuck_loop_turn_trigger,
+                turn_gap=CFG.stuck_loop_turn_gap,
+                advisor_grace_s=CFG.stuck_loop_advisor_grace_s))
+        if CFG.soft_completion_gate_enabled:
+            active_guards.append(SoftCompletionGate())
+        if CFG.plan_persistence_enabled:
+            active_guards.append(PlanPersistenceInjector(
+                state_dir=state_dir,
+                cwd=cwd_hdr,
+                plan_ttl_s=CFG.plan_persistence_ttl_s,
+                session_id=sid))
+        guard_ctx = GuardContext(
+            body=body, proj_sid=proj_sid, conv_sid=conv_sid,
+            turn_count=decision.turn_count,
+            is_compaction=decision.is_compaction,
+            forced_by_client_model=trace.forced_by_client_model,
+        )
+        guard_results = GuardPipeline(active_guards).run(guard_ctx)
+        body = guard_ctx.body
+
+        # Apply per-guard side effects (route override, trace fields,
+        # phase, log emit) — keeps observability identical to the
+        # pre-refactor inline path.
+        for gr in guard_results:
+            if gr.guard_name == "force_frontier":
+                if gr.fired and decision.route != "frontier":
+                    decision = Decision(
+                        "frontier", gr.reason,
+                        is_compaction=decision.is_compaction,
+                        est_input_tokens=decision.est_input_tokens,
+                        turn_count=decision.turn_count,
+                    )
+                    backend = CFG.frontier
+                    _phase_set(proj_sid, RequestPhase.empty_guarded,
+                                trace.request_id)
+                    _log("empty_response_guard_forced_frontier",
+                          session=sid, proj_sid=proj_sid,
+                          prev_completion_tokens=gr.additional_log.get(
+                              "completion_tokens"),
+                          prev_finish_reason=gr.additional_log.get(
+                              "finish_reason"))
+                elif (not gr.fired and gr.additional_log.get(
+                        "exception_type")):
+                    _log("empty_response_guard_error",
+                          session=sid, error=gr.reason)
+            elif gr.guard_name == "stuck_loop":
+                if gr.fired:
+                    trace.stuck_reminder_injected = True
+                    trace.stuck_turn_count_at_inject = decision.turn_count
+                    _phase_set(proj_sid, RequestPhase.injecting,
+                                trace.request_id)
+                    _log("stuck_reminder_injected", session=sid,
+                          proj_sid=proj_sid, turn_count=decision.turn_count)
+                elif gr.additional_log.get("exception_type"):
+                    _log("stuck_loop_error", session=sid, error=gr.reason)
+            elif gr.guard_name == "budget_reminder":
+                if gr.fired:
+                    _log("budget_exhausted_reminder_injected",
+                          session=sid, proj_sid=proj_sid,
+                          injection_count=gr.additional_log.get(
+                              "injection_count"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("budget_reminder_error", session=sid,
+                          error=gr.reason)
+            elif gr.guard_name == "soft_completion_gate":
+                if gr.fired:
+                    trace.soft_completion_gate_injected = True
+                    trace.soft_completion_gate_pattern = (
+                        gr.additional_log.get("pattern") or "")
+                    _log("soft_completion_gate_injected", session=sid,
+                          proj_sid=proj_sid,
+                          pattern=gr.additional_log.get("pattern"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("soft_completion_gate_error", session=sid,
+                          error=gr.reason)
+            elif gr.guard_name == "plan_persistence":
+                if gr.fired:
+                    # Two distinct logs depending on which sub-action fired.
+                    if "saved" in (gr.reason or ""):
+                        _log("plan_persistence_saved", session=sid,
+                              cwd=cwd_hdr[:120],
+                              turn_count=decision.turn_count)
+                    if "injected" in (gr.reason or ""):
+                        _log("plan_persistence_injected",
+                              session=sid, cwd=cwd_hdr[:120],
+                              prev_turn_count=gr.additional_log.get(
+                                  "prev_turn_count"),
+                              updated=gr.additional_log.get("updated"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("plan_persistence_error", session=sid,
+                          error=gr.reason)
+
+        # Single roll-up event so dashboards can see what fired in one
+        # place without scanning across the per-guard log events above.
+        _log("guards_pipeline_done", session=sid, proj_sid=proj_sid,
+              conv_sid=conv_sid,
+              fired=[gr.guard_name for gr in guard_results if gr.fired],
+              skipped=[gr.guard_name for gr in guard_results
+                       if not gr.fired])
+    except Exception as e:  # noqa: BLE001 — pipeline must never block
+        _log("guards_pipeline_error", session=sid, error=str(e))
 
     # Model-driven escalation (Anthropic Advisor Strategy alignment):
     # ask the LOCAL model itself whether this turn deserves the advisor.
@@ -765,82 +829,8 @@ async def responses(request: Request) -> Any:
         except Exception as e:  # noqa: BLE001
             _log("compaction_reset_error", session=sid, error=str(e))
 
-    # Stuck-loop watchdog: when turn_count climbs past the trigger
-    # without a recent advisor call, append a `<system-reminder>` to
-    # the input tail asking the agent to either consult advisor or
-    # surface its blocker. See tinyctx/stuck_loop.py for rationale.
-    # Only fires for non-compaction main turns (advisor sub-threads
-    # carry forced_by_client_model and don't need their own watchdog).
-    if (CFG.stuck_loop_watchdog_enabled
-            and not decision.is_compaction
-            and not trace.forced_by_client_model):
-        try:
-            from . import stuck_loop
-            # Key the reminder gate by conv_sid so a fresh conversation
-            # (codex turn_count resets to 0) doesn't get blocked by a
-            # stale `_LAST_REMINDER_TURN` from the previous conversation
-            # (e.g. 175 → `0 - 175 = -175 < 50` would skip forever).
-            # Advisor grace stays project-scoped so advisor activity in
-            # any sub-thread quiets nudges across all conversations.
-            body, was_injected = stuck_loop.maybe_inject_stuck_reminder(
-                body, conv_sid, decision.turn_count,
-                turn_trigger=CFG.stuck_loop_turn_trigger,
-                turn_gap=CFG.stuck_loop_turn_gap,
-                advisor_grace_s=CFG.stuck_loop_advisor_grace_s,
-                advisor_scope_sid=proj_sid,
-            )
-            if was_injected:
-                trace.stuck_reminder_injected = True
-                trace.stuck_turn_count_at_inject = decision.turn_count
-                _phase_set(proj_sid, RequestPhase.injecting, trace.request_id)
-                _log("stuck_reminder_injected", session=sid,
-                     proj_sid=proj_sid, turn_count=decision.turn_count)
-        except Exception as e:  # noqa: BLE001 — watchdog must never block
-            _log("stuck_loop_error", session=sid, error=str(e))
-
-    # P2: injection-budget exhaustion reminder. When synthetic_continue
-    # tripped its budget on the previous turn, append a one-shot
-    # `<system-reminder>` warning the agent that tinyctx auto-continued
-    # N times and may have been wrong. Keyed by conv_sid so a fresh
-    # conversation in the same project starts with a clean budget
-    # instead of inheriting the previous thread's exhausted counter.
-    # The flag is consumed on use so this never repeats next turn.
-    if not decision.is_compaction and not trace.forced_by_client_model:
-        try:
-            from . import synthetic_continue as _syn_budget
-            inj_count = _syn_budget.injection_count(conv_sid)
-            if (inj_count >= CFG.max_continue_injections_per_session
-                    and inj_count > 0):
-                body, was_budget_inj = (
-                    _syn_budget.maybe_inject_budget_reminder(
-                        body, conv_sid, inj_count))
-                if was_budget_inj:
-                    _log("budget_exhausted_reminder_injected",
-                         session=sid, proj_sid=proj_sid,
-                         injection_count=inj_count)
-        except Exception as e:  # noqa: BLE001
-            _log("budget_reminder_error", session=sid, error=str(e))
-
-    # Soft-completion gate: if the previous turn ended with a "soft
-    # punt to user" pattern (matched in the streaming sniffer), inject
-    # an advisor-vet reminder requiring the agent to route any user-
-    # facing question through advisor first. Per user directive: "如果
-    # 非要提问，走 advisor 进行回答". See tinyctx/soft_completion.py.
-    if (CFG.soft_completion_gate_enabled
-            and not decision.is_compaction
-            and not trace.forced_by_client_model):
-        try:
-            from . import soft_completion
-            body, was_gated, gate_pattern = (
-                soft_completion.maybe_inject_soft_completion_gate(
-                    body, proj_sid))
-            if was_gated:
-                trace.soft_completion_gate_injected = True
-                trace.soft_completion_gate_pattern = gate_pattern
-                _log("soft_completion_gate_injected", session=sid,
-                     proj_sid=proj_sid, pattern=gate_pattern)
-        except Exception as e:  # noqa: BLE001
-            _log("soft_completion_gate_error", session=sid, error=str(e))
+    # (stuck_loop, budget_reminder, soft_completion guards now run
+    # inside the GuardPipeline above — see tinyctx/guards.py.)
 
     # Sanitize before any model swap.
     if CFG.sanitize_encrypted_content:

@@ -1,0 +1,314 @@
+"""Priority-ordered pre-flight guard pipeline (P4 refactor).
+
+Before P4, pre-flight guards (`empty_response_guard`, `stuck_loop`,
+`synthetic_continue`, `soft_completion`, `plan_persistence`) were called
+inline from `tinyctx.proxy.responses` in an implicit, hardcoded order.
+Each one's effect (body mutation, route override, flag consumption) was
+also inline — adding a new guard meant editing the central handler, and
+"why did this guard fire" was scattered across several `_log()` calls.
+
+This module replaces those inline calls with:
+
+- `Guard` — Protocol every guard implements (`name`, `priority`,
+  `apply(ctx) -> GuardResult`).
+- `GuardContext` — request-scoped inputs guards inspect and mutate
+  (body, session keys, turn_count, plus a small mutation accumulator
+  for `force_route` and the list of injected reminders).
+- `GuardResult` — uniform per-guard contribution (fired? body mutated?
+  force_route? reason? additional log fields?).
+- `GuardPipeline` — runs guards in priority order (lower first), each
+  seeing the cumulative mutations of earlier guards. Exceptions in one
+  guard never break the pipeline — they're captured into the guard's
+  `GuardResult.reason` so the request can still proceed.
+
+The 5 concrete wrapper guards (`ForceFrontierGuard`,
+`BudgetReminderGuard`, `StuckLoopGuard`, `SoftCompletionGate`,
+`PlanPersistenceInjector`) preserve EXACT existing behavior — they
+only relocate where the call happens. The underlying module functions
+(in `empty_response_guard.py` etc.) are unchanged.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+
+@dataclass
+class GuardResult:
+    """One guard's contribution to the request shape."""
+    guard_name: str
+    fired: bool
+    reason: str = ""
+    body_mutated: bool = False
+    force_route: str | None = None  # "frontier" | "local" | None
+    additional_log: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GuardContext:
+    """Inputs guards inspect + mutate.
+
+    `body` is the request body (mutated in-place via reassignment to
+    `ctx.body`). `force_route` and `injected_reminders` accumulate the
+    cumulative effect of all guards that ran so far; the proxy reads
+    them after `pipeline.run()` returns.
+    """
+    body: dict[str, Any]
+    proj_sid: str
+    conv_sid: str
+    turn_count: int = 0
+    is_compaction: bool = False
+    forced_by_client_model: bool = False
+    # Mutation accumulator
+    force_route: str | None = None
+    injected_reminders: list[str] = field(default_factory=list)
+
+
+@runtime_checkable
+class Guard(Protocol):
+    """Each guard exposes a name, a priority (lower runs first), and an
+    `apply(ctx)` that returns a GuardResult."""
+    name: str
+    priority: int
+
+    def apply(self, ctx: GuardContext) -> GuardResult: ...
+
+
+class GuardPipeline:
+    """Run a fixed set of guards in priority order. Lower priority runs
+    first. Each guard sees ctx mutations from prior guards. A guard's
+    exception is captured into its `GuardResult` so subsequent guards
+    still run (degrade rather than crash the request)."""
+
+    def __init__(self, guards: list[Guard]):
+        self._guards = sorted(guards, key=lambda g: g.priority)
+
+    def run(self, ctx: GuardContext) -> list[GuardResult]:
+        results: list[GuardResult] = []
+        for g in self._guards:
+            try:
+                r = g.apply(ctx)
+            except Exception as e:  # noqa: BLE001 — degrade, never crash
+                r = GuardResult(
+                    guard_name=getattr(g, "name", g.__class__.__name__),
+                    fired=False,
+                    reason=f"exception: {e!r}",
+                    additional_log={"exception_type": type(e).__name__},
+                )
+            results.append(r)
+        return results
+
+
+# ─── concrete wrapper guards ─────────────────────────────────────────────
+
+
+class ForceFrontierGuard:
+    """Consume the one-shot `force_next_to_frontier` flag from
+    `empty_response_guard`. When set, the next request is forced to
+    frontier (caller reads `ctx.force_route` to apply the route
+    override). Tries `conv_sid` first, then falls back to `proj_sid`
+    so flags set by mid-stream stall / upstream-error escalation
+    (which don't have body access) still trigger.
+
+    Wraps `empty_response_guard.consume_force_frontier`."""
+
+    name = "force_frontier"
+    priority = 10  # runs first — its decision dominates routing
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        from . import empty_response_guard as _erg
+        info = _erg.consume_force_frontier(ctx.conv_sid)
+        if info is None and ctx.conv_sid != ctx.proj_sid:
+            info = _erg.consume_force_frontier(ctx.proj_sid)
+        elif info is not None and ctx.conv_sid != ctx.proj_sid:
+            # Consuming any flag for this proj_sid clears ALL flags
+            # under it (conv_sid-keyed + proj_sid-keyed). Without this,
+            # a dangling proj_sid flag would be consumed by a DIFFERENT
+            # conversation's next request via the fallback above —
+            # force-routing it for no reason. Mirrors proxy.py behavior.
+            _erg.reset_state(ctx.proj_sid)
+        if info is None:
+            return GuardResult(guard_name=self.name, fired=False)
+        ctx.force_route = "frontier"
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            reason=f"empty-response guard: {info.get('reason', '?')[:80]}",
+            force_route="frontier",
+            additional_log={
+                "completion_tokens": info.get("completion_tokens"),
+                "finish_reason": info.get("finish_reason"),
+            },
+        )
+
+
+class BudgetReminderGuard:
+    """Inject a one-shot `<system-reminder>` when synthetic_continue
+    tripped its per-conversation injection budget. Skipped on
+    compaction or when the client explicitly forced a model.
+
+    Wraps `synthetic_continue.maybe_inject_budget_reminder`."""
+
+    name = "budget_reminder"
+    priority = 20
+
+    def __init__(self, max_injections: int = 12):
+        self.max_injections = max_injections
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(guard_name=self.name, fired=False,
+                                reason="skipped: compaction or forced model")
+        from . import synthetic_continue as _syn
+        inj_count = _syn.injection_count(ctx.conv_sid)
+        if not (inj_count >= self.max_injections and inj_count > 0):
+            return GuardResult(guard_name=self.name, fired=False)
+        new_body, was_inj = _syn.maybe_inject_budget_reminder(
+            ctx.body, ctx.conv_sid, inj_count)
+        if not was_inj:
+            # Already fired this conversation — flag consumed.
+            return GuardResult(guard_name=self.name, fired=False,
+                                reason="already fired this conversation")
+        ctx.body = new_body
+        ctx.injected_reminders.append(self.name)
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=True,
+            reason=f"injection_count={inj_count} >= budget={self.max_injections}",
+            additional_log={"injection_count": inj_count},
+        )
+
+
+class StuckLoopGuard:
+    """Inject a stuck-loop `<system-reminder>` when turn_count climbs
+    past `turn_trigger` without a recent advisor call. Keyed by
+    `conv_sid` (so a new codex thread starts with a clean counter);
+    advisor grace uses `proj_sid` (so advisor activity in any
+    sub-thread quiets nudges across the project).
+
+    Wraps `stuck_loop.maybe_inject_stuck_reminder`."""
+
+    name = "stuck_loop"
+    priority = 30
+
+    def __init__(self, turn_trigger: int = 80, turn_gap: int = 50,
+                  advisor_grace_s: float = 600.0):
+        self.turn_trigger = turn_trigger
+        self.turn_gap = turn_gap
+        self.advisor_grace_s = advisor_grace_s
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(guard_name=self.name, fired=False,
+                                reason="skipped: compaction or forced model")
+        from . import stuck_loop
+        new_body, was_inj = stuck_loop.maybe_inject_stuck_reminder(
+            ctx.body, ctx.conv_sid, ctx.turn_count,
+            turn_trigger=self.turn_trigger,
+            turn_gap=self.turn_gap,
+            advisor_grace_s=self.advisor_grace_s,
+            advisor_scope_sid=ctx.proj_sid,
+        )
+        if not was_inj:
+            return GuardResult(guard_name=self.name, fired=False)
+        ctx.body = new_body
+        ctx.injected_reminders.append(self.name)
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=True,
+            reason=f"stuck at turn={ctx.turn_count}",
+            additional_log={"turn_count": ctx.turn_count},
+        )
+
+
+class SoftCompletionGate:
+    """Inject an advisor-vet `<system-reminder>` when the previous
+    turn ended in a "soft punt to user" pattern (matched by the
+    streaming sniffer + classifier). Per user directive: if the agent
+    insists on asking the user, route the question through advisor
+    first.
+
+    Wraps `soft_completion.maybe_inject_soft_completion_gate`."""
+
+    name = "soft_completion_gate"
+    priority = 40
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(guard_name=self.name, fired=False,
+                                reason="skipped: compaction or forced model")
+        from . import soft_completion
+        new_body, was_gated, gate_pattern = (
+            soft_completion.maybe_inject_soft_completion_gate(
+                ctx.body, ctx.proj_sid))
+        if not was_gated:
+            return GuardResult(guard_name=self.name, fired=False)
+        ctx.body = new_body
+        ctx.injected_reminders.append(self.name)
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=True,
+            reason=f"soft-completion pattern: {gate_pattern}",
+            additional_log={"pattern": gate_pattern},
+        )
+
+
+class PlanPersistenceInjector:
+    """Save the current turn's progress tracker (update_plan /
+    TodoWrite) to disk for this cwd, and inject a previously-saved
+    plan as a `<persisted-plan>` block on the FIRST turn of a fresh
+    codex thread (turn_count==0). Bridges context across thread
+    boundaries within the same working directory.
+
+    Wraps `plan_persistence.save_plan` + `load_plan` + `inject_plan`."""
+
+    name = "plan_persistence"
+    priority = 50  # runs last — purely additive context injection
+
+    def __init__(self, state_dir: Path, cwd: str,
+                  plan_ttl_s: float, session_id: str = ""):
+        self.state_dir = state_dir
+        self.cwd = cwd or ""
+        self.plan_ttl_s = plan_ttl_s
+        self.session_id = session_id
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        from . import plan_persistence as _pp
+        saved = False
+        injected = False
+        plan_now = _pp.extract_plan_text(ctx.body)
+        if plan_now:
+            saved = _pp.save_plan(self.state_dir, self.cwd, plan_now,
+                                    session_id=self.session_id,
+                                    turn_count=ctx.turn_count)
+        pdata_meta: dict[str, Any] = {}
+        if ctx.turn_count == 0:
+            pdata = _pp.load_plan(self.state_dir, self.cwd,
+                                   ttl_s=self.plan_ttl_s)
+            if pdata is not None:
+                new_body, was_inj = _pp.inject_plan(ctx.body, pdata)
+                if was_inj:
+                    ctx.body = new_body
+                    injected = True
+                    pdata_meta = {
+                        "prev_turn_count": pdata.get("turn_count_at_save"),
+                        "updated": pdata.get("updated_at_iso"),
+                    }
+        if not (saved or injected):
+            return GuardResult(guard_name=self.name, fired=False)
+        bits: list[str] = []
+        if saved:
+            bits.append("saved")
+        if injected:
+            bits.append("injected")
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=injected,
+            reason=",".join(bits),
+            additional_log={"cwd": self.cwd[:120], **pdata_meta},
+        )
