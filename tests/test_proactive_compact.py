@@ -661,3 +661,127 @@ def test_proactive_compact_summary_blob_includes_goal_and_tracker():
         "the summarizer blob must include the latest update_plan args so "
         "the produced summary carries the tracker explicitly"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Execution-state preservation: shell activity, file edits, errors must
+# survive compaction so the post-compact agent doesn't lose what it did.
+# Regression: user reported even after 09b1946 the agent loses recent
+# exec_command outputs, edits, and error signals.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_proactive_compact_summary_includes_recent_shell_activity():
+    """Recent exec_command calls + their outputs must be preserved or
+    summarized through compaction. Currently the deterministic placeholder
+    plus the 2k-char LM summary lose all shell history that fell out of
+    the recent_keep window."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "build the thing"}]})
+    # 195 noise calls
+    for i in range(195):
+        items.append({"type": "function_call", "call_id": f"c{i}",
+                      "name": "exec_command",
+                      "arguments": json.dumps({"command": [f"echo {i}"]})})
+        items.append({"type": "function_call_output", "call_id": f"c{i}",
+                      "output": "noise"})
+    # Marker shell command + output (the one we want to see surface)
+    items.append({"type": "function_call", "call_id": "cBUILD",
+                  "name": "exec_command",
+                  "arguments": json.dumps({"command": ["cargo build"]})})
+    items.append({"type": "function_call_output", "call_id": "cBUILD",
+                  "output": "SHELL_MARKER_BUILD_OK"})
+    # 200 more noise calls afterwards so the marker lands in middle
+    for i in range(195, 395):
+        items.append({"type": "function_call", "call_id": f"d{i}",
+                      "name": "exec_command",
+                      "arguments": json.dumps({"command": [f"ls /{i}"]})})
+        items.append({"type": "function_call_output", "call_id": f"d{i}",
+                      "output": "ok"})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="shell-history-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    text = json.dumps(out["input"])
+    assert "SHELL_MARKER_BUILD_OK" in text or "cargo build" in text, (
+        "recent shell command + output must be preserved or summarized; "
+        "without it the post-compact agent has no idea what shell work was "
+        "done. items_after=" + str(info.get("items_after"))
+    )
+
+
+def test_proactive_compact_summary_includes_recent_edits():
+    """Recent file-edit calls (apply_patch / Edit / Write) must survive
+    compaction or appear in the structured summary so the agent knows
+    what files it touched."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "fix the bug"}]})
+    for i in range(200):
+        items.append({"type": "function_call", "call_id": f"c{i}",
+                      "name": "exec_command", "arguments": "{}"})
+        items.append({"type": "function_call_output", "call_id": f"c{i}",
+                      "output": "noise"})
+    # Marker edit
+    items.append({"type": "function_call", "call_id": "edit_1",
+                  "name": "apply_patch",
+                  "arguments": json.dumps({"diff": "--- a/UNIQUE_FILE_MARKER.py"})})
+    items.append({"type": "function_call_output", "call_id": "edit_1",
+                  "output": "patched"})
+    for i in range(200, 400):
+        items.append({"type": "function_call", "call_id": f"c{i}",
+                      "name": "exec_command", "arguments": "{}"})
+        items.append({"type": "function_call_output", "call_id": f"c{i}",
+                      "output": "ok"})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="edit-history-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    text = json.dumps(out["input"])
+    assert "UNIQUE_FILE_MARKER" in text, (
+        "recent file edits must be preserved or summarized; without them the "
+        "post-compact agent doesn't know what files it changed. "
+        "items_after=" + str(info.get("items_after"))
+    )
+
+
+def test_proactive_compact_summary_includes_errors():
+    """Distinct error outputs (non-empty stderr / exit != 0 / 'FAILED' /
+    'AssertionError' markers) must survive compaction so the agent knows
+    what didn't work."""
+    clear_proactive_cache()
+    items: list = []
+    items.append({"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "run tests"}]})
+    items.append({"type": "function_call", "call_id": "err_1",
+                  "name": "exec_command",
+                  "arguments": json.dumps({"command": ["pytest"]})})
+    items.append({"type": "function_call_output", "call_id": "err_1",
+                  "output": "FAILED test_x.py::test_y - AssertionError: UNIQUE_ERR_MARKER"})
+    # Bury the error in a 300-call middle
+    for i in range(300):
+        items.append({"type": "function_call", "call_id": f"c{i}",
+                      "name": "exec_command", "arguments": "{}"})
+        items.append({"type": "function_call_output", "call_id": f"c{i}",
+                      "output": "ok"})
+
+    body = {"model": "tinyctx", "instructions": "x", "input": items}
+    out, info = proactive_compact(
+        body, session_id="err-history-test", est_tokens=300_000,
+        threshold_tokens=200_000, recent_keep=8,
+    )
+    assert info["applied"] is True
+    text = json.dumps(out["input"])
+    assert "UNIQUE_ERR_MARKER" in text, (
+        "errors must be preserved or summarized; without them the post-compact "
+        "agent doesn't know what failed. items_after=" + str(info.get("items_after"))
+    )

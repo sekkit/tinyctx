@@ -141,26 +141,42 @@ _PROACTIVE_SUMMARY_SYSTEM_PROMPT = (
     "that is about to be truncated to fit within a context window. The "
     "RECENT turns will continue verbatim after your summary; the model "
     "reading your summary is the same one that wrote those turns. Your "
-    "job is to give it just enough memory to keep working without losing "
-    "the thread.\n\n"
-    "Output a 250-500 word markdown handoff with these sections:\n"
-    "## What we were trying to do\n"
+    "job is to give it enough memory — including SHELL ACTIVITY, FILE "
+    "EDITS, and ERROR SIGNALS — to keep working without losing the thread.\n\n"
+    "The input you receive is split into:\n"
+    "  - '## Pre-extracted execution signals' (recent edits / shell / errors)\n"
+    "  - '## Raw transcript of older turns'\n"
+    "Use BOTH. Don't drop the execution signals — they are load-bearing.\n\n"
+    "Output a 400-900 word markdown handoff with these sections:\n"
+    "## Session goal\n"
     "  The user's actual goal. Be specific. Include any pivot the user made.\n"
-    "## Files & decisions\n"
-    "  Concrete paths touched. Decisions made (e.g. \"keep the env-knob\" or\n"
-    "  \"drop SLAM setup\"). Verbatim where possible.\n"
-    "## Commands & outcomes\n"
-    "  Exact commands run and what they returned (success/failure + key\n"
-    "  output line). Do NOT include long stderr — one line per command.\n"
-    "## What's left / next step\n"
-    "  Pending work the model was about to do, or the question it was\n"
+    "## Recent file edits\n"
+    "  Concrete paths touched and what changed. One line per edit, newest "
+    "  last. Quote the pre-extracted signals when relevant.\n"
+    "## Recent shell activity\n"
+    "  Exact commands run and what they returned (success/failure + key "
+    "  output line). Cover at least the 10 most recent. One line per "
+    "  command. Drop pure noise (`echo`, `ls /tmp`); keep build/test/git/curl.\n"
+    "## Errors / failures encountered\n"
+    "  Distinct error patterns observed. Include the actual error text so "
+    "  the next turn can reason about them.\n"
+    "## Plan progress\n"
+    "  Latest update_plan / TodoWrite content (verbatim if short). Items "
+    "  checked off so far if extractable.\n"
+    "## Acceptance / verification signals\n"
+    "  Tests passed / failed (counts + names if visible). Build status. "
+    "  Linter/type-check status if visible.\n"
+    "## Open questions / blockers / next step\n"
+    "  Pending work the model was about to do, or the question it was "
     "  about to ask. Be explicit so the next turn can resume.\n\n"
     "Rules:\n"
     "  - Concrete > abstract. Say \"removed RayNeo SLAM env knobs in\n"
     "    com.foo.Bar.kt:42\" not \"made some Kotlin changes\".\n"
     "  - Drop redundancy and chitchat.\n"
     "  - Do NOT invent anything not in the conversation.\n"
-    "  - Keep it terse. The next model has tokens to spare elsewhere."
+    "  - Preserve unique markers, file paths, error class names, command "
+    "    names verbatim — the next model uses them as anchors.\n"
+    "  - Keep it terse but COMPLETE on the execution signals."
 )
 
 
@@ -190,7 +206,12 @@ def _make_local_summarizer(local: BackendCfg):
             ],
             "temperature": 0.2,
             "top_p": 0.9,
-            "max_tokens": 1200,
+            # Bumped from 1200 → 2000 to fit the structured multi-section
+            # handoff (goal + edits + shell + errors + plan + verification
+            # + next step). 1200 truncated the shell/errors sections in
+            # practice and was the proximate cause of "execution state
+            # lost after compaction".
+            "max_tokens": 2000,
             "stream": False,
         }
         # Synchronous httpx — proactive_compact wraps us in asyncio.to_thread

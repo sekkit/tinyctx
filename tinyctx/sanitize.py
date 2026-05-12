@@ -888,6 +888,47 @@ _TRACKER_TOOL_NAMES: frozenset[str] = frozenset({
     "TodoWrite",
 })
 
+# Tool names recognized as "shell-like" — outputs are exec results.
+# Used by _extract_shell_history to surface recent shell activity into
+# the compaction summary.
+_SHELL_TOOL_NAMES: frozenset[str] = frozenset({
+    "exec_command",
+    "shell",
+    "Bash",
+    "local_shell_call",
+})
+
+# Tool names recognized as "edit-like" — calls represent file writes.
+# Used by _extract_edits to surface recent file changes into the summary.
+_EDIT_TOOL_NAMES: frozenset[str] = frozenset({
+    "apply_patch",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "str_replace_editor",
+})
+
+# Substrings (case-insensitive) that flag a tool result as an error.
+# Used by _extract_errors to surface recent failures into the summary.
+_ERROR_MARKERS: tuple[str, ...] = (
+    "error", "failed", "traceback", "exception",
+    "assertionerror", "fatal:", "panic:", "non-zero exit",
+)
+
+# Substrings (case-insensitive) that flag a shell command as "interesting"
+# enough to surface even when it didn't happen recently — build/test/git/
+# package-manager invocations and similar high-signal commands. Used by
+# _extract_shell_history so heavy build commands buried 200+ turns back
+# still reach the post-compact summary.
+_HIGH_SIGNAL_SHELL_MARKERS: tuple[str, ...] = (
+    "build", "test", "pytest", "cargo", "gradle", "make", "npm ", "yarn ",
+    "pnpm ", "uv run", "pip install", "git ", "curl ", "wget ", "ssh ",
+    "docker ", "kubectl ", "terraform ", "ansible-", "go build", "go test",
+    "rustc", "javac", "mvn ", "swift build", "xcodebuild", "deploy",
+    "migrate", "psql", "mysql", "sqlite3",
+)
+
 
 def _hash_items(items: list) -> str:
     blob = json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)
@@ -942,6 +983,192 @@ def _flatten_history_for_summary(items: list, *, max_chars: int = 60_000) -> str
         tail = blob[-(3 * max_chars // 4):]
         blob = head + "\n\n... [middle truncated by tinyctx proactive_compact] ...\n\n" + tail
     return blob
+
+
+def _tool_result_text(item: dict[str, Any]) -> str:
+    """Best-effort flatten of a tool-result item's output for extraction."""
+    v = item.get("output")
+    if v is None:
+        v = item.get("content")
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, dict)):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            return str(v)
+    return str(v)
+
+
+def _short_args(args: Any, *, limit: int = 200) -> str:
+    """Compact one-line preview of a tool call's arguments."""
+    if isinstance(args, (dict, list)):
+        try:
+            s = json.dumps(args, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            s = str(args)
+    else:
+        s = str(args) if args is not None else ""
+    s = s.replace("\n", " ").strip()
+    return s[:limit] + ("..." if len(s) > limit else "")
+
+
+def _extract_shell_history(items: list, *, last_n: int = 15,
+                           high_signal_extra: int = 10) -> list[str]:
+    """Return up to last_n one-line summaries of RECENT shell-like tool
+    calls + their outputs PLUS up to high_signal_extra HIGH-SIGNAL entries
+    (build/test/git/etc.) that may sit further back in history.
+
+    The post-compact agent needs both:
+      - recency (what just happened, regardless of importance), AND
+      - importance (the cargo build / pytest invocation 200 turns ago is
+        load-bearing even if 200 echo/ls calls happened since).
+
+    Each entry looks like: "`cmd preview`: output_preview"
+    Output is chronological (newest last), de-duplicated by command line.
+    """
+    # Index outputs by call_id for pairing.
+    outputs: dict[str, str] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") in _TOOL_RESULT_TYPES:
+            cid = it.get("call_id") or it.get("id") or ""
+            if cid:
+                outputs[cid] = _tool_result_text(it)
+
+    # Collect every shell call (with original index for chronological ordering).
+    every: list[tuple[int, str, str]] = []  # (index, cmd_preview, line)
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") not in _TOOL_CALL_TYPES:
+            continue
+        if it.get("name") not in _SHELL_TOOL_NAMES:
+            continue
+        cid = it.get("call_id") or it.get("id") or ""
+        args = it.get("arguments")
+        cmd_preview = ""
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+                cmd = parsed.get("command") if isinstance(parsed, dict) else None
+                if isinstance(cmd, list):
+                    cmd_preview = " ".join(str(c) for c in cmd)
+                elif isinstance(cmd, str):
+                    cmd_preview = cmd
+            except Exception:  # noqa: BLE001
+                pass
+        if not cmd_preview:
+            cmd_preview = _short_args(args, limit=160)
+        out_preview = (outputs.get(cid, "") or "").replace("\n", " ").strip()
+        if len(out_preview) > 200:
+            out_preview = out_preview[:200] + "..."
+        line = (f"`{cmd_preview[:160]}`: {out_preview}" if out_preview
+                else f"`{cmd_preview[:160]}`")
+        every.append((idx, cmd_preview, line))
+
+    if not every:
+        return []
+
+    # Recent slice (last N).
+    recent = every[-last_n:]
+    recent_idx_set = {x[0] for x in recent}
+
+    # High-signal slice: scan all, prefer those NOT already in recent.
+    high_signal: list[tuple[int, str, str]] = []
+    for entry in every:
+        idx, cmd_preview, _line = entry
+        if idx in recent_idx_set:
+            continue
+        low = cmd_preview.lower()
+        if any(m in low for m in _HIGH_SIGNAL_SHELL_MARKERS):
+            high_signal.append(entry)
+    # Keep the LATEST `high_signal_extra` high-signal entries.
+    high_signal = high_signal[-high_signal_extra:]
+
+    # Merge, sort chronologically, dedup by command line.
+    merged = sorted(recent + high_signal, key=lambda x: x[0])
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for _idx, _cmd, line in merged:
+        if line in seen:
+            continue
+        seen.add(line)
+        out_lines.append(line)
+    return out_lines
+
+
+def _extract_edits(items: list, *, last_n: int = 10) -> list[str]:
+    """Return up to last_n one-line summaries of recent file-edit calls."""
+    found: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") not in _TOOL_CALL_TYPES:
+            continue
+        if it.get("name") not in _EDIT_TOOL_NAMES:
+            continue
+        name = it.get("name") or ""
+        args = it.get("arguments")
+        preview = _short_args(args, limit=200)
+        found.append(f"{name}: {preview}")
+    return found[-last_n:]
+
+
+def _extract_errors(items: list, *, last_n: int = 8) -> list[str]:
+    """Return up to last_n distinct error/failure snippets from tool outputs."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") not in _TOOL_RESULT_TYPES:
+            continue
+        text = _tool_result_text(it)
+        if not text:
+            continue
+        low = text.lower()
+        if not any(m in low for m in _ERROR_MARKERS):
+            continue
+        # Pick a short signature for dedup — first 80 chars after the marker.
+        snippet = text.replace("\n", " ").strip()
+        if len(snippet) > 240:
+            snippet = snippet[:240] + "..."
+        key = snippet[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(snippet)
+    return found[-last_n:]
+
+
+def _build_signals_section(items: list) -> str:
+    """Render shell/edit/error extractions into a markdown preamble.
+
+    Returns "" when nothing was extracted; otherwise a multi-line block
+    that the summarizer can quote or rewrite into its handoff. Both the
+    summarizer blob AND the fallback placeholder prepend this text so the
+    information survives even when the LM call fails.
+    """
+    shells = _extract_shell_history(items, last_n=15)
+    edits = _extract_edits(items, last_n=10)
+    errs = _extract_errors(items, last_n=8)
+    if not (shells or edits or errs):
+        return ""
+    parts: list[str] = ["## Pre-extracted execution signals"]
+    if edits:
+        parts.append("### Recent file edits")
+        parts.extend(f"- {e}" for e in edits)
+    if shells:
+        parts.append("### Recent shell activity")
+        parts.extend(f"- {s}" for s in shells)
+    if errs:
+        parts.append("### Errors / failures observed")
+        parts.extend(f"- {e}" for e in errs)
+    return "\n".join(parts)
 
 
 def proactive_compact(
@@ -1168,6 +1395,14 @@ def proactive_compact(
     summary_text = _PROACTIVE_SUMMARY_CACHE.get(cache_key)
     cached = summary_text is not None
 
+    # Pre-extract execution signals (shell / edits / errors). This block
+    # is deterministically appended to the final summary regardless of
+    # whether the LM summarizer succeeds — so the post-compact agent ALWAYS
+    # sees recent shell activity, file edits, and error markers. The same
+    # block is also prepended to the summarizer blob so the LM can quote
+    # or refine it within its narrative.
+    signals_section = _build_signals_section(middle)
+
     if summary_text is None:
         blob = _flatten_history_for_summary(middle)
         # Incremental seed: when we have a previous bucket's summary,
@@ -1181,6 +1416,12 @@ def proactive_compact(
                 "## Previous handoff summary (carry forward and refine)\n\n"
                 + prev_summary
                 + "\n\n## Additional turns since that summary\n\n"
+                + blob
+            )
+        if signals_section:
+            blob = (
+                signals_section
+                + "\n\n## Raw transcript of older turns\n\n"
                 + blob
             )
         if summarizer is not None:
@@ -1197,6 +1438,13 @@ def proactive_compact(
                 "omitted to fit context. Recent turns and system prompt "
                 "remain. Ask the user if you need details from earlier.]"
             )
+        # Always append the pre-extracted signals to the summary text so
+        # they survive even when the LM summary is terse or the fallback
+        # placeholder fires. This is the load-bearing line for execution-
+        # state preservation: shell/edit/error markers ALWAYS reach the
+        # post-compact agent.
+        if signals_section:
+            summary_text = summary_text.rstrip() + "\n\n" + signals_section
         _PROACTIVE_SUMMARY_CACHE[cache_key] = summary_text
 
     summary_item = {
