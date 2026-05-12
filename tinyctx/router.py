@@ -9,11 +9,27 @@ Three responsibilities:
 We do NOT trust verbalized confidence from the model. We trust observable
 properties of the request (length, turn count, prompt fingerprint, error
 streak via session state).
+
+P5 (this module): the `Router` class consolidates the previously-scattered
+route-decision chain that lived inline in `proxy.responses`. One call
+`Router(cfg).decide(ctx)` returns a fully-resolved `Decision` carrying
+the backend URL + model + headers + wire_api + timeout, so proxy.py
+no longer has to re-derive any of that. Each rule is a small `_X_rule`
+method returning a Decision or None; the first non-None wins. The order
+of rules is the priority order (compaction beats force_route beats
+explicit-model beats error_streak beats capacity beats classify beats
+default).
+
+The legacy `decide()` free function is preserved unchanged — many tests
+and the chat-completions handler still call it directly and we don't
+need to widen the migration just for P5.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +69,38 @@ class Decision:
     is_compaction: bool = False
     est_input_tokens: int = 0
     turn_count: int = 0
+    # P5: resolved backend info — populated by Router.decide so proxy.py
+    # doesn't need to re-derive. Optional/empty when constructed via the
+    # legacy free-function `decide()` (proxy.py callers that build a
+    # Decision directly during retry-escalate continue to work).
+    target: str = ""
+    model: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    wire_api: str = ""
+    timeout_s: float = 0.0
+
+
+@dataclass
+class RouteContext:
+    """Inputs for `Router.decide`. The proxy assembles this from the
+    incoming request + per-session state (error_streak, classify result,
+    force_route flag from the guard pipeline) and hands it to the Router.
+
+    `classify_p` / `classify_reason` are populated by `self_classify` if
+    enabled — the Router only CONSUMES the score, it doesn't run the
+    classifier itself (which would force this module to be async).
+    """
+    body: dict[str, Any]
+    proj_sid: str
+    conv_sid: str
+    turn_count: int = 0
+    est_tokens: int = 0
+    requested_model: str = ""
+    force_route: str | None = None     # from GuardPipeline (ForceFrontierGuard)
+    error_streak: int = 0
+    is_compaction: bool = False
+    classify_p: float = 0.0
+    classify_reason: str = ""
 
 
 def _flatten_text(node: Any) -> str:
@@ -180,3 +228,245 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
 
     return Decision("local", "small/short -> cheap path",
                     est_input_tokens=est, turn_count=turns)
+
+
+# ─── P5: consolidated Router ─────────────────────────────────────────────
+
+
+def _resolve_api_key_from_env(backend, codex_auth: str | None = None) -> str | None:
+    """Same precedence as proxy._resolve_api_key (env var → forwarded
+    Authorization → ~/.codex/auth.json). Kept here so Router.decide can
+    bake Authorization into Decision.headers without a circular import on
+    proxy.py. Proxy passes its inbound Authorization (if any) through
+    `codex_auth`."""
+    if getattr(backend, "api_key_env", None):
+        v = os.environ.get(backend.api_key_env)
+        if v:
+            return v
+    if codex_auth:
+        return codex_auth
+    try:
+        with open(os.path.expanduser("~/.codex/auth.json")) as f:
+            tok = json.load(f).get("tokens", {}).get("access_token")
+        if tok:
+            return tok
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return None
+
+
+class Router:
+    """Single source of truth for route + backend + headers.
+
+    Rules run in priority order; first non-None Decision wins. The
+    `_default_rule` always returns, so `decide` is total. Each rule
+    method is intentionally short (≤30 LOC) — they read from
+    `ctx`/`self.cfg` and call the `_make_local_decision` /
+    `_make_frontier_decision` builders to fill in target/headers/etc.
+    """
+
+    def __init__(self, cfg, *, codex_auth: str | None = None):
+        self.cfg = cfg
+        # Inbound Authorization header from the codex client, used as a
+        # fallback when no api_key_env is set for the chosen backend.
+        # Proxy injects this per-request via `with_codex_auth`.
+        self._codex_auth = codex_auth
+
+    def with_codex_auth(self, codex_auth: str | None) -> "Router":
+        """Return a per-request shallow-copy bound to the inbound
+        Authorization. Cheap; called once per request."""
+        r = Router.__new__(Router)
+        r.cfg = self.cfg
+        r._codex_auth = codex_auth
+        return r
+
+    # — public —
+
+    def decide(self, ctx: RouteContext) -> Decision:
+        for rule in (
+            self._compaction_rule,
+            self._force_route_rule,
+            self._explicit_model_rule,
+            self._error_streak_rule,
+            self._capacity_rule,
+            self._classify_rule,
+            self._default_rule,
+        ):
+            d = rule(ctx)
+            if d is not None:
+                return d
+        # _default_rule always returns — unreachable.
+        raise RuntimeError("router has no default rule")
+
+    # — backend resolution helpers —
+
+    def _backend_for(self, route: str):
+        return self.cfg.local if route == "local" else self.cfg.frontier
+
+    def _target_url(self, backend) -> str:
+        base = backend.base_url.rstrip("/")
+        if getattr(backend, "wire_api", "responses") == "responses":
+            return base + "/responses"
+        return base + "/chat/completions"
+
+    def _build_headers(self, backend) -> dict[str, str]:
+        h: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        api_key = _resolve_api_key_from_env(backend, self._codex_auth)
+        if api_key:
+            h["Authorization"] = (
+                api_key if api_key.lower().startswith(("bearer ", "basic "))
+                else f"Bearer {api_key}"
+            )
+        # Per-backend static header overlay (e.g. openai-beta).
+        h.update(getattr(backend, "headers", {}) or {})
+        return h
+
+    def _make_local_decision(self, ctx: RouteContext, reason: str) -> Decision:
+        b = self.cfg.local
+        return Decision(
+            route="local",
+            reason=reason,
+            is_compaction=ctx.is_compaction,
+            est_input_tokens=ctx.est_tokens,
+            turn_count=ctx.turn_count,
+            target=self._target_url(b),
+            model=b.model or "",
+            headers=self._build_headers(b),
+            wire_api=getattr(b, "wire_api", "responses"),
+            timeout_s=float(getattr(b, "timeout_s", 0.0) or 0.0),
+        )
+
+    def _make_frontier_decision(self, ctx: RouteContext, reason: str) -> Decision:
+        b = self.cfg.frontier
+        return Decision(
+            route="frontier",
+            reason=reason,
+            is_compaction=ctx.is_compaction,
+            est_input_tokens=ctx.est_tokens,
+            turn_count=ctx.turn_count,
+            target=self._target_url(b),
+            model=b.model or "",
+            headers=self._build_headers(b),
+            wire_api=getattr(b, "wire_api", "responses"),
+            timeout_s=float(getattr(b, "timeout_s", 0.0) or 0.0),
+        )
+
+    # — rules (priority order) —
+
+    def _compaction_rule(self, ctx: RouteContext) -> Decision | None:
+        """1. Compaction handoff → local (highest priority).
+
+        Codex emits a deterministic handoff-summary prompt during local
+        compaction; redirect it to the cheap path regardless of any other
+        signal. Beats force_route so an empty-response flag set on a
+        previous turn doesn't waste a frontier call on a summary."""
+        if ctx.is_compaction and getattr(self.cfg, "redirect_compaction_to_local", True):
+            return self._make_local_decision(ctx, "compaction handoff -> cheap path")
+        return None
+
+    def _force_route_rule(self, ctx: RouteContext) -> Decision | None:
+        """2. Force-route override → honor the pin.
+
+        Two sources, in order of precedence:
+          a) `ctx.force_route` — per-request, set by ForceFrontierGuard
+             when the previous turn produced an empty response, hit a
+             stall, or got an upstream error.
+          b) `cfg.force_route` — admin-level config pin
+             (`TINYCTX_FORCE_ROUTE` env / `force_route` in config.toml)
+             that's typically "auto" (no pin) but operators use
+             "frontier" / "local" to force-pin a session for debugging.
+
+        Either source beats explicit `tinyctx-local` / `tinyctx-frontier`
+        requests so the recovery / admin routing wins over a client
+        preference that's either known to fail (per-request) or
+        intentionally being overridden by config (admin)."""
+        # Per-request takes precedence over CFG pin (recovery > admin).
+        pinned = ctx.force_route or getattr(self.cfg, "force_route", "auto")
+        if pinned == "frontier":
+            src = "guard pipeline" if ctx.force_route else "cfg"
+            return self._make_frontier_decision(
+                ctx, f"{src} force_route=frontier")
+        if pinned == "local":
+            src = "guard pipeline" if ctx.force_route else "cfg"
+            return self._make_local_decision(
+                ctx, f"{src} force_route=local")
+        return None
+
+    def _explicit_model_rule(self, ctx: RouteContext) -> Decision | None:
+        """3. Client-requested model id → honor verbatim.
+
+        `model=tinyctx-local` / `tinyctx-frontier` is the in-band route
+        override codex.app / advisor agents use. Beats capacity and
+        classify so the client's explicit decision is respected even on
+        a small request."""
+        m = (ctx.requested_model or "").lower()
+        if m == "tinyctx-local":
+            return self._make_local_decision(
+                ctx, "client requested tinyctx-local")
+        if m == "tinyctx-frontier":
+            return self._make_frontier_decision(
+                ctx, "client requested tinyctx-frontier")
+        return None
+
+    def _error_streak_rule(self, ctx: RouteContext) -> Decision | None:
+        """4. Repeated tool-failure streak → frontier.
+
+        Anthropic "when stuck, escalate" — N consecutive failures on
+        local means cheap model isn't making progress, so try the
+        stronger model."""
+        thr = getattr(self.cfg, "escalate_on_error_streak", 0) or 0
+        if thr and ctx.error_streak >= thr:
+            return self._make_frontier_decision(
+                ctx, f"error_streak={ctx.error_streak} >= {thr}")
+        return None
+
+    def _capacity_rule(self, ctx: RouteContext) -> Decision | None:
+        """5. Local context capacity escalation → frontier.
+
+        Belt-and-suspenders for small-context local backends (LMStudio
+        32k, Ollama default). Disabled when context_safe_fraction is 0
+        (the Advisor-Strategy-aligned default). Also honors the legacy
+        absolute `escalate_input_tokens` threshold when no context_window
+        is set on the local backend."""
+        local = getattr(self.cfg, "local", None)
+        if local is None:
+            return None
+        cw = getattr(local, "context_window", 0) or 0
+        sf = getattr(local, "context_safe_fraction", 0.0) or 0.0
+        if cw and sf > 0:
+            cap = int(cw * sf)
+            if ctx.est_tokens >= cap:
+                return self._make_frontier_decision(
+                    ctx,
+                    f"est_tokens={ctx.est_tokens} >= {cap} "
+                    f"({sf:.0%} of local ctx {cw})")
+            return None
+        legacy = getattr(self.cfg, "escalate_input_tokens", 0) or 0
+        if legacy and ctx.est_tokens >= legacy:
+            return self._make_frontier_decision(
+                ctx, f"est_tokens={ctx.est_tokens} >= {legacy}")
+        return None
+
+    def _classify_rule(self, ctx: RouteContext) -> Decision | None:
+        """6. Self-classify p(escalate) ≥ threshold → frontier.
+
+        The local model itself classified this turn as needing the
+        advisor. Threshold defaults to 0.7 and is configurable. The
+        classifier result was already computed (async) before decide()
+        ran; we just consume the score."""
+        thr = getattr(self.cfg, "self_classify_threshold", 1.1) or 1.1
+        if ctx.classify_p >= thr:
+            tail = (f": {ctx.classify_reason}" if ctx.classify_reason else "")
+            return self._make_frontier_decision(
+                ctx, f"self-classify p={ctx.classify_p:.2f}{tail}")
+        return None
+
+    def _default_rule(self, ctx: RouteContext) -> Decision:
+        """7. Default → local (cheap path).
+
+        Small/short request with no escalation signal; this is the win
+        path that justifies the proxy's existence."""
+        return self._make_local_decision(ctx, "small/short -> cheap path")

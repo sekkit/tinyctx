@@ -162,6 +162,270 @@ def test_legacy_threshold_used_when_context_window_unset():
     assert "60000" in d.reason
 
 
+# ─── P5: Router class (consolidated route decision) ──────────────────────
+
+
+def _make_router_cfg(**overrides):
+    """Build a Config with a known-shape local + frontier for Router tests."""
+    from tinyctx.config import BackendCfg, Config
+    cfg = Config()
+    cfg.local = BackendCfg(
+        base_url="http://local.test/v1",
+        api_key_env=None,
+        model="local-mdl",
+        wire_api="chat",
+        timeout_s=180.0,
+        context_window=1_000_000,
+        context_safe_fraction=0.85,
+    )
+    cfg.frontier = BackendCfg(
+        base_url="http://frontier.test/v1",
+        api_key_env=None,
+        model="frontier-mdl",
+        wire_api="responses",
+        timeout_s=300.0,
+        context_window=272_000,
+    )
+    cfg.escalate_on_error_streak = 2
+    cfg.redirect_compaction_to_local = True
+    cfg.self_classify_threshold = 0.7
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _ctx(**overrides):
+    """Build a RouteContext with sensible defaults for Router tests."""
+    from tinyctx.router import RouteContext
+    defaults = dict(
+        body={"input": [{"role": "user", "content": "hi"}]},
+        proj_sid="proj",
+        conv_sid="conv",
+        turn_count=1,
+        est_tokens=100,
+        requested_model="",
+        force_route=None,
+        error_streak=0,
+        is_compaction=False,
+        classify_p=0.0,
+        classify_reason="",
+    )
+    defaults.update(overrides)
+    return RouteContext(**defaults)
+
+
+def test_router_decision_dataclass_has_target_headers_wire_api():
+    """The new Decision must expose target URL + model + headers + wire_api
+    + timeout so proxy.py can forward without separately resolving backend."""
+    from tinyctx.router import Decision
+    d = Decision(
+        route="local", reason="x",
+        target="http://t/", model="m", headers={"a": "b"},
+        wire_api="chat", timeout_s=10.0, is_compaction=False,
+    )
+    assert d.target == "http://t/"
+    assert d.headers["a"] == "b"
+    assert d.wire_api == "chat"
+    assert d.timeout_s == 10.0
+
+
+def test_router_default_returns_local_for_small_inputs():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx())
+    assert d.route == "local"
+    assert d.target.startswith("http://local.test")
+    assert d.model == "local-mdl"
+    assert d.wire_api == "chat"
+    assert d.timeout_s == 180.0
+
+
+def test_router_compaction_rule_routes_to_local():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(is_compaction=True))
+    assert d.route == "local"
+    assert d.is_compaction is True
+    assert "compaction" in d.reason.lower()
+
+
+def test_router_compaction_beats_force_route_to_frontier():
+    """Compaction redirect_to_local must win over a force_route=frontier
+    from the guard pipeline (matches current proxy.py behavior: compaction
+    handoff goes local even when an empty-response flag is pending)."""
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(is_compaction=True, force_route="frontier"))
+    assert d.route == "local"
+    assert d.is_compaction is True
+
+
+def test_router_force_route_rule_to_frontier():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(force_route="frontier"))
+    assert d.route == "frontier"
+    assert d.target.startswith("http://frontier.test")
+    assert d.model == "frontier-mdl"
+    assert d.wire_api == "responses"
+
+
+def test_router_force_route_beats_explicit_local_model():
+    """A force_route=frontier from the guard pipeline (set by
+    ForceFrontierGuard) overrides a client-side `model=tinyctx-local`."""
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(force_route="frontier", requested_model="tinyctx-local"))
+    assert d.route == "frontier"
+
+
+def test_router_explicit_model_local():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(requested_model="tinyctx-local"))
+    assert d.route == "local"
+    assert "client" in d.reason.lower() or "explicit" in d.reason.lower()
+
+
+def test_router_explicit_model_frontier():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(requested_model="tinyctx-frontier"))
+    assert d.route == "frontier"
+
+
+def test_router_explicit_model_beats_capacity_and_classify():
+    """If the client explicitly asked for tinyctx-frontier, honor that even
+    on a small-token request (don't downgrade to local). Mirrors
+    `forced_by_client_model` semantics in proxy.py."""
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(requested_model="tinyctx-frontier",
+                       est_tokens=50, classify_p=0.0))
+    assert d.route == "frontier"
+
+
+def test_router_explicit_local_beats_capacity_escalation():
+    """If client says tinyctx-local but est_tokens > capacity, the explicit
+    request wins (client knows what they're doing — same precedence as
+    current proxy.py where requested_model is applied AFTER decide())."""
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    cfg.local.context_window = 32_000
+    cfg.local.context_safe_fraction = 0.85
+    r = Router(cfg)
+    d = r.decide(_ctx(requested_model="tinyctx-local", est_tokens=100_000))
+    assert d.route == "local"
+
+
+def test_router_error_streak_escalates_to_frontier():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg(escalate_on_error_streak=2))
+    d = r.decide(_ctx(error_streak=2))
+    assert d.route == "frontier"
+    assert "error_streak" in d.reason
+
+
+def test_router_error_streak_below_threshold_stays_local():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg(escalate_on_error_streak=2))
+    d = r.decide(_ctx(error_streak=1))
+    assert d.route == "local"
+
+
+def test_router_capacity_rule_escalates_when_over_safe_cap():
+    """est_tokens > local.context_window * safe_fraction → frontier."""
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    cfg.local.context_window = 32_000
+    cfg.local.context_safe_fraction = 0.85
+    r = Router(cfg)
+    d = r.decide(_ctx(est_tokens=30_000))  # > 32_000 * 0.85 = 27_200
+    assert d.route == "frontier"
+    assert "30000" in d.reason or "ctx" in d.reason
+
+
+def test_router_capacity_rule_disabled_when_safe_fraction_zero():
+    """Default config (safe_fraction=0.0) must NOT auto-escalate by tokens."""
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    cfg.local.context_window = 1_000_000
+    cfg.local.context_safe_fraction = 0.0  # disabled
+    r = Router(cfg)
+    d = r.decide(_ctx(est_tokens=2_000_000))
+    assert d.route == "local"
+
+
+def test_router_classify_rule_escalates_above_threshold():
+    """classify_p >= self_classify_threshold → frontier."""
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg(self_classify_threshold=0.7))
+    d = r.decide(_ctx(classify_p=0.85, classify_reason="needs strategy"))
+    assert d.route == "frontier"
+    assert "0.85" in d.reason or "self-classify" in d.reason.lower()
+
+
+def test_router_classify_rule_below_threshold_stays_local():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg(self_classify_threshold=0.7))
+    d = r.decide(_ctx(classify_p=0.5))
+    assert d.route == "local"
+
+
+def test_router_priority_compaction_beats_classify():
+    """Even with classify_p high, compaction must route local."""
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(is_compaction=True, classify_p=0.99))
+    assert d.route == "local"
+
+
+def test_router_priority_force_route_beats_error_streak_and_classify():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(force_route="frontier", error_streak=0, classify_p=0.0))
+    assert d.route == "frontier"
+
+
+def test_router_headers_include_content_type_and_accept():
+    """Decision.headers must carry at minimum Content-Type + Accept; if the
+    backend has an api_key_env set and env var present, Authorization too."""
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    r = Router(cfg)
+    d = r.decide(_ctx())
+    assert d.headers.get("Content-Type") == "application/json"
+    assert "text/event-stream" in d.headers.get("Accept", "")
+
+
+def test_router_headers_include_authorization_when_env_set(monkeypatch):
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    cfg.frontier.api_key_env = "TINYCTX_TEST_FRONTIER_KEY"
+    monkeypatch.setenv("TINYCTX_TEST_FRONTIER_KEY", "sk-frontier-abc")
+    r = Router(cfg)
+    d = r.decide(_ctx(requested_model="tinyctx-frontier"))
+    assert d.headers.get("Authorization", "").startswith("Bearer sk-frontier")
+
+
+def test_router_target_url_is_responses_for_responses_wire_api():
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    cfg.frontier.wire_api = "responses"
+    r = Router(cfg)
+    d = r.decide(_ctx(force_route="frontier"))
+    assert d.target.rstrip("/").endswith("/responses")
+
+
+def test_router_target_url_is_chat_for_chat_wire_api():
+    from tinyctx.router import Router
+    cfg = _make_router_cfg()
+    cfg.local.wire_api = "chat"
+    r = Router(cfg)
+    d = r.decide(_ctx())
+    assert d.target.rstrip("/").endswith("/chat/completions")
+
+
 if __name__ == "__main__":
     import sys
     failed = 0

@@ -46,7 +46,16 @@ from .continuity import save_compaction
 from . import historian
 from . import lingua
 from .read_delta import collapse_repeated_reads
-from .router import Decision, decide
+from .router import (
+    Decision,
+    RouteContext,
+    Router,
+    count_turns,
+    decide,
+    estimate_tokens,
+    is_compaction_request,
+    _flatten_text,
+)
 from .sanitize import (
     CacheAwareMutator,
     cap_responses_fields,
@@ -585,8 +594,16 @@ async def responses(request: Request) -> Any:
     _phase_set(proj_sid, RequestPhase.received, trace.request_id)
     streak = _SESSION_ERROR_STREAK[proj_sid]
     _phase_set(proj_sid, RequestPhase.classifying, trace.request_id)
-    decision = decide(body, CFG, error_streak=streak)
-    backend = _select_backend(decision)
+
+    # Body-derived signals computed once, fed into guards + Router. We
+    # used to compute these via `decide()` and then discard everything
+    # except the decision; now we extract them directly and let the
+    # Router (called below) consume them via RouteContext.
+    _blob = _flatten_text(body)
+    est_tokens = estimate_tokens(_blob)
+    turns = count_turns(body)
+    is_compaction = is_compaction_request(_blob)
+
     _phase_set(proj_sid, RequestPhase.routing, trace.request_id)
 
     # Tool-call frequency tracking — mine body.input for function_call
@@ -599,45 +616,33 @@ async def responses(request: Request) -> Any:
     except Exception:  # noqa: BLE001
         pass
 
-    # Allow client to force a specific route via the model id sent.
-    # Done before the guard pipeline so the body-mutating guards (stuck,
-    # budget, soft) see `forced_by_client_model` in their context and
-    # skip themselves on advisor sub-threads.
     requested_model = (body.get("model") or "").lower()
     trace.requested_model = requested_model
-    if requested_model == "tinyctx-local":
-        backend = CFG.local
-        decision = Decision("local", "client requested tinyctx-local",
-                            est_input_tokens=decision.est_input_tokens,
-                            turn_count=decision.turn_count)
+    if requested_model in ("tinyctx-local", "tinyctx-frontier"):
         trace.forced_by_client_model = True
-    elif requested_model == "tinyctx-frontier":
-        backend = CFG.frontier
-        decision = Decision("frontier", "client requested tinyctx-frontier",
-                            est_input_tokens=decision.est_input_tokens,
-                            turn_count=decision.turn_count)
-        trace.forced_by_client_model = True
-        # The agent invoked advisor — note timestamp so the stuck-loop
-        # watchdog skips its grace window and doesn't nudge the parent
-        # session right after the agent already escalated. Mark under
-        # proj_sid so any conversation in this project (incl. the parent
-        # that triggered the advisor) sees the grace; advisor's own
-        # conv_sid is separate and its watchdog state stays isolated.
-        try:
-            from . import stuck_loop
-            stuck_loop.mark_advisor_call(proj_sid)
-        except Exception:  # noqa: BLE001 — instrumentation only
-            pass
+        if requested_model == "tinyctx-frontier":
+            # The agent invoked advisor — note timestamp so the stuck-loop
+            # watchdog skips its grace window and doesn't nudge the parent
+            # session right after the agent already escalated. Mark under
+            # proj_sid so any conversation in this project (incl. the parent
+            # that triggered the advisor) sees the grace; advisor's own
+            # conv_sid is separate and its watchdog state stays isolated.
+            try:
+                from . import stuck_loop
+                stuck_loop.mark_advisor_call(proj_sid)
+            except Exception:  # noqa: BLE001 — instrumentation only
+                pass
 
     # Pre-flight guard pipeline. Replaces the previously-inline calls
     # into empty_response_guard / stuck_loop / synthetic_continue /
     # soft_completion / plan_persistence. Each guard is a small class
     # in tinyctx/guards.py wrapping the existing module function. The
-    # pipeline runs guards in priority order; ForceFrontierGuard's
-    # `force_route` decision is applied to `decision`/`backend` AFTER
-    # the pipeline returns. Per-guard trace fields and `_phase_set`
-    # calls are restored from the result list below to preserve the
-    # observability the old inline code emitted.
+    # pipeline runs guards in priority order; ForceFrontierGuard sets
+    # `guard_ctx.force_route` which is consumed by Router._force_route_rule
+    # below. Per-guard trace fields and `_phase_set` calls are restored
+    # from the result list to preserve the observability the old inline
+    # code emitted.
+    guard_force_route: str | None = None
     try:
         from .guards import (
             BudgetReminderGuard,
@@ -672,26 +677,20 @@ async def responses(request: Request) -> Any:
                 session_id=sid))
         guard_ctx = GuardContext(
             body=body, proj_sid=proj_sid, conv_sid=conv_sid,
-            turn_count=decision.turn_count,
-            is_compaction=decision.is_compaction,
+            turn_count=turns,
+            is_compaction=is_compaction,
             forced_by_client_model=trace.forced_by_client_model,
         )
         guard_results = GuardPipeline(active_guards).run(guard_ctx)
         body = guard_ctx.body
+        guard_force_route = guard_ctx.force_route
 
-        # Apply per-guard side effects (route override, trace fields,
-        # phase, log emit) — keeps observability identical to the
-        # pre-refactor inline path.
+        # Apply per-guard side effects (trace fields, phase, log emit).
+        # The route override itself is consumed by Router.decide via
+        # `guard_force_route` — no decision rewrite here.
         for gr in guard_results:
             if gr.guard_name == "force_frontier":
-                if gr.fired and decision.route != "frontier":
-                    decision = Decision(
-                        "frontier", gr.reason,
-                        is_compaction=decision.is_compaction,
-                        est_input_tokens=decision.est_input_tokens,
-                        turn_count=decision.turn_count,
-                    )
-                    backend = CFG.frontier
+                if gr.fired:
                     _phase_set(proj_sid, RequestPhase.empty_guarded,
                                 trace.request_id)
                     _log("empty_response_guard_forced_frontier",
@@ -700,18 +699,17 @@ async def responses(request: Request) -> Any:
                               "completion_tokens"),
                           prev_finish_reason=gr.additional_log.get(
                               "finish_reason"))
-                elif (not gr.fired and gr.additional_log.get(
-                        "exception_type")):
+                elif gr.additional_log.get("exception_type"):
                     _log("empty_response_guard_error",
                           session=sid, error=gr.reason)
             elif gr.guard_name == "stuck_loop":
                 if gr.fired:
                     trace.stuck_reminder_injected = True
-                    trace.stuck_turn_count_at_inject = decision.turn_count
+                    trace.stuck_turn_count_at_inject = turns
                     _phase_set(proj_sid, RequestPhase.injecting,
                                 trace.request_id)
                     _log("stuck_reminder_injected", session=sid,
-                          proj_sid=proj_sid, turn_count=decision.turn_count)
+                          proj_sid=proj_sid, turn_count=turns)
                 elif gr.additional_log.get("exception_type"):
                     _log("stuck_loop_error", session=sid, error=gr.reason)
             elif gr.guard_name == "budget_reminder":
@@ -740,7 +738,7 @@ async def responses(request: Request) -> Any:
                     if "saved" in (gr.reason or ""):
                         _log("plan_persistence_saved", session=sid,
                               cwd=cwd_hdr[:120],
-                              turn_count=decision.turn_count)
+                              turn_count=turns)
                     if "injected" in (gr.reason or ""):
                         _log("plan_persistence_injected",
                               session=sid, cwd=cwd_hdr[:120],
@@ -763,17 +761,26 @@ async def responses(request: Request) -> Any:
 
     # Model-driven escalation (Anthropic Advisor Strategy alignment):
     # ask the LOCAL model itself whether this turn deserves the advisor.
-    # Only runs when:
-    #   - feature is enabled
-    #   - we'd otherwise route to local (don't second-guess explicit
-    #     frontier escalation, force_route, error_streak, compaction)
-    #   - this isn't a force_route / explicit-model override
-    # Failures are silent — the classifier returns None and the
-    # original heuristic decision stands. See tinyctx/self_classify.py.
+    # Runs only when no higher-priority router rule will already escalate
+    # — i.e. no compaction, no force_route, no explicit-frontier request,
+    # no error_streak. We pass the classifier's score (sc.p) and reason
+    # into the RouteContext; the Router's _classify_rule consumes it.
+    # Failures are silent.
+    classify_p = 0.0
+    classify_reason = ""
+    # Skip the classifier when another router rule will already escalate
+    # to frontier (or pin to local), to avoid the ~200ms classifier RTT
+    # whose result would be discarded. Mirrors the original pre-refactor
+    # gates plus the new guard_force_route path.
+    _streak_thr = getattr(CFG, "escalate_on_error_streak", 0) or 0
+    _will_escalate_pre_classify = (
+        guard_force_route is not None
+        or (_streak_thr > 0 and streak >= _streak_thr)
+    )
     if (CFG.self_classify_enabled
-            and decision.route == "local"
-            and not decision.is_compaction
-            and not trace.forced_by_client_model):
+            and not is_compaction
+            and not trace.forced_by_client_model
+            and not _will_escalate_pre_classify):
         try:
             from . import self_classify
             api_key = (os.environ.get(CFG.local.api_key_env)
@@ -791,19 +798,31 @@ async def responses(request: Request) -> Any:
                 trace.self_classify_reason = sc.reason
                 trace.self_classify_cached = sc.cached
                 if sc.escalate and sc.p >= CFG.self_classify_threshold:
-                    decision = Decision(
-                        "frontier",
-                        f"self-classify p={sc.p:.2f}: {sc.reason}",
-                        is_compaction=decision.is_compaction,
-                        est_input_tokens=decision.est_input_tokens,
-                        turn_count=decision.turn_count,
-                    )
-                    backend = CFG.frontier
+                    classify_p = sc.p
+                    classify_reason = sc.reason
                     trace.self_classify_overrode = True
                     _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
                                trace.request_id)
         except Exception as e:  # noqa: BLE001 — classifier must never fail forward
             _log("self_classify_error", session=sid, error=str(e))
+
+    # ─── Single consolidated route decision ──────────────────────────
+    route_ctx = RouteContext(
+        body=body,
+        proj_sid=proj_sid,
+        conv_sid=conv_sid,
+        turn_count=turns,
+        est_tokens=est_tokens,
+        requested_model=requested_model,
+        force_route=guard_force_route,
+        error_streak=streak,
+        is_compaction=is_compaction,
+        classify_p=classify_p,
+        classify_reason=classify_reason,
+    )
+    router = Router(CFG).with_codex_auth(request.headers.get("authorization"))
+    decision = router.decide(route_ctx)
+    backend = _select_backend(decision)
 
     trace.route = decision.route
     trace.route_reason = decision.reason
@@ -1209,7 +1228,6 @@ async def responses(request: Request) -> Any:
     # `est_input_tokens - forwarded_tokens_est` is the savings, and the
     # breakdown shows where the remaining tokens go.
     try:
-        from .router import estimate_tokens, _flatten_text
         fb_serialized = json.dumps(forward_body, ensure_ascii=False, default=str)
         trace.forwarded_bytes = len(fb_serialized.encode("utf-8"))
         trace.forwarded_tokens_est = estimate_tokens(fb_serialized)
