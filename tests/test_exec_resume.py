@@ -465,28 +465,39 @@ def test_reset_state_clears_poke_count_per_session():
 
 
 def test_proxy_passes_prompt_tiers_and_proj_sid_to_poke():
-    """Wiring contract: proxy.py's `_xr.poke(...)` call MUST forward
-    `prompt_tiers=CFG.exec_resume_prompt_tiers` and `proj_sid=...`
-    so the tiered escalation path is reachable.
+    """Wiring contract: the post-stream classifier path's `_xr.poke(...)`
+    call MUST forward `prompt_tiers=CFG.exec_resume_prompt_tiers` and
+    `proj_sid=...` so the tiered escalation path is reachable.
 
     Without this, the `prompt_tiers` parameter on `poke()` exists in
     isolation — every poke uses the single `exec_resume_prompt` and
     the tier system + force_frontier-on-exhaustion fallback never
     trigger. Live trace 2026-05-10: linter added the tier system but
-    the wiring is incomplete; this test guards the connection."""
+    the wiring is incomplete; this test guards the connection.
+
+    P7: the call site moved from `proxy.py` into
+    `post_stream.PostStreamAnalyzer._bg_classify`. Check both files
+    so the test still holds if a future refactor moves it back."""
     from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "tinyctx" / "proxy.py").read_text()
-    # Find the _xr.poke( ... ) call site
-    idx = src.find("_xr.poke(")
-    assert idx != -1, "proxy.py must call _xr.poke(...) somewhere"
-    # Look at the next ~1500 chars to capture the full kwarg list
-    call_block = src[idx:idx + 1500]
-    assert "prompt_tiers=" in call_block, (
-        "proxy._xr.poke(...) must pass prompt_tiers=CFG.exec_resume_prompt_tiers "
-        "— otherwise the tier escalation system is dead code")
-    assert "proj_sid=" in call_block, (
-        "proxy._xr.poke(...) must pass proj_sid=... — required for "
-        "tier_exhausted to set the force_frontier flag on the right session")
+    pkg = Path(__file__).resolve().parent.parent / "tinyctx"
+    srcs = [
+        (pkg / "post_stream.py").read_text(),
+        (pkg / "proxy.py").read_text(),
+    ]
+    for src in srcs:
+        idx = src.find("_xr.poke(")
+        if idx == -1:
+            continue
+        call_block = src[idx:idx + 1500]
+        assert "prompt_tiers=" in call_block, (
+            "exec_resume_poke call must pass prompt_tiers=CFG.exec_resume_prompt_tiers "
+            "— otherwise the tier escalation system is dead code")
+        assert "proj_sid=" in call_block, (
+            "exec_resume_poke call must pass proj_sid=... — required for "
+            "tier_exhausted to set the force_frontier flag on the right session")
+        return
+    raise AssertionError(
+        "Neither post_stream.py nor proxy.py calls _xr.poke(...)")
 
 
 # ─── history snapshot ────────────────────────────────────────────────────

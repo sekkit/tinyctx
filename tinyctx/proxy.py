@@ -74,6 +74,7 @@ from .sanitize import (
     strip_unsupported_responses_fields,
     trim_tools_for_frontier,
 )
+from . import post_stream as _post
 from .request_phase import RequestPhase, set_phase as _phase_set
 from . import retry_policy
 from . import stall_watchdog as _stall
@@ -1929,105 +1930,33 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             for out in translator.flush():
                                 yield out
     except _stall.StallCancelledError as e:
-        # Watchdog cancelled the in-flight relay because the upstream
-        # went silent past CFG.stall_threshold_s. Emit a clean SSE
-        # error event and let the always-fires terminator below close
-        # the stream with status=incomplete so codex's SSE parser
-        # accepts it. force_next_to_frontier was already set by the
-        # stall callback — codex's follow-up turn routes frontier-side.
-        _SESSION_ERROR_STREAK[proj_sid] += 1
-        _log("stream_error", session=proj_sid, error=str(e),
-             error_type="StallCancelledError",
-             bytes_yielded=bytes_out,
-             elapsed_silent_s=e.elapsed_silent_s,
-             conv_sid=e.conv_sid)
-        status = 0
-        yield (
-            f"event: error\ndata: "
-            f"{json.dumps({'message': str(e), 'type': 'stall_cancelled'})}"
-            f"\n\n").encode()
-        upstream_failed = True
-        upstream_failure_msg = f"stall_cancelled: {e!s}"
-        # Forensics dump — capture what we saw so post-mortems can
-        # confirm the watchdog fired correctly.
-        if CFG.forensics_enabled and CFG.forensics_capture_errors:
-            try:
-                from . import forensics as _fx
-                forensics_dir = CFG.log_dir.parent / "forensics"
-                _fx.write_forensics_dump(
-                    forensics_dir, proj_sid,
-                    trigger="stall_cancelled_relay",
-                    response_buffer="",
-                    timing={"elapsed_s": round(time.time() - started, 3),
-                            "elapsed_silent_s": e.elapsed_silent_s},
-                    extra={"conv_sid": e.conv_sid,
-                           "bytes_yielded": bytes_out,
-                           "url": url},
-                    max_dumps=CFG.forensics_max_dumps,
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        # Watchdog cancelled the in-flight relay; emit terminator and
+        # set force-frontier flag for the follow-up turn.
+        # P7: dispatch into RelayErrorTerminator for the bookkeeping +
+        # forensics; we still own the `yield` because it's the
+        # generator's response to its parser.
+        _term = _post.RelayErrorTerminator(
+            cfg=CFG, log=_log,
+            session_error_streak=_SESSION_ERROR_STREAK)
+        res = _term.on_stall_cancelled(
+            e, proj_sid=proj_sid, conv_sid=conv_sid,
+            bytes_out=bytes_out, started=started, url=url)
+        status = res.status
+        yield res.error_event
+        upstream_failed = res.upstream_failed
+        upstream_failure_msg = res.upstream_failure_msg
     except httpx.HTTPError as e:
-        _SESSION_ERROR_STREAK[proj_sid] += 1
-        _log("stream_error", session=proj_sid, error=str(e),
-             error_type=type(e).__name__, bytes_yielded=bytes_out)
-        status = 0
-        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n".encode()
-        upstream_failed = True
-        upstream_failure_msg = f"http error: {e!s}"
-
-        # On transient stream error, set force-frontier flag so the NEXT
-        # request from codex (whether codex auto-retries or user nudges)
-        # bypasses the unstable backend and routes to gpt-5.5. Per user
-        # directive: "先重试原来模型，再出错就升级" — first retry happens
-        # implicitly via codex's natural behavior, second attempt then
-        # escalates by virtue of this flag.
-        is_transient = isinstance(e, (
-            httpx.RemoteProtocolError, httpx.ReadTimeout,
-            httpx.ReadError, httpx.ConnectError, httpx.WriteError))
-        if (CFG.empty_response_guard_enabled
-                and is_transient
-                and CFG.upstream_retry_enabled):
-            try:
-                from . import empty_response_guard as _erg
-                # Only escalate if THIS session has now had multiple
-                # consecutive errors (≥ retry_count + 1). The first
-                # error sets the streak; subsequent errors trip escalation.
-                if _SESSION_ERROR_STREAK[proj_sid] > CFG.upstream_retry_count:
-                    _erg.force_next_to_frontier(
-                        erg_key,
-                        f"stream_error escalate: {type(e).__name__} streak={_SESSION_ERROR_STREAK[proj_sid]}")
-                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier, request_id)
-                    _log("stream_error_escalating_to_frontier", session=proj_sid,
-                         streak=_SESSION_ERROR_STREAK[proj_sid])
-                else:
-                    _phase_set(proj_sid, RequestPhase.retrying, request_id)
-                    _log("stream_error_will_retry_same_backend",
-                         session=proj_sid, streak=_SESSION_ERROR_STREAK[proj_sid])
-            except Exception:  # noqa: BLE001
-                pass
-
-        # Error forensics — capture request that triggered this stream
-        # error so we can post-mortem the failure (network blip /
-        # upstream timeout / TLS handshake issue / etc.)
-        if CFG.forensics_enabled and CFG.forensics_capture_errors:
-            try:
-                from . import forensics as _fx
-                forensics_dir = CFG.log_dir.parent / "forensics"
-                _fx.write_forensics_dump(
-                    forensics_dir, proj_sid,
-                    trigger="stream_error",
-                    response_buffer="",
-                    timing={"elapsed_s": round(time.time() - started, 3)},
-                    extra={"error": str(e)[:1000],
-                           "error_type": type(e).__name__,
-                           "url": url,
-                           "bytes_yielded": bytes_out,
-                           "session_error_streak": _SESSION_ERROR_STREAK[proj_sid]},
-                    max_dumps=CFG.forensics_max_dumps,
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        _term = _post.RelayErrorTerminator(
+            cfg=CFG, log=_log,
+            session_error_streak=_SESSION_ERROR_STREAK)
+        res = _term.on_http_error(
+            e, proj_sid=proj_sid, conv_sid=conv_sid,
+            bytes_out=bytes_out, started=started, url=url,
+            erg_key=erg_key, request_id=request_id)
+        status = res.status
+        yield res.error_event
+        upstream_failed = res.upstream_failed
+        upstream_failure_msg = res.upstream_failure_msg
     # Always emit a structurally valid response.completed terminator so
     # codex.app's SSE parser doesn't raise "stream closed before
     # response.completed". For the success path we hope the upstream
@@ -2049,217 +1978,31 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
              translated=bool(translator),
              elapsed_s=elapsed,
              keepalives=keepalives_emitted)
-        # Soft-completion: spawn LLM behavioral classifier as a fire-
-        # and-forget background task. It judges whether THIS turn's
-        # output was a soft-punt-to-user; result lands as a flag that
-        # the next request's gate check consumes. Never blocks the
-        # stream's return — codex.app gets its bytes immediately.
-        if (CFG.soft_completion_gate_enabled
-                and status == 200
-                and bytes_out > 0
-                and not upstream_failed):
-            _phase_set(proj_sid, RequestPhase.post_stream_classifying, request_id)
-            try:
-                from . import soft_completion as _sc
-                api_key = (os.environ.get(CFG.local.api_key_env)
-                           if CFG.local.api_key_env else None)
-                # Snapshot the buffer at SPAWN time, not at task-run time.
-                # Without this, asyncio scheduling delay (event loop busy
-                # serving the next stream) could cause the bg task to read
-                # a buffer that the next stream had already `reset_stream`
-                # and not yet refilled — leading to spurious "no_buffer"
-                # / "short_text text_chars=0" skips. Closure-capture the
-                # snapshot so the dict isn't consulted later.
-                buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
-                # Extract semantic context from the request body for
-                # the new classifier. The body has the entire
-                # conversation history; mine it for user goal +
-                # progress tracker + tool summary so classifier can
-                # judge "did the agent finish the user's actual goal"
-                # rather than just pattern-match the response shape.
-                body_input = body.get("input") if isinstance(body, dict) else None
-                user_goal_snapshot = _sc.extract_user_goal(body_input)
-                tracker_snapshot = _sc.extract_progress_tracker(body_input)
-                tool_summary_snapshot = _sc.extract_tool_summary(body_input)
-
-                async def _bg_classify():
-                    _log("soft_completion_classify_started", session=proj_sid,
-                         buffer_chars_at_spawn=len(buffer_snapshot),
-                         user_goal_chars=len(user_goal_snapshot),
-                         tracker_chars=len(tracker_snapshot),
-                         tool_summary=tool_summary_snapshot[:120])
-                    try:
-                        diag = await _sc.classify_at_stream_end_diag(
-                            proj_sid,
-                            local_base_url=CFG.local.base_url,
-                            local_model=CFG.local.model,
-                            api_key=api_key,
-                            timeout_s=CFG.self_classify_timeout_s,
-                            threshold=CFG.self_classify_threshold,
-                            raw_buffer=buffer_snapshot,
-                            user_goal=user_goal_snapshot,
-                            progress_tracker=tracker_snapshot,
-                            tool_summary=tool_summary_snapshot,
-                            force_frontier_threshold=(
-                                CFG.soft_completion_auto_force_frontier_threshold
-                                if CFG.soft_completion_auto_force_frontier_enabled
-                                else 1.01),
-                            short_text_threshold=CFG.soft_completion_short_text_threshold,
-                            stop_text_threshold=CFG.soft_completion_stop_text_threshold,
-                            conv_sid=conv_sid,
-                        )
-                        # Always log the outcome — even None paths, so
-                        # silent-skip cases are diagnosable. One of the
-                        # following branches always fires:
-                        if diag.result is not None:
-                            _log("soft_completion_classified",
-                                 session=proj_sid,
-                                 soft_punt=diag.result.soft_punt,
-                                 p=diag.result.p,
-                                 reason=diag.result.reason,
-                                 extracted_text_chars=diag.extracted_text_chars)
-                            # PUNT forensics dump for high-confidence
-                            # cases — lets us inspect what the agent
-                            # actually said when classifier flagged it.
-                            if (CFG.forensics_enabled
-                                    and CFG.forensics_capture_punts
-                                    and diag.result.soft_punt
-                                    and diag.result.p >= CFG.forensics_punt_threshold):
-                                try:
-                                    forensics_dir = CFG.log_dir.parent / "forensics"
-                                    p = _sc.write_punt_forensics(
-                                        proj_sid, forensics_dir, diag.result, diag,
-                                        max_dumps=CFG.forensics_max_dumps)
-                                    if p:
-                                        _log("forensics_dump_written",
-                                             session=proj_sid, trigger="punt",
-                                             path=p)
-                                except Exception as fe:  # noqa: BLE001
-                                    _log("forensics_dump_error",
-                                         session=proj_sid, error=str(fe))
-                            # C-4 hybrid: actively poke the codex.app
-                            # session via `codex exec resume` side
-                            # process. Turns the auto_force_frontier flag
-                            # from passive (waits on user input) into
-                            # active (immediate one-shot turn). See
-                            # tinyctx/exec_resume.py.
-                            if (CFG.exec_resume_enabled
-                                    and diag.result.soft_punt
-                                    and diag.result.p >= CFG.exec_resume_min_p
-                                    and cwd):
-                                try:
-                                    from . import exec_resume as _xr
-                                    log_dir = CFG.log_dir.parent / "exec_resume_logs"
-                                    tiers = list(CFG.exec_resume_prompt_tiers or [])
-                                    rec = await _xr.poke(
-                                        cwd=cwd,
-                                        prompt=CFG.exec_resume_prompt,
-                                        prompt_tiers=tiers or None,
-                                        codex_binary=CFG.exec_resume_codex_binary,
-                                        sandbox=CFG.exec_resume_sandbox,
-                                        approval_policy=CFG.exec_resume_approval_policy,
-                                        cooldown_s=CFG.exec_resume_cooldown_s,
-                                        max_per_minute=CFG.exec_resume_max_per_minute,
-                                        timeout_s=CFG.exec_resume_timeout_s,
-                                        log_dir=log_dir,
-                                        proj_sid=proj_sid,
-                                    )
-                                    _log("exec_resume_poke",
-                                         session=proj_sid,
-                                         status=rec.status,
-                                         reason=rec.reason,
-                                         pid=rec.pid,
-                                         resolved_session_id=rec.session_id,
-                                         log_path=rec.log_path,
-                                         p=diag.result.p)
-                                except Exception as xe:  # noqa: BLE001
-                                    _log("exec_resume_poke_error",
-                                         session=proj_sid, error=str(xe))
-                        elif diag.skipped_reason:
-                            _log("soft_completion_classify_skipped",
-                                 session=proj_sid,
-                                 reason=diag.skipped_reason,
-                                 finish_reason=diag.finish_reason,
-                                 extracted_text_chars=diag.extracted_text_chars,
-                                 raw_buffer_chars=diag.raw_buffer_chars,
-                                 raw_head=diag.raw_buffer_head,
-                                 raw_tail=diag.raw_buffer_tail)
-                        elif diag.backend_error:
-                            _log("soft_completion_classify_backend_error",
-                                 session=proj_sid,
-                                 error=diag.backend_error,
-                                 status=diag.backend_status,
-                                 extracted_text_chars=diag.extracted_text_chars)
-                        else:
-                            # Parse failure — backend returned 200 but
-                            # content didn't yield a verdict.
-                            _log("soft_completion_classify_parse_failed",
-                                 session=proj_sid,
-                                 status=diag.backend_status,
-                                 raw_preview=diag.raw_content_preview,
-                                 extracted_text_chars=diag.extracted_text_chars)
-                    except Exception as e:  # noqa: BLE001
-                        _log("soft_completion_classify_error",
-                             session=proj_sid, error=str(e))
-                asyncio.create_task(_bg_classify())
-            except Exception as e:  # noqa: BLE001
-                _log("soft_completion_classify_spawn_error",
-                     session=proj_sid, error=str(e))
-        # Empty-response guard: parse upstream's usage block from buffer
-        # tail; if completion_tokens too low + finish_reason normal,
-        # flag this session so the NEXT request gets routed to frontier.
-        # See tinyctx/empty_response_guard.py.
-        if (CFG.empty_response_guard_enabled
-                and status == 200
-                and not upstream_failed):
-            try:
-                from . import empty_response_guard as _erg
-                from . import soft_completion as _sc
-                buf_for_check = _sc._OUTPUT_BUFFER.get(proj_sid, "")
-                info = _erg.maybe_flag_empty_response(
-                    erg_key, buf_for_check,
-                    min_completion_tokens=CFG.empty_response_min_completion_tokens)
-                if info is not None:
-                    _log("empty_response_detected", session=proj_sid,
-                         completion_tokens=info.get("completion_tokens"),
-                         finish_reason=info.get("finish_reason"),
-                         reason=info.get("reason"))
-                    # Forensics dump — capture request + response so
-                    # next-time root cause is recoverable. The 05:07
-                    # turn 1780 empty response had no captured body
-                    # and is forever unrecoverable.
-                    if CFG.forensics_enabled:
-                        try:
-                            from . import forensics as _fx
-                            forensics_dir = CFG.log_dir.parent / "forensics"
-                            path = _fx.write_forensics_dump(
-                                forensics_dir,
-                                proj_sid,
-                                trigger="empty_response",
-                                response_buffer=buf_for_check,
-                                timing={
-                                    "elapsed_s": elapsed,
-                                    "started_at": started,
-                                },
-                                extra={
-                                    "bytes_out": bytes_out,
-                                    "keepalives_emitted": keepalives_emitted,
-                                    "completion_tokens": info.get("completion_tokens"),
-                                    "finish_reason": info.get("finish_reason"),
-                                    "url": url,
-                                },
-                                max_dumps=CFG.forensics_max_dumps,
-                            )
-                            if path:
-                                _log("forensics_dump_written",
-                                     session=proj_sid, trigger="empty_response",
-                                     path=str(path), file=path.name)
-                        except Exception as fe:  # noqa: BLE001
-                            _log("forensics_dump_error",
-                                 session=proj_sid, error=str(fe))
-            except Exception as e:  # noqa: BLE001
-                _log("empty_response_guard_error",
-                     session=proj_sid, error=str(e))
+        # P7: post-stream analysis (classifier spawn + empty-response
+        # guard + forensics) all live in post_stream.PostStreamAnalyzer.
+        # The analyzer preserves pre-P7 timing exactly: the LLM
+        # classifier is spawned as a fire-and-forget bg task (never
+        # blocks return); the empty-response guard runs synchronously.
+        try:
+            _ps_analyzer = _post.PostStreamAnalyzer(cfg=CFG, log=_log)
+            await _ps_analyzer.analyze(_post.PostStreamContext(
+                proj_sid=proj_sid,
+                conv_sid=conv_sid,
+                erg_key=erg_key,
+                request_id=request_id,
+                body=body if isinstance(body, dict) else {},
+                cwd=cwd,
+                bytes_out=bytes_out,
+                status=status,
+                upstream_failed=upstream_failed,
+                keepalives_emitted=keepalives_emitted,
+                elapsed=elapsed,
+                started=started,
+                url=url,
+            ))
+        except Exception as _e:  # noqa: BLE001
+            _log("post_stream_analyze_error",
+                 session=proj_sid, error=str(_e))
         if trace is not None:
             trace.status = status
             trace.bytes_out = bytes_out
