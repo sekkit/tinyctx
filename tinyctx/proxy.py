@@ -68,6 +68,7 @@ from .sanitize import (
 from .request_phase import RequestPhase, set_phase as _phase_set
 from . import retry_policy
 from . import stall_watchdog as _stall
+from . import stream_relay as _relay
 from .tool_call_translator import ChatToResponsesTranslator, StreamTranslator, rebuild_response
 from .trace import RequestTrace
 
@@ -1571,20 +1572,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     # itself errored. The completion has status=incomplete so codex still
     # surfaces the failure correctly.
     def _terminator_event(message: str, *, status_label: str = "incomplete") -> bytes:
-        rid = "resp_" + uuid4().hex[:24]
-        payload = {
-            "type": "response.completed",
-            "response": {
-                "id": rid,
-                "object": "response",
-                "model": body.get("model") or "tinyctx",
-                "status": status_label,
-                "incomplete_details": {"reason": "tinyctx_proxy_terminator",
-                                       "message": message[:500]},
-                "output": [],
-            },
-        }
-        return f"event: response.completed\ndata: {json.dumps(payload)}\n\n".encode()
+        return _relay.build_terminator_event(message,
+                                             body.get("model") if isinstance(body, dict) else None,
+                                             status_label=status_label)
 
     # SSE keepalive: when upstream goes silent during streaming, emit
     # `: tinyctx keepalive` SSE comment lines every
@@ -1673,471 +1663,205 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             # interaction (open + upload + read headers + stream body),
             # and the main coroutine yields keepalives whenever the queue
             # is silent for keepalive_interval seconds.
-            chunk_q: asyncio.Queue = asyncio.Queue()
-            _STATUS = object()
-            _SENTINEL = object()
-            _ERR = object()
-            # ── Unified retry layer ──────────────────────────────────
-            # Per user directive 2026-05-11 "凡是中断了都要加重试".
-            # The producer task itself runs a retry loop: when the
-            # upstream returns 4xx/5xx or raises a connection error
-            # BEFORE we've put any body chunks on the queue, the
-            # producer consults `retry_policy.classify_failure` and
-            # may re-issue the request — switching to frontier when
-            # the policy says retry_escalate. The consumer below sees
-            # only the FINAL outcome (status + body or error). Once
-            # the producer has put a body chunk, retry is blocked
-            # (partial content already in flight).
-            retry_state = retry_policy.RequestRetryState()
-            # Mutable per-attempt state so we can swap on escalate.
-            attempt_url = [url]
-            attempt_headers = [headers]
-            attempt_body = [body]
-            attempt_decision = [decision]
-
-            async def _producer():
-                produced_chunk = False
-                try:
-                    while True:
-                        retry_state.record_attempt()
-                        cur_attempt_url = attempt_url[0]
-                        cur_attempt_headers = attempt_headers[0]
-                        cur_attempt_body = attempt_body[0]
-                        cur_decision = attempt_decision[0]
-                        attempt_started = time.time()
-                        http_status: int | None = None
-                        conn_error = False
-                        exc_caught: Exception | None = None
-                        err_body_for_retry: str = ""
-                        retry_after_s = 0.0
-                        try:
-                            async with httpx.AsyncClient(
-                                    timeout=timeout, transport=transport) as client:
-                                async with client.stream(
-                                        "POST", cur_attempt_url,
-                                        headers=cur_attempt_headers,
-                                        json=cur_attempt_body) as r:
-                                    http_status = r.status_code
-                                    if r.status_code >= 400:
-                                        err_body_for_retry = (
-                                            await r.aread()).decode(
-                                            "utf-8", "replace")
-                                        ra = (r.headers.get("retry-after")
-                                              or r.headers.get("Retry-After"))
-                                        try:
-                                            retry_after_s = float(ra) if ra else 0.0
-                                        except (TypeError, ValueError):
-                                            retry_after_s = 0.0
-                                        # Fall through to the policy check
-                                        # below — do NOT push STATUS yet.
-                                    else:
-                                        # Success — emit STATUS and stream
-                                        # body chunks. From this point on
-                                        # retry is impossible (partial
-                                        # content in flight).
-                                        await chunk_q.put(
-                                            (_STATUS, (r.status_code, None)))
-                                        async for chunk in r.aiter_raw():
-                                            produced_chunk = True
-                                            await chunk_q.put((None, chunk))
-                                        # finished successfully — push
-                                        # sentinel (return skips the
-                                        # outer else clause) and exit.
-                                        await chunk_q.put(
-                                            (_SENTINEL, None))
-                                        return
-                        except Exception as e:  # noqa: BLE001
-                            conn_error = True
-                            exc_caught = e
-                        # Failure path. Consult policy.
-                        if produced_chunk:
-                            # We already streamed bytes to the consumer
-                            # for THIS attempt's response body — cannot
-                            # retry. Propagate.
-                            if exc_caught is not None:
-                                raise exc_caught
-                            await chunk_q.put(
-                                (_STATUS, (http_status or 0, err_body_for_retry)))
-                            await chunk_q.put((_SENTINEL, None))
-                            return
-                        action = retry_policy.classify_failure(
-                            route=cur_decision.route,
-                            status=http_status,
-                            is_connection_error=conn_error,
-                            is_compaction=cur_decision.is_compaction,
-                            attempts_used=retry_state.attempts_used,
-                            max_total_retries=CFG.max_total_retries_per_request,
-                            upstream_retry_count=CFG.upstream_retry_count,
-                            retry_on_local_4xx_escalate_frontier=(
-                                CFG.retry_on_local_4xx_escalate_frontier),
-                            retry_on_frontier_4xx=CFG.retry_on_frontier_4xx,
-                            retry_after_s=retry_after_s,
+            #
+            # P6: producer + consumer + supervisor live in stream_relay.
+            # Status-error forensics is the only branch we still own here
+            # because it needs `url` and the forensics writer.
+            def _on_status_error(status_code: int, err_body: str) -> None:
+                _SESSION_ERROR_STREAK[proj_sid] += 1
+                _log("upstream_error", session=proj_sid,
+                     status=status_code, url=url, body=err_body[:2000])
+                if CFG.forensics_enabled and CFG.forensics_capture_errors:
+                    try:
+                        from . import forensics as _fx
+                        forensics_dir = CFG.log_dir.parent / "forensics"
+                        _fx.write_forensics_dump(
+                            forensics_dir, proj_sid,
+                            trigger=f"upstream_{status_code}",
+                            response_buffer=err_body or "",
+                            extra={"status": status_code, "url": url},
+                            max_dumps=CFG.forensics_max_dumps,
                         )
-                        retry_state.last_action = action
-                        if action.decision == "propagate":
-                            if action.escalate_flag_reason:
-                                try:
-                                    from . import empty_response_guard as _erg
-                                    _erg.force_next_to_frontier(
-                                        erg_key, action.escalate_flag_reason)
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            if exc_caught is not None:
-                                # surface connection error to consumer
-                                raise exc_caught
-                            # surface upstream 4xx/5xx to consumer
-                            await chunk_q.put(
-                                (_STATUS, (http_status or 0,
-                                            err_body_for_retry)))
-                            await chunk_q.put((_SENTINEL, None))
-                            return
-                        # retry_same / retry_escalate
-                        new_url = cur_attempt_url
-                        new_headers = cur_attempt_headers
-                        new_decision = cur_decision
-                        if action.decision == "retry_escalate":
-                            esc_url, esc_headers_proto, _b, esc_decision, _bk = (
-                                _build_frontier_retry_target(
-                                    None, cur_attempt_body, action.reason))
-                            # Preserve codex routing headers (openai-beta,
-                            # x-codex-session-id, ...) from the original
-                            # request, but REBUILD Authorization for the
-                            # frontier backend. Without this, a
-                            # local-backend bearer (e.g. LMStudio's sk-*)
-                            # leaks to chatgpt.com and triggers a 401 that
-                            # closes the stream at bytes_out=0 — codex
-                            # shows "task interrupted" right after
-                            # retry_attempted. See rq_f372c3c35c47444db89e.
-                            merged = dict(cur_attempt_headers)
-                            merged["Content-Type"] = "application/json"
-                            merged.setdefault("Accept", "text/event-stream")
-                            fb_key = _resolve_api_key(CFG.frontier, None)
-                            if fb_key:
-                                merged["Authorization"] = (
-                                    fb_key if fb_key.lower().startswith(
-                                        ("bearer ", "basic "))
-                                    else f"Bearer {fb_key}")
-                            else:
-                                merged.pop("Authorization", None)
-                            new_url = esc_url
-                            new_headers = merged
-                            new_decision = esc_decision
-                            if action.escalate_flag_reason:
-                                try:
-                                    from . import empty_response_guard as _erg
-                                    _erg.force_next_to_frontier(
-                                        erg_key, action.escalate_flag_reason)
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            retry_state.record_escalation()
-                        _log("retry_attempted",
-                             session=proj_sid,
-                             attempt_number=retry_state.attempts_used,
-                             original_status=http_status,
-                             retry_target=action.decision,
-                             original_url=cur_attempt_url,
-                             new_url=new_url,
-                             reason=action.reason,
-                             request_id=request_id,
-                             conn_error=conn_error,
-                             elapsed_s=round(time.time() - attempt_started, 3))
-                        # Reset the stall watchdog's last-event timestamp
-                        # on the retry boundary so the new upstream attempt
-                        # gets a fresh threshold window. Without this, the
-                        # countdown still references the FAILED attempt's
-                        # last event, and a silent retry can run out the
-                        # 180s before the watchdog ever fires.
-                        try:
-                            _stall.mark_event(proj_sid, conv_sid=conv_sid)
-                        except Exception:  # noqa: BLE001
-                            pass
-                        if action.backoff_s > 0:
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            chunk_q: asyncio.Queue = asyncio.Queue()
+            producer = _relay.StreamProducer(
+                url=url, headers=headers, body=body,
+                proj_sid=proj_sid, conv_sid=conv_sid,
+                decision=decision, timeout=timeout, transport=transport,
+                erg_key=erg_key, request_id=request_id,
+                cfg=CFG, log=_log,
+                build_frontier_retry_target=_build_frontier_retry_target,
+                resolve_api_key=_resolve_api_key,
+            )
+            consumer = _relay.StreamConsumer(
+                chunk_q=chunk_q, translator=translator,
+                proj_sid=proj_sid, conv_sid=conv_sid,
+                keepalive_interval=keepalive_interval,
+                capture_outgoing=_capture_outgoing,
+                intercept_completed=_intercept_completed,
+                cfg=CFG, log=_log, url=url,
+                on_status_error=_on_status_error,
+            )
+            supervisor = _relay.StallSupervisor(
+                proj_sid, enabled=CFG.stall_watchdog_enabled)
+            # Reset _SESSION_ERROR_STREAK on the SUCCESS-status branch;
+            # on_status_error increments it on the failure branch.
+            # The reset has to fire on the STATUS=(200, None) path that
+            # stream_relay handles internally, so we hook it by reading
+            # consumer.status / upstream_failed after the loop.
+            async for out in _relay.relay_stream(
+                    chunk_q=chunk_q, producer=producer, consumer=consumer,
+                    supervisor=supervisor,
+                    keepalive_interval=keepalive_interval):
+                yield out
+            # Mirror consumer state back into outer locals so the post-
+            # stream / finally blocks below see the same values they
+            # did when this logic lived inline.
+            bytes_out = consumer.bytes_out
+            status = consumer.status
+            keepalives_emitted = consumer.keepalives_emitted
+            upstream_failed = consumer.upstream_failed
+            upstream_failure_msg = consumer.upstream_failure_msg
+            if not upstream_failed and status == 200:
+                _SESSION_ERROR_STREAK[proj_sid] = 0
+            # ─── stream-rewrite synthesis ──────────────────────────
+            # We held back the response.completed event. Decide whether
+            # to inject a synthetic advisor function_call in front of
+            # it, then flush. Runs only on the keepalive path because
+            # the held-completion buffer is fed by _intercept_completed
+            # which only sees bytes via the queue-based consumer.
+            if rewrite_enabled and holding_completion[0] and not upstream_failed:
+                try:
+                    from . import soft_completion as _sc
+                    from . import stream_rewrite as _sr
+                    api_key = (os.environ.get(CFG.local.api_key_env)
+                               if CFG.local.api_key_env else None)
+                    buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
+                    body_input = (body.get("input")
+                                   if isinstance(body, dict) else None)
+                    user_goal = _sc.extract_user_goal(body_input)
+                    tracker = _sc.extract_progress_tracker(body_input)
+                    tool_summary = _sc.extract_tool_summary(body_input)
+                    # Synchronous classification — we're at stream
+                    # end, no other bytes flowing. Bounded by
+                    # self_classify_timeout_s (default 30s).
+                    diag = await _sc.classify_at_stream_end_diag(
+                        proj_sid,
+                        local_base_url=CFG.local.base_url,
+                        local_model=CFG.local.model,
+                        api_key=api_key,
+                        timeout_s=CFG.self_classify_timeout_s,
+                        threshold=CFG.self_classify_threshold,
+                        raw_buffer=buffer_snapshot,
+                        user_goal=user_goal,
+                        progress_tracker=tracker,
+                        tool_summary=tool_summary,
+                        force_frontier_threshold=(
+                            CFG.soft_completion_auto_force_frontier_threshold
+                            if CFG.soft_completion_auto_force_frontier_enabled
+                            else 1.01),
+                        short_text_threshold=CFG.soft_completion_short_text_threshold,
+                        stop_text_threshold=CFG.soft_completion_stop_text_threshold,
+                    )
+                    if (diag.result is not None
+                            and diag.result.soft_punt
+                            and diag.result.p >= CFG.soft_completion_stream_rewrite_threshold):
+                        text_excerpt = _sc._extract_text_from_buffer(
+                            buffer_snapshot)
+                        task_body = _sr.build_task_body(
+                            text_excerpt,
+                            diag.result.reason,
+                            diag.result.p)
+                        # Multi-strategy synthetic continue: rotate
+                        # through codex builtins (shell / local_shell /
+                        # update_plan) until codex actually dispatches
+                        # one. spawn_agent was tried first but binary
+                        # analysis confirmed codex silently drops it.
+                        from . import synthetic_continue as _syn
+                        inj_events, strategy = _syn.build_continue_injection(
+                            erg_key,
+                            max_injections=CFG.max_continue_injections_per_session,
+                        )
+                        if strategy["label"] == "budget_exhausted":
+                            from . import empty_response_guard as _erg_budget
+                            _erg_budget.force_next_to_frontier(
+                                erg_key, "injection_budget_exhausted")
+                            _log("soft_completion_stream_rewrite_budget_exhausted",
+                                 session=proj_sid,
+                                 p=diag.result.p,
+                                 injection_count=_syn.injection_count(erg_key),
+                                 max_injections=CFG.max_continue_injections_per_session)
+                        else:
+                            for evt in inj_events:
+                                yield _capture_outgoing(evt)
+                            _log("soft_completion_stream_rewrite_injected",
+                                 session=proj_sid,
+                                 p=diag.result.p,
+                                 reason=diag.result.reason,
+                                 strategy=strategy["label"],
+                                 tool_name=strategy["tool_name"],
+                                 task_chars=len(task_body),
+                                 injection_count=_syn.injection_count(erg_key))
+                        if trace is not None:
+                            trace.soft_completion_gate_injected = True
+                            trace.soft_completion_gate_pattern = (
+                                f"stream-rewrite: {diag.result.reason}")[:80]
+                        # Forensics: capture the PUNT that triggered
+                        # this stream-rewrite. Same write_punt_forensics
+                        # the bg_classify path uses.
+                        if (CFG.forensics_enabled
+                                and CFG.forensics_capture_punts
+                                and diag.result.p >= CFG.forensics_punt_threshold):
                             try:
-                                await asyncio.sleep(action.backoff_s)
+                                from . import forensics as _fx
+                                forensics_dir = CFG.log_dir.parent / "forensics"
+                                # Custom dump that ALSO includes the
+                                # outgoing capture (what codex
+                                # actually saw, post-injection).
+                                raw = _sc._OUTPUT_BUFFER.get(proj_sid, "") or ""
+                                fpath = _fx.write_forensics_dump(
+                                    forensics_dir, proj_sid,
+                                    trigger="punt_via_stream_rewrite",
+                                    response_buffer=raw,
+                                    classifier_verdict={
+                                        "soft_punt": diag.result.soft_punt,
+                                        "p": diag.result.p,
+                                        "reason": diag.result.reason,
+                                        "extracted_text_chars": diag.extracted_text_chars,
+                                        "raw_buffer_chars": diag.raw_buffer_chars,
+                                        "finish_reason": diag.finish_reason,
+                                    },
+                                    extra={
+                                        "strategy": strategy["label"],
+                                        "tool_name": strategy["tool_name"],
+                                        "outgoing_to_codex_chars": len(outgoing_capture),
+                                        "outgoing_to_codex_tail": (
+                                            bytes(outgoing_capture[-4000:]).decode("utf-8", "replace")
+                                            if outgoing_capture else ""),
+                                    },
+                                    max_dumps=CFG.forensics_max_dumps,
+                                )
+                                if fpath:
+                                    _log("forensics_dump_written",
+                                         session=proj_sid,
+                                         trigger="punt_via_stream_rewrite",
+                                         path=str(fpath))
                             except Exception:  # noqa: BLE001
                                 pass
-                        attempt_url[0] = new_url
-                        attempt_headers[0] = new_headers
-                        attempt_decision[0] = new_decision
-                        # loop and re-attempt
-                except asyncio.CancelledError:
-                    # Stall watchdog (or shutdown) cancelled us. Surface
-                    # as a synthetic StallCancelledError so the consumer
-                    # can emit a clean SSE terminator and trigger the
-                    # next-turn escalation. We MUST NOT re-raise here —
-                    # the producer is a fire-and-forget task whose
-                    # cancellation must be communicated to the consumer
-                    # via the queue, not by killing the whole generator.
-                    try:
-                        elapsed = _stall.seconds_since_event(proj_sid)
-                    except Exception:  # noqa: BLE001
-                        elapsed = None
-                    synthetic = _stall.StallCancelledError(
-                        "stall_watchdog_cancelled_relay",
-                        proj_sid=proj_sid,
-                        conv_sid=conv_sid,
-                        elapsed_silent_s=elapsed,
-                    )
-                    try:
-                        await chunk_q.put((_ERR, synthetic))
-                    except Exception:  # noqa: BLE001
-                        pass
-                except Exception as exc:  # noqa: BLE001
-                    await chunk_q.put((_ERR, exc))
-                else:
-                    await chunk_q.put((_SENTINEL, None))
-
-            producer = asyncio.create_task(_producer())
-            if CFG.stall_watchdog_enabled:
-                try:
-                    _stall.register_task(proj_sid, producer)
-                except Exception:  # noqa: BLE001
-                    pass
-            # Initial keepalive: emit one SSE comment frame IMMEDIATELY
-            # on stream open, BEFORE waiting for the first upstream byte.
-            # The idle-loop keepalive below only fires after
-            # `keepalive_interval` seconds of silence — with the default
-            # 15s interval, codex's client-side idle timeout (or any TCP
-            # middlebox) can disconnect first when the upstream takes
-            # >15s to deliver its first byte (large-context cold-start,
-            # post-retry frontier wait). Emitting one keepalive frame at
-            # t≈0 guarantees codex sees activity within the first turn
-            # of the event loop, independent of upstream latency. SSE
-            # comments are ignored by spec-compliant clients.
-            yield b": tinyctx keepalive\n\n"
-            keepalives_emitted += 1
-            try:
-                while True:
-                    try:
-                        tag, payload = await asyncio.wait_for(
-                            chunk_q.get(), timeout=keepalive_interval)
-                    except asyncio.TimeoutError:
-                        yield b": tinyctx keepalive\n\n"
-                        keepalives_emitted += 1
-                        continue
-                    if tag is _SENTINEL:
-                        break
-                    if tag is _ERR:
-                        raise payload  # type: ignore[misc]
-                    if tag is _STATUS:
-                        status_code, err_body = payload
-                        status = status_code
-                        if CFG.stall_watchdog_enabled:
-                            _stall.mark_event(proj_sid, conv_sid=conv_sid)
-                        if err_body is not None:
-                            _SESSION_ERROR_STREAK[proj_sid] += 1
-                            _log("upstream_error", session=proj_sid,
-                                 status=status_code, url=url,
-                                 body=err_body[:2000])
-                            yield (
-                                f"event: error\ndata: "
-                                f"{json.dumps({'status': status_code, 'body': err_body[:2000]})}"
-                                f"\n\n").encode()
-                            upstream_failed = True
-                            upstream_failure_msg = (
-                                f"upstream {status_code}: {err_body[:200]}")
-                            # Forensics dump for upstream errors —
-                            # capture the request that triggered the
-                            # 4xx/5xx + the upstream's error body
-                            if (CFG.forensics_enabled
-                                    and CFG.forensics_capture_errors):
-                                try:
-                                    from . import forensics as _fx
-                                    forensics_dir = CFG.log_dir.parent / "forensics"
-                                    _fx.write_forensics_dump(
-                                        forensics_dir, proj_sid,
-                                        trigger=f"upstream_{status_code}",
-                                        response_buffer=err_body or "",
-                                        extra={"status": status_code,
-                                               "url": url},
-                                        max_dumps=CFG.forensics_max_dumps,
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            # Don't break — wait for SENTINEL so producer
-                            # cleanly closes its async-with stack.
-                        else:
-                            _SESSION_ERROR_STREAK[proj_sid] = 0
-                        continue
-                    # tag is None → real response-body chunk
-                    bytes_out += len(payload)
-                    if CFG.stall_watchdog_enabled:
-                        _stall.mark_event(proj_sid, conv_sid=conv_sid)
-                    # Soft-completion accumulator: just buffer the bytes,
-                    # the LLM behavioral classifier runs ONCE at stream
-                    # end (see finally block below). We don't decide
-                    # mid-stream — hot-path stays cheap.
-                    if CFG.soft_completion_gate_enabled:
-                        try:
-                            from . import soft_completion as _sc
-                            _sc.accumulate_chunk(proj_sid, payload)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if translator is None:
-                        out_bytes = _intercept_completed(payload)
-                        if out_bytes:
-                            yield _capture_outgoing(out_bytes)
                     else:
-                        for out in translator.feed(payload):
-                            out_bytes = _intercept_completed(out)
-                            if out_bytes:
-                                yield _capture_outgoing(out_bytes)
-                if translator is not None and not upstream_failed:
-                    for out in translator.flush():
-                        out_bytes = _intercept_completed(out)
-                        if out_bytes:
-                            yield _capture_outgoing(out_bytes)
-
-                # ─── stream-rewrite synthesis ──────────────────────
-                # We held back the response.completed event. Decide
-                # whether to inject a synthetic advisor function_call
-                # in front of it, then flush.
-                if rewrite_enabled and holding_completion[0]:
-                    try:
-                        from . import soft_completion as _sc
-                        from . import stream_rewrite as _sr
-                        api_key = (os.environ.get(CFG.local.api_key_env)
-                                   if CFG.local.api_key_env else None)
-                        buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
-                        body_input = (body.get("input")
-                                       if isinstance(body, dict) else None)
-                        user_goal = _sc.extract_user_goal(body_input)
-                        tracker = _sc.extract_progress_tracker(body_input)
-                        tool_summary = _sc.extract_tool_summary(body_input)
-                        # Synchronous classification — we're at stream
-                        # end, no other bytes flowing. Bounded by
-                        # self_classify_timeout_s (default 30s).
-                        diag = await _sc.classify_at_stream_end_diag(
-                            proj_sid,
-                            local_base_url=CFG.local.base_url,
-                            local_model=CFG.local.model,
-                            api_key=api_key,
-                            timeout_s=CFG.self_classify_timeout_s,
-                            threshold=CFG.self_classify_threshold,
-                            raw_buffer=buffer_snapshot,
-                            user_goal=user_goal,
-                            progress_tracker=tracker,
-                            tool_summary=tool_summary,
-                            force_frontier_threshold=(
-                                CFG.soft_completion_auto_force_frontier_threshold
-                                if CFG.soft_completion_auto_force_frontier_enabled
-                                else 1.01),
-                            short_text_threshold=CFG.soft_completion_short_text_threshold,
-                            stop_text_threshold=CFG.soft_completion_stop_text_threshold,
-                        )
-                        if (diag.result is not None
-                                and diag.result.soft_punt
-                                and diag.result.p >= CFG.soft_completion_stream_rewrite_threshold):
-                            text_excerpt = _sc._extract_text_from_buffer(
-                                buffer_snapshot)
-                            task_body = _sr.build_task_body(
-                                text_excerpt,
-                                diag.result.reason,
-                                diag.result.p)
-                            # Multi-strategy synthetic continue: rotate
-                            # through codex builtins (shell / local_shell /
-                            # update_plan) until codex actually dispatches
-                            # one. spawn_agent was tried first but binary
-                            # analysis confirmed codex silently drops it.
-                            from . import synthetic_continue as _syn
-                            inj_events, strategy = _syn.build_continue_injection(
-                                erg_key,
-                                max_injections=CFG.max_continue_injections_per_session,
-                            )
-                            if strategy["label"] == "budget_exhausted":
-                                from . import empty_response_guard as _erg_budget
-                                _erg_budget.force_next_to_frontier(
-                                    erg_key, "injection_budget_exhausted")
-                                _log("soft_completion_stream_rewrite_budget_exhausted",
-                                     session=proj_sid,
-                                     p=diag.result.p,
-                                     injection_count=_syn.injection_count(erg_key),
-                                     max_injections=CFG.max_continue_injections_per_session)
-                            else:
-                                for evt in inj_events:
-                                    yield _capture_outgoing(evt)
-                                _log("soft_completion_stream_rewrite_injected",
-                                     session=proj_sid,
-                                     p=diag.result.p,
-                                     reason=diag.result.reason,
-                                     strategy=strategy["label"],
-                                     tool_name=strategy["tool_name"],
-                                     task_chars=len(task_body),
-                                     injection_count=_syn.injection_count(erg_key))
-                            if trace is not None:
-                                trace.soft_completion_gate_injected = True
-                                trace.soft_completion_gate_pattern = (
-                                    f"stream-rewrite: {diag.result.reason}")[:80]
-                            # Forensics: capture the PUNT that triggered
-                            # this stream-rewrite. Same write_punt_forensics
-                            # the bg_classify path uses.
-                            if (CFG.forensics_enabled
-                                    and CFG.forensics_capture_punts
-                                    and diag.result.p >= CFG.forensics_punt_threshold):
-                                try:
-                                    from . import forensics as _fx
-                                    forensics_dir = CFG.log_dir.parent / "forensics"
-                                    # Custom dump that ALSO includes the
-                                    # outgoing capture (what codex
-                                    # actually saw, post-injection).
-                                    raw = _sc._OUTPUT_BUFFER.get(proj_sid, "") or ""
-                                    fpath = _fx.write_forensics_dump(
-                                        forensics_dir, proj_sid,
-                                        trigger="punt_via_stream_rewrite",
-                                        response_buffer=raw,
-                                        classifier_verdict={
-                                            "soft_punt": diag.result.soft_punt,
-                                            "p": diag.result.p,
-                                            "reason": diag.result.reason,
-                                            "extracted_text_chars": diag.extracted_text_chars,
-                                            "raw_buffer_chars": diag.raw_buffer_chars,
-                                            "finish_reason": diag.finish_reason,
-                                        },
-                                        extra={
-                                            "strategy": strategy["label"],
-                                            "tool_name": strategy["tool_name"],
-                                            "outgoing_to_codex_chars": len(outgoing_capture),
-                                            "outgoing_to_codex_tail": (
-                                                bytes(outgoing_capture[-4000:]).decode("utf-8", "replace")
-                                                if outgoing_capture else ""),
-                                        },
-                                        max_dumps=CFG.forensics_max_dumps,
-                                    )
-                                    if fpath:
-                                        _log("forensics_dump_written",
-                                             session=proj_sid,
-                                             trigger="punt_via_stream_rewrite",
-                                             path=str(fpath))
-                                except Exception:  # noqa: BLE001
-                                    pass
-                        else:
-                            _log("soft_completion_stream_rewrite_skipped",
-                                 session=proj_sid,
-                                 reason=("not_punt" if diag.result is None
-                                         else f"p={diag.result.p:.2f}"
-                                              f"<{CFG.soft_completion_stream_rewrite_threshold}"))
-                    except Exception as e:  # noqa: BLE001
-                        _log("soft_completion_stream_rewrite_error",
-                             session=proj_sid, error=str(e))
-                    # Always flush the held response.completed at the end
-                    if held_completion_buf:
-                        yield _capture_outgoing(bytes(held_completion_buf))
-            finally:
-                if not producer.done():
-                    producer.cancel()
-                    try:
-                        await producer
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                        pass
-                # Always unregister, even if the watchdog already
-                # cancelled us — `unregister_task(task=producer)` is a
-                # no-op when a fresh stream has already replaced the
-                # registration, so we never clobber the next stream.
-                if CFG.stall_watchdog_enabled:
-                    try:
-                        _stall.unregister_task(proj_sid, producer)
-                    except Exception:  # noqa: BLE001
-                        pass
+                        _log("soft_completion_stream_rewrite_skipped",
+                             session=proj_sid,
+                             reason=("not_punt" if diag.result is None
+                                     else f"p={diag.result.p:.2f}"
+                                          f"<{CFG.soft_completion_stream_rewrite_threshold}"))
+                except Exception as e:  # noqa: BLE001
+                    _log("soft_completion_stream_rewrite_error",
+                         session=proj_sid, error=str(e))
+                # Always flush the held response.completed at the end
+                if held_completion_buf:
+                    yield _capture_outgoing(bytes(held_completion_buf))
         else:
             # keepalive disabled — original simple loop, no extra task overhead
             async with httpx.AsyncClient(
