@@ -573,3 +573,39 @@ async def test_poke_back_compat_without_prompt_tiers(tmp_path: Path):
     assert rec.status == "spawned"
     log_text = Path(rec.log_path).read_text()
     assert "LEGACY_BACKCOMPAT" in log_text
+
+
+# ─── P3 SessionState integration ──────────────────────────────────────────
+
+
+def test_session_state_stores_poke_count_under_exec_resume_namespace():
+    """P3: per-session poke counter lives in SessionState ns=exec_resume,
+    key=poke_count. Mutating via the SessionState API must be visible
+    through the legacy module attribute (and vice-versa) — confirms the
+    shim isn't drifting from the canonical store."""
+    from tinyctx import exec_resume as _xr
+    from tinyctx import session_state as ss
+    _xr.reset_state()
+    # SessionState write → module-attribute read.
+    ss.set("sid-aa", "exec_resume", "poke_count", 3)
+    assert _xr.poke_count("sid-aa") == 3
+    assert _xr._POKE_COUNT_PER_SESSION["sid-aa"] == 3
+    # Module-attribute write → SessionState read.
+    _xr._LAST_POKE_TS["sid-aa"] = 1234.5
+    assert ss.get("sid-aa", "exec_resume", "last_poke_ts") == 1234.5
+
+
+def test_exec_resume_state_survives_compaction():
+    """P3: cooldown + tier counter must NOT be cleared by a compaction
+    boundary — codex's session_id is rooted in sqlite (outlives the
+    in-process compaction event), so rate-limit + tier escalation
+    semantics need to persist."""
+    from tinyctx import exec_resume as _xr
+    from tinyctx import session_state as ss
+    _xr.reset_state()
+    ss.set("sid-cc", "exec_resume", "poke_count", 4)
+    ss.set("sid-cc", "exec_resume", "last_poke_ts", time.time())
+    ss.reset_compaction("sid-cc")
+    assert _xr.poke_count("sid-cc") == 4
+    # last_poke_ts is still readable (cooldown semantics preserved).
+    assert ss.get("sid-cc", "exec_resume", "last_poke_ts") is not None

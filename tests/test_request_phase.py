@@ -143,3 +143,34 @@ def test_transition_timing_records_since_ts_per_transition():
     set_phase("sid-time", RequestPhase.backend_streaming)
     info2 = get_phase("sid-time")
     assert info2["since_ts"] - info["since_ts"] >= 0.04
+
+
+# ─── P3 SessionState integration ──────────────────────────────────────────
+
+
+def test_session_state_stores_phase_under_request_phase_namespace():
+    """P3: phase entry lives in SessionState ns=request_phase, key=current.
+    set_phase / get_phase are thin wrappers over `session_state.set/get`."""
+    from tinyctx.request_phase import RequestPhase, set_phase, get_phase
+    from tinyctx import session_state as ss
+
+    set_phase("sid-ns", RequestPhase.backend_streaming, "rq_ns")
+    raw = ss.get("sid-ns", "request_phase", "current")
+    assert raw is not None
+    assert raw["phase"] == "backend_streaming"
+    assert raw["request_id"] == "rq_ns"
+    # Public getter mirrors what's in SessionState.
+    assert get_phase("sid-ns")["phase"] == raw["phase"]
+
+
+def test_phase_cleared_on_compaction():
+    """P3: `current` is registered for compaction reset — a post-compaction
+    request flow is logically fresh and the stale phase badge would
+    mislead the dashboard."""
+    from tinyctx.request_phase import RequestPhase, set_phase, get_phase
+    from tinyctx import session_state as ss
+
+    set_phase("sid-cp", RequestPhase.backend_streaming, "rq_cp")
+    assert get_phase("sid-cp") is not None
+    ss.reset_compaction("sid-cp")
+    assert get_phase("sid-cp") is None

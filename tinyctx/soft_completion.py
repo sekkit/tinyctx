@@ -63,17 +63,159 @@ import hashlib
 import json
 import re
 import time
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
+from . import session_state
+
+
+# ─── SessionState namespace + compaction reset policy ─────────────────────
+
+_NS = "soft_completion"
+_K_FLAG = "flag"
+_K_OUTPUT_BUFFER = "output_buffer"
+
+# Compaction clears the stale stream buffer — post-compaction is a fresh
+# request and any buffered SSE fragment from before is no longer relevant.
+# The flag is one-shot (consumed on the next gate-check), so it doesn't
+# need explicit compaction-reset; leaving it set across a compaction is
+# fine — the next request still consumes it once.
+session_state.register_compaction_reset(_NS, [_K_OUTPUT_BUFFER])
+
+
+# ─── legacy dict views ────────────────────────────────────────────────────
+
+
+class _FlagDictView:
+    """Read/write proxy for the legacy `_SOFT_COMPLETION_FLAG` attribute.
+    `view[proj_sid]` returns the underlying flag dict by reference (so
+    callers / tests that read individual fields like `flag["active"]`
+    still work). Missing entries return `None` from `.get(...)` to match
+    the original `dict.get` semantics — note the underlying type was
+    `defaultdict(dict)` but every reader uses `.get(...)` so `None` is
+    the observable shape."""
+
+    __slots__ = ()
+
+    def __iter__(self) -> Iterator[str]:
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if _K_FLAG in by_ns.get(_NS, {}):
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def items(self) -> list[tuple[str, dict[str, Any]]]:
+        snap = session_state.snapshot()
+        out: list[tuple[str, dict[str, Any]]] = []
+        for sid, by_ns in snap.items():
+            val = by_ns.get(_NS, {}).get(_K_FLAG)
+            if val is not None:
+                out.append((sid, val))
+        return out
+
+    def values(self) -> list[dict[str, Any]]:
+        return [v for _, v in self.items()]
+
+    def __contains__(self, sid: Any) -> bool:
+        return session_state.get(sid, _NS, _K_FLAG) is not None
+
+    def __getitem__(self, sid: Any) -> dict[str, Any]:
+        val = session_state.get(sid, _NS, _K_FLAG)
+        if val is None:
+            # Match defaultdict(dict) semantics: missing → new empty dict
+            # stored back, returned by reference. _set_flag_for_test and
+            # the classifier paths use direct assignment so the shape on
+            # read is consistent.
+            empty: dict[str, Any] = {}
+            session_state.set(sid, _NS, _K_FLAG, empty)
+            return empty
+        return val
+
+    def __setitem__(self, sid: Any, value: dict[str, Any]) -> None:
+        session_state.set(sid, _NS, _K_FLAG, value)
+
+    def __delitem__(self, sid: Any) -> None:
+        session_state.clear(sid, _NS, _K_FLAG)
+
+    def get(self, sid: Any, default: Any = None) -> Any:
+        val = session_state.get(sid, _NS, _K_FLAG)
+        return default if val is None else val
+
+    def pop(self, sid: Any, default: Any = None) -> Any:
+        existing = session_state.consume(sid, _NS, _K_FLAG)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, _K_FLAG)
+
+
+class _OutputBufferDictView:
+    """Read/write proxy for the legacy `_OUTPUT_BUFFER` attribute. The
+    buffer is a STRING per proj_sid (ring-buffer'd by the caller via the
+    read-then-set-truncated pattern in `accumulate_chunk`). Missing reads
+    return `""` to match the original `defaultdict(str)` semantics."""
+
+    __slots__ = ()
+
+    def __iter__(self) -> Iterator[str]:
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if _K_OUTPUT_BUFFER in by_ns.get(_NS, {}):
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def items(self) -> list[tuple[str, str]]:
+        snap = session_state.snapshot()
+        out: list[tuple[str, str]] = []
+        for sid, by_ns in snap.items():
+            val = by_ns.get(_NS, {}).get(_K_OUTPUT_BUFFER)
+            if val is not None:
+                out.append((sid, val))
+        return out
+
+    def values(self) -> list[str]:
+        return [v for _, v in self.items()]
+
+    def __contains__(self, sid: Any) -> bool:
+        return session_state.get(sid, _NS, _K_OUTPUT_BUFFER) is not None
+
+    def __getitem__(self, sid: Any) -> str:
+        val = session_state.get(sid, _NS, _K_OUTPUT_BUFFER)
+        return "" if val is None else val
+
+    def __setitem__(self, sid: Any, value: str) -> None:
+        session_state.set(sid, _NS, _K_OUTPUT_BUFFER, value)
+
+    def __delitem__(self, sid: Any) -> None:
+        session_state.clear(sid, _NS, _K_OUTPUT_BUFFER)
+
+    def get(self, sid: Any, default: Any = "") -> str:
+        val = session_state.get(sid, _NS, _K_OUTPUT_BUFFER)
+        return default if val is None else val
+
+    def pop(self, sid: Any, default: Any = None) -> Any:
+        existing = session_state.consume(sid, _NS, _K_OUTPUT_BUFFER)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, _K_OUTPUT_BUFFER)
+
 
 # ─── per-session state ─────────────────────────────────────────────────────
+# Module-level shims that delegate to SessionState. Public-API-identical
+# to the previous `defaultdict(dict)` / `defaultdict(str)` storage so
+# tests and proxy call sites keep working unchanged.
 
-_SOFT_COMPLETION_FLAG: dict[str, dict[str, Any]] = defaultdict(dict)
-_OUTPUT_BUFFER: dict[str, str] = defaultdict(str)
+_SOFT_COMPLETION_FLAG = _FlagDictView()
+_OUTPUT_BUFFER = _OutputBufferDictView()
 # Cap raw SSE buffer at 64KB. After SSE+JSON-overhead extraction this
 # yields ~30-50KB of actual text — comfortably above the 4KB tail we
 # feed the classifier.

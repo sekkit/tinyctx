@@ -71,10 +71,87 @@ import os
 import shutil
 import sqlite3
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from . import session_state
+
+
+# ─── SessionState namespace + compaction reset policy ─────────────────────
+
+_NS = "exec_resume"
+_K_LAST_POKE_TS = "last_poke_ts"
+_K_POKE_COUNT = "poke_count"
+
+# Intentionally EMPTY: poke history should NOT reset on a compaction
+# boundary. The codex session_id keys outlive the agent's compaction
+# (they're rooted in codex.app's sqlite, not the running thread), so
+# the cooldown + tier counter must persist for the rate-limit + tier
+# escalation to behave correctly across compactions.
+session_state.register_compaction_reset(_NS, [])
+
+
+# ─── legacy dict view ──────────────────────────────────────────────────────
+
+
+class _SessionStateDictView:
+    """Read/write proxy that maps `view[session_id]` to a single SessionState
+    key under namespace `exec_resume`. Returns `_default` for missing keys
+    so callers preserving the original `defaultdict` semantics keep working
+    (tests rely on `_LAST_POKE_TS.get(sid, 0.0)` style reads)."""
+
+    __slots__ = ("_key", "_default")
+
+    def __init__(self, key: str, default: Any) -> None:
+        self._key = key
+        self._default = default
+
+    def __iter__(self) -> Iterator[str]:
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if self._key in by_ns.get(_NS, {}):
+                yield sid
+
+    def keys(self) -> list[str]:
+        return list(iter(self))
+
+    def items(self) -> list[tuple[str, Any]]:
+        snap = session_state.snapshot()
+        out: list[tuple[str, Any]] = []
+        for sid, by_ns in snap.items():
+            if self._key in by_ns.get(_NS, {}):
+                out.append((sid, by_ns[_NS][self._key]))
+        return out
+
+    def values(self) -> list[Any]:
+        return [v for _, v in self.items()]
+
+    def __contains__(self, session_id: Any) -> bool:
+        return session_state.get(session_id, _NS, self._key) is not None
+
+    def __getitem__(self, session_id: Any) -> Any:
+        val = session_state.get(session_id, _NS, self._key)
+        return self._default if val is None else val
+
+    def __setitem__(self, session_id: Any, value: Any) -> None:
+        session_state.set(session_id, _NS, self._key, value)
+
+    def __delitem__(self, session_id: Any) -> None:
+        session_state.clear(session_id, _NS, self._key)
+
+    def get(self, session_id: Any, default: Any = None) -> Any:
+        val = session_state.get(session_id, _NS, self._key)
+        return default if val is None else val
+
+    def pop(self, session_id: Any, default: Any = None) -> Any:
+        existing = session_state.consume(session_id, _NS, self._key)
+        return existing if existing is not None else default
+
+    def clear(self) -> None:
+        for sid in list(iter(self)):
+            session_state.clear(sid, _NS, self._key)
 
 
 # ─── default codex paths ───────────────────────────────────────────────────
@@ -175,17 +252,19 @@ class PokeRecord:
     log_path: str = ""     # subprocess stdout/stderr capture file
 
 
-# Per-session cooldown timestamps + global per-minute counter.
-_LAST_POKE_TS: dict[str, float] = defaultdict(float)  # by session_id
+# Per-session cooldown timestamps + per-session tier counter live in
+# SessionState (keyed by codex `session_id`); the global per-minute
+# deque + dashboard history deque stay module-local — they're NOT
+# per-session state and SessionState's storage shape doesn't fit them.
+_LAST_POKE_TS = _SessionStateDictView(_K_LAST_POKE_TS, default=0.0)
+_POKE_COUNT_PER_SESSION = _SessionStateDictView(_K_POKE_COUNT, default=0)
 _RECENT_POKES: deque[float] = deque(maxlen=120)       # global timestamps
 _HISTORY: deque[PokeRecord] = deque(maxlen=50)        # for dashboard
-# Per-session count of successful pokes — drives the tiered prompt
-# escalation (gentle → firm → final → tier_exhausted).
-_POKE_COUNT_PER_SESSION: dict[str, int] = defaultdict(int)
 
 
 def poke_count(session_id: str) -> int:
-    return _POKE_COUNT_PER_SESSION.get(session_id, 0)
+    val = session_state.get(session_id, _NS, _K_POKE_COUNT, 0)
+    return int(val) if val else 0
 
 
 def select_tier_prompt(session_id: str,
@@ -200,7 +279,7 @@ def select_tier_prompt(session_id: str,
     """
     if not tiers:
         return None
-    count = _POKE_COUNT_PER_SESSION.get(session_id, 0)
+    count = int(session_state.get(session_id, _NS, _K_POKE_COUNT, 0) or 0)
     if count <= 1:
         return tiers[0] if len(tiers) >= 1 else tiers[-1]
     if count <= 4:
@@ -216,7 +295,7 @@ def _check_rate_limits(session_id: str,
     """Return empty string if poke is allowed, else a reason string
     (used as PokeRecord.reason on rejection)."""
     now = time.time()
-    last = _LAST_POKE_TS.get(session_id, 0.0)
+    last = float(session_state.get(session_id, _NS, _K_LAST_POKE_TS, 0.0) or 0.0)
     if last and (now - last) < cooldown_s:
         return f"cooldown: {int(cooldown_s - (now - last))}s remaining"
     # Global per-minute cap — strip stale entries first
@@ -422,9 +501,9 @@ async def poke(
     rec.status = "spawned"
     rec.pid = pid
     rec.log_path = log_path
-    _LAST_POKE_TS[session_id] = rec.ts
+    session_state.set(session_id, _NS, _K_LAST_POKE_TS, rec.ts)
     _RECENT_POKES.append(rec.ts)
-    _POKE_COUNT_PER_SESSION[session_id] += 1
+    session_state.increment(session_id, _NS, _K_POKE_COUNT, 1)
     _HISTORY.append(rec)
     return rec
 
@@ -451,14 +530,14 @@ def history_snapshot(limit: int = 50) -> list[dict[str, Any]]:
 
 def state_snapshot() -> dict[str, Any]:
     """Compact summary: counts by status + active cooldowns."""
-    by_status: dict[str, int] = defaultdict(int)
+    by_status: dict[str, int] = {}
     for r in _HISTORY:
-        by_status[r.status] += 1
+        by_status[r.status] = by_status.get(r.status, 0) + 1
     now = time.time()
     cooldowns = {sid: round(now - ts, 1)
                  for sid, ts in _LAST_POKE_TS.items()
                  if (now - ts) < 600}  # show last 10 minutes
-    poke_counts = dict(_POKE_COUNT_PER_SESSION)
+    poke_counts = {sid: int(c) for sid, c in _POKE_COUNT_PER_SESSION.items()}
     tier_state = {
         sid: ("gentle" if c <= 1
               else "firm" if c <= 4
@@ -467,7 +546,7 @@ def state_snapshot() -> dict[str, Any]:
     }
     return {
         "history_total": len(_HISTORY),
-        "by_status": dict(by_status),
+        "by_status": by_status,
         "recent_pokes_per_min": len([t for t in _RECENT_POKES
                                        if now - t < 60]),
         "cooldowns_age_s": cooldowns,

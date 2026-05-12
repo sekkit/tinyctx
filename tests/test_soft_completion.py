@@ -1019,3 +1019,41 @@ def test_force_frontier_flag_falls_back_to_proj_sid_without_conv_sid():
         assert empty_response_guard.peek_force_frontier("p1") is not None
     finally:
         httpd.shutdown()
+
+
+# ─── P3 SessionState integration ──────────────────────────────────────────
+
+
+def test_session_state_stores_soft_completion_under_namespace():
+    """P3: output buffer + flag live in SessionState ns=soft_completion.
+    Round-trip the legacy module attributes against the canonical store."""
+    from tinyctx import soft_completion
+    from tinyctx import session_state as ss
+    soft_completion.reset_state()
+    # Buffer round-trip
+    soft_completion.accumulate_chunk("sid-int", b"hello world")
+    assert "hello world" in ss.get("sid-int", "soft_completion",
+                                     "output_buffer")
+    assert "hello world" in soft_completion._OUTPUT_BUFFER["sid-int"]
+    # Flag round-trip
+    soft_completion._set_flag_for_test("sid-int", reason="probe", p=0.9)
+    flag = ss.get("sid-int", "soft_completion", "flag")
+    assert flag is not None
+    assert flag.get("active") is True
+    assert soft_completion.get_flag("sid-int") is not None
+
+
+def test_soft_completion_output_buffer_clears_on_compaction():
+    """P3: output_buffer is registered for compaction reset — a stream
+    fragment from before the compaction boundary is no longer relevant
+    to the new request flow that follows. Flag is NOT cleared (one-shot
+    consumed by the next gate-check)."""
+    from tinyctx import soft_completion
+    from tinyctx import session_state as ss
+    soft_completion.reset_state()
+    soft_completion.accumulate_chunk("sid-compact", b"stale buffer content")
+    soft_completion._set_flag_for_test("sid-compact", reason="x", p=1.0)
+    ss.reset_compaction("sid-compact")
+    # Buffer wiped, flag preserved.
+    assert ss.get("sid-compact", "soft_completion", "output_buffer") is None
+    assert soft_completion.get_flag("sid-compact") is not None

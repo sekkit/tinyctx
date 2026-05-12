@@ -16,15 +16,21 @@ proxy.py calls `set_phase(proj_sid, RequestPhase.X, request_id=...)`
 at ~10 natural lifecycle points. The dashboard reads the dict via
 `state_snapshot()` and renders the current phase + age per session.
 
-Storage is in-memory module-level (single-process proxy); test harness
-clears it via `reset_state()`.
+State storage
+─────────────
+P3 migration: state lives in `tinyctx.session_state` under namespace
+`request_phase` key `current` (single dict value per proj_sid). The key
+is registered for compaction reset because a compaction boundary marks
+the start of a logically fresh request flow — surfacing the pre-
+compaction phase on the dashboard would be misleading.
 """
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from enum import Enum
 from typing import Any
+
+from . import session_state
 
 
 class RequestPhase(str, Enum):
@@ -45,12 +51,16 @@ class RequestPhase(str, Enum):
     empty_guarded = "empty_guarded"
 
 
-# ─── per-session state ─────────────────────────────────────────────────────
-# Keyed by proj_sid. Each entry: {"phase": str, "since_ts": float,
-# "request_id": str}. Single-entry-per-session: a new transition replaces
-# the previous one. State is per-process (proxy is single-process).
+# ─── SessionState namespace + compaction reset policy ─────────────────────
 
-_PHASE: dict[str, dict[str, Any]] = defaultdict(dict)
+_NS = "request_phase"
+_K_CURRENT = "current"
+
+# Post-compaction is a logically fresh request flow — drop the stale
+# phase entry so the dashboard doesn't render an outdated "stuck in
+# backend_streaming" badge for a session whose stream actually ended
+# at the compaction boundary.
+session_state.register_compaction_reset(_NS, [_K_CURRENT])
 
 
 def set_phase(proj_sid: str,
@@ -64,31 +74,38 @@ def set_phase(proj_sid: str,
     if not proj_sid:
         return
     value = phase.value if isinstance(phase, RequestPhase) else str(phase)
-    _PHASE[proj_sid] = {
+    session_state.set(proj_sid, _NS, _K_CURRENT, {
         "phase": value,
         "since_ts": time.time(),
         "request_id": request_id or "",
-    }
+    })
 
 
 def get_phase(proj_sid: str) -> dict[str, Any] | None:
     """Return current phase entry for `proj_sid`, or None when no
     transition has been recorded for this session."""
-    info = _PHASE.get(proj_sid)
+    info = session_state.get(proj_sid, _NS, _K_CURRENT)
     return dict(info) if info else None
 
 
 def state_snapshot() -> dict[str, dict[str, Any]]:
     """All active phase entries, copied. For dashboard rendering."""
-    return {sid: dict(info)
-            for sid, info in _PHASE.items()
-            if info}
+    snap = session_state.snapshot()
+    out: dict[str, dict[str, Any]] = {}
+    for sid, by_ns in snap.items():
+        info = by_ns.get(_NS, {}).get(_K_CURRENT)
+        if info:
+            out[sid] = dict(info)
+    return out
 
 
 def reset_state(proj_sid: str | None = None) -> None:
     """Test/dev helper. With no arg, clear all sessions; with a key,
     clear just that one."""
     if proj_sid is None:
-        _PHASE.clear()
+        snap = session_state.snapshot()
+        for sid, by_ns in snap.items():
+            if _K_CURRENT in by_ns.get(_NS, {}):
+                session_state.clear(sid, _NS, _K_CURRENT)
         return
-    _PHASE.pop(proj_sid, None)
+    session_state.clear(proj_sid, _NS, _K_CURRENT)
