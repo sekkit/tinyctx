@@ -1457,13 +1457,24 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             if action.decision == "retry_escalate":
                 new_url, new_headers, _b, new_decision, _backend = (
                     _build_frontier_retry_target(None, cur_body, action.reason))
-                # Reuse incoming Authorization-style headers (codex auth);
-                # the original `headers` already had auth resolved. Frontier
-                # accepts the same body so no body transform needed.
-                # Patch Content-Type + Accept defaults.
+                # Preserve codex routing headers (openai-beta,
+                # x-codex-session-id, etc.) from the original request,
+                # but REBUILD Authorization for the frontier backend.
+                # Without this, a local-backend bearer (e.g. LMStudio's
+                # sk-* key) leaks to chatgpt.com and triggers a 401 that
+                # closes the request at bytes_out=0 — codex shows
+                # "task interrupted" right after retry_attempted. See
+                # rq_f372c3c35c47444db89e for the live trace.
                 merged = dict(cur_headers)
                 merged["Content-Type"] = "application/json"
                 merged.setdefault("Accept", "text/event-stream")
+                fb_key = _resolve_api_key(CFG.frontier, None)
+                if fb_key:
+                    merged["Authorization"] = (
+                        fb_key if fb_key.lower().startswith(
+                            ("bearer ", "basic ")) else f"Bearer {fb_key}")
+                else:
+                    merged.pop("Authorization", None)
                 new_headers = merged
                 # Set force_next_to_frontier so next turn also frontier
                 if action.escalate_flag_reason:
@@ -1798,12 +1809,26 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             esc_url, esc_headers_proto, _b, esc_decision, _bk = (
                                 _build_frontier_retry_target(
                                     None, cur_attempt_body, action.reason))
-                            # Reuse existing auth headers (codex auth was
-                            # already resolved by _forward_headers); patch
-                            # Content-Type + Accept.
+                            # Preserve codex routing headers (openai-beta,
+                            # x-codex-session-id, ...) from the original
+                            # request, but REBUILD Authorization for the
+                            # frontier backend. Without this, a
+                            # local-backend bearer (e.g. LMStudio's sk-*)
+                            # leaks to chatgpt.com and triggers a 401 that
+                            # closes the stream at bytes_out=0 — codex
+                            # shows "task interrupted" right after
+                            # retry_attempted. See rq_f372c3c35c47444db89e.
                             merged = dict(cur_attempt_headers)
                             merged["Content-Type"] = "application/json"
                             merged.setdefault("Accept", "text/event-stream")
+                            fb_key = _resolve_api_key(CFG.frontier, None)
+                            if fb_key:
+                                merged["Authorization"] = (
+                                    fb_key if fb_key.lower().startswith(
+                                        ("bearer ", "basic "))
+                                    else f"Bearer {fb_key}")
+                            else:
+                                merged.pop("Authorization", None)
                             new_url = esc_url
                             new_headers = merged
                             new_decision = esc_decision

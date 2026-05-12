@@ -1026,3 +1026,219 @@ class TestEarlyKeepaliveOnStreamOpen:
             f"first bytes must be an SSE comment frame (starting with "
             f"':'); got: {first_chunk[:80]!r}"
         )
+
+
+# ─── retry-escalate must REBUILD frontier auth, not pass through ─────────
+#
+# Diagnosed 2026-05-12 from a live trace:
+#   request_id rq_f372c3c35c47444db89e
+#     T+0.000s   route local (LMStudio)
+#     T+3.345s   LMStudio returns 400 → retry_attempted → retry_escalate
+#                new_url = https://chatgpt.com/backend-api/codex/responses
+#     T+5.169s   upstream_error status=401
+#                body: "Incorrect API key provided: sk-0c07e**********55a7"
+#                bytes_out=0, keepalives_emitted=1, request ended
+#
+# Root cause: both retry sites do `merged = dict(cur_attempt_headers)` and
+# only patch Content-Type/Accept — the original LOCAL-backend Authorization
+# header (e.g. LMStudio's `Bearer sk-0c07e...`) flows unchanged to
+# chatgpt.com, which rejects it as an invalid OpenAI key with 401. The
+# request closes with bytes_out=0 and codex shows "task interrupted".
+#
+# Fix: on retry_escalate, rebuild the Authorization header for the frontier
+# backend (via `_resolve_api_key(CFG.frontier, None)` → env var or
+# ~/.codex/auth.json passthrough), dropping the local-backend bearer.
+
+
+def _make_mock_post_with_headers(responses: list):
+    """Like `_make_mock_post` but also records the headers per attempt."""
+    state = {"calls": [], "headers": [], "idx": 0}
+
+    async def _post(self, url, *args, **kwargs):
+        state["calls"].append(url)
+        # httpx may pass headers either as a kwarg or on `self.headers`;
+        # the proxy passes them via the `headers=` kwarg.
+        state["headers"].append(dict(kwargs.get("headers") or {}))
+        if state["idx"] >= len(responses):
+            raise RuntimeError(f"unexpected extra call to {url}")
+        r = responses[state["idx"]]
+        state["idx"] += 1
+        if isinstance(r, Exception):
+            raise r
+        status_code, body = r
+        return httpx.Response(
+            status_code=status_code,
+            json=body,
+            request=httpx.Request("POST", url),
+        )
+
+    return _post, state
+
+
+def _make_mock_stream_with_headers(scripts: list):
+    """Like `_make_mock_stream` but also records per-attempt headers."""
+    state = {"calls": [], "headers": [], "idx": 0}
+
+    def stream_fn(self, method, url, **kwargs):
+        state["calls"].append(url)
+        state["headers"].append(dict(kwargs.get("headers") or {}))
+        if state["idx"] >= len(scripts):
+            raise RuntimeError(f"unexpected extra stream call to {url}")
+        sc = scripts[state["idx"]]
+        state["idx"] += 1
+        kind = sc[0]
+        if kind == "ok":
+            chunks = sc[1]
+            return _MockStreamCtx(200, chunks=chunks)
+        if kind == "err":
+            status, body = sc[1], sc[2]
+            return _MockStreamCtx(status, err_body=body)
+        raise AssertionError(f"unknown script kind {kind}")
+
+    return stream_fn, state
+
+
+class TestRetryEscalateRebuildsFrontierAuth:
+    """The Authorization header sent to the frontier upstream on
+    retry_escalate must NOT be the original local-backend bearer. It
+    must either (a) be resolved fresh from TINYCTX_FRONTIER_API_KEY /
+    ~/.codex/auth.json, or (b) be absent — anything BUT a copy of the
+    local-backend bearer.
+    """
+
+    _LOCAL_BEARER = "Bearer sk-LOCAL-KEY-must-not-leak-to-frontier-0c07e"
+
+    @pytest.mark.asyncio
+    async def test_forward_nonstream_escalate_drops_local_auth(
+            self, proxy_module, monkeypatch):
+        # Force a known frontier key so the rebuild has a deterministic
+        # value to compare against. (If left unset, the helper falls back
+        # to ~/.codex/auth.json which we can't depend on in CI.)
+        monkeypatch.setenv("TINYCTX_FRONTIER_API_KEY", "frontier-test-key")
+        responses = [
+            (400, {"error": {"message": "schema mismatch"}}),  # local 400
+            (200, {"id": "resp", "output": []}),                # frontier ok
+        ]
+        post_fn, state = _make_mock_post_with_headers(responses)
+        with patch.object(httpx.AsyncClient, "post", post_fn):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-auth-fwd")
+            await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json",
+                 "Authorization": self._LOCAL_BEARER},
+                {"model": "qwen-test", "input": []},
+                is_stream=False,
+                sid="s-auth-fwd",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-auth-fwd",
+            )
+        assert len(state["calls"]) == 2, (
+            f"expected 2 attempts; got {state['calls']}")
+        local_h, frontier_h = state["headers"]
+        # Sanity: the first attempt (local) still carries the original
+        # local-backend bearer.
+        assert local_h.get("Authorization") == self._LOCAL_BEARER, (
+            f"first-attempt auth should be the caller-provided bearer; "
+            f"got {local_h.get('Authorization')!r}")
+        # Critical: the SECOND attempt (frontier escalate) must NOT
+        # reuse the local-backend bearer.
+        assert frontier_h.get("Authorization") != self._LOCAL_BEARER, (
+            "retry-escalate to frontier sent the LOCAL-backend "
+            "Authorization header — chatgpt.com rejects this with 401 "
+            "and the user sees the request interrupted at bytes_out=0. "
+            f"Headers seen on frontier attempt: {frontier_h}"
+        )
+        # And: when TINYCTX_FRONTIER_API_KEY is set, the rebuilt header
+        # must use it.
+        assert frontier_h.get("Authorization") == "Bearer frontier-test-key", (
+            f"expected frontier attempt Authorization='Bearer "
+            f"frontier-test-key' (resolved from env); "
+            f"got {frontier_h.get('Authorization')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_escalate_drops_local_auth(
+            self, proxy_module, monkeypatch):
+        monkeypatch.setenv("TINYCTX_FRONTIER_API_KEY", "frontier-test-key")
+        monkeypatch.setattr(proxy_module.CFG,
+                            "stream_keepalive_interval_s", 1.0)
+        scripts = [
+            ("err", 400, b'{"error":"schema mismatch"}'),  # local 400
+            ("ok", [b'event: response.completed\n'
+                    b'data: {"type":"response.completed"}\n\n']),
+        ]
+        stream_fn, state = _make_mock_stream_with_headers(scripts)
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-auth-stream")
+            sr = await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json",
+                 "Authorization": self._LOCAL_BEARER},
+                {"model": "qwen-test", "input": []},
+                is_stream=True,
+                sid="s-auth-stream",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-auth-stream",
+            )
+            await _drain_stream(sr)
+        assert len(state["calls"]) == 2
+        local_h, frontier_h = state["headers"]
+        assert local_h.get("Authorization") == self._LOCAL_BEARER
+        assert frontier_h.get("Authorization") != self._LOCAL_BEARER, (
+            "stream retry-escalate sent the LOCAL-backend Authorization "
+            "to chatgpt.com — this is the rq_f372c3c35c47444db89e wedge "
+            "mode: chatgpt.com 401s, request ends bytes_out=0, codex "
+            f"shows 'task interrupted'. Headers: {frontier_h}"
+        )
+        assert frontier_h.get("Authorization") == "Bearer frontier-test-key"
+
+    @pytest.mark.asyncio
+    async def test_stream_escalate_preserves_codex_routing_headers(
+            self, proxy_module, monkeypatch):
+        """The rebuild must swap ONLY Authorization, not codex routing
+        headers (openai-beta, x-codex-session-id) that the frontier
+        relies on for proper request dispatch."""
+        monkeypatch.setenv("TINYCTX_FRONTIER_API_KEY", "frontier-test-key")
+        monkeypatch.setattr(proxy_module.CFG,
+                            "stream_keepalive_interval_s", 1.0)
+        scripts = [
+            ("err", 400, b'{"error":"schema mismatch"}'),
+            ("ok", [b'event: response.completed\n'
+                    b'data: {"type":"response.completed"}\n\n']),
+        ]
+        stream_fn, state = _make_mock_stream_with_headers(scripts)
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            trace = RequestTrace(session_id="s-auth-preserve")
+            sr = await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json",
+                 "Authorization": self._LOCAL_BEARER,
+                 "openai-beta": "responses=v1",
+                 "x-codex-session-id": "sess-xyz"},
+                {"model": "qwen-test", "input": []},
+                is_stream=True,
+                sid="s-auth-preserve",
+                decision=decision,
+                trace=trace,
+                conv_sid="conv-auth-preserve",
+            )
+            await _drain_stream(sr)
+        assert len(state["calls"]) == 2
+        _local_h, frontier_h = state["headers"]
+        assert frontier_h.get("openai-beta") == "responses=v1", (
+            f"openai-beta must survive the retry-escalate header rebuild; "
+            f"got {frontier_h}")
+        assert frontier_h.get("x-codex-session-id") == "sess-xyz", (
+            f"x-codex-session-id must survive the retry-escalate header "
+            f"rebuild; got {frontier_h}")
