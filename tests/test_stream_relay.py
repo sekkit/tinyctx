@@ -340,6 +340,116 @@ class TestStreamProducer:
         assert err.conv_sid == "conv-1"
 
     @pytest.mark.asyncio
+    async def test_stream_relay_survives_cancel_during_synthetic_err_put(self):
+        """If task.cancel() fires DURING the synthetic-error put on the
+        chunk queue (e.g. queue full + we are awaiting), the consumer
+        must still receive _ERR — not hang forever.
+
+        This is the race that explains the production stall_kill (not
+        stall_cancelled) observation: the producer enters the cancel
+        handler, builds the synthetic StallCancelledError, then a second
+        CancelledError lands during `await chunk_q.put(...)` and the
+        synthetic never makes it to the consumer. The producer task
+        ends in `done()` state, stall_watchdog's `cancel_active_task`
+        returns False on next sweep, and `stall_kill` is emitted while
+        the consumer hangs on `await chunk_q.get()` indefinitely.
+
+        We trigger the race deterministically by monkeypatching
+        `chunk_q.put` so the first call (inside the cancel handler)
+        raises `CancelledError`, simulating a cancel that lands during
+        the awaitable put.
+        """
+        started_evt = asyncio.Event()
+
+        class _Hanging:
+            status_code = 200
+            headers: dict = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def aread(self):
+                return b""
+
+            async def aiter_raw(self):
+                started_evt.set()
+                await asyncio.sleep(60)
+                if False:
+                    yield b""
+
+        def stream_fn(self, method, url, **kwargs):
+            return _Hanging()
+
+        producer = _make_producer()
+        chunk_q: asyncio.Queue = asyncio.Queue()
+
+        # Wrap chunk_q.put so we can simulate a cancel-during-put race
+        # ONLY when the producer is in its cancel handler (after the
+        # test pulls `race_armed`). Earlier puts (e.g. STATUS) must
+        # behave normally so the producer can reach the hang point.
+        real_put = chunk_q.put
+        race_armed = {"on": False}
+
+        async def racing_put(item):
+            if race_armed["on"]:
+                # Race: a cancel lands DURING this await — the synthetic
+                # never reaches the queue.
+                raise asyncio.CancelledError()
+            return await real_put(item)
+
+        chunk_q.put = racing_put  # type: ignore[assignment]
+
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            task = asyncio.create_task(producer.run(chunk_q))
+            await asyncio.wait_for(started_evt.wait(), timeout=1.0)
+            # Arm the race: the next `await chunk_q.put(...)` raises
+            # CancelledError. This is the put inside the cancel handler
+            # (the synthetic StallCancelledError push). The current code
+            # uses `await chunk_q.put(...)` which is itself cancellable.
+            race_armed["on"] = True
+            task.cancel()
+            # The producer MUST complete (not hang) within a bounded
+            # window even when the synthetic-err put races with cancel.
+            await asyncio.wait_for(task, timeout=2.0)
+
+        # CONTRACT: a terminating item (_ERR or _SENTINEL) MUST eventually
+        # appear on the queue within a bounded window — otherwise the
+        # consumer's `await chunk_q.get()` loop hangs forever. Drain up
+        # to a few items, but the cumulative wait must be bounded.
+        async def _drain_until_terminator(deadline: float):
+            seen: list = []
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                item = await asyncio.wait_for(chunk_q.get(), timeout=remaining)
+                seen.append(item)
+                if item[0] in (sr._ERR, sr._SENTINEL):
+                    return seen
+
+        deadline = asyncio.get_event_loop().time() + 1.0
+        try:
+            items = await _drain_until_terminator(deadline)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "consumer would hang forever: producer was cancelled "
+                "during synthetic-err put and pushed no terminator "
+                "(_ERR/_SENTINEL) onto the queue — this is the "
+                "stall_kill production bug.")
+
+        terminator = items[-1]
+        # Prefer the synthetic _ERR for clean terminator emission; a
+        # _SENTINEL also satisfies the no-hang contract.
+        assert terminator[0] in (sr._ERR, sr._SENTINEL), (
+            f"unexpected terminator after cancel-during-put: {terminator!r}")
+        if terminator[0] is sr._ERR:
+            assert isinstance(terminator[1], _sw.StallCancelledError)
+            assert terminator[1].proj_sid == "proj-1"
+
+    @pytest.mark.asyncio
     async def test_connection_error_propagates_via_err_tag(self):
         """The producer never raises to its caller — terminal failures
         surface as an _ERR-tagged queue item so the consumer can emit
@@ -563,6 +673,246 @@ class TestRelayStream:
         # And the upstream body MUST still be delivered.
         joined = b"".join(chunks)
         assert b"response.completed" in joined
+
+    @pytest.mark.asyncio
+    async def test_relay_registers_producer_with_stall_watchdog(self):
+        """Locks in the contract: while relay_stream is actively
+        consuming, the producer task MUST be registered in
+        stall_watchdog._ACTIVE_TASKS under proj_sid so that
+        cancel_active_task can find and cancel it. Without this,
+        the on_stall callback logs `stall_kill` (no task to cancel)
+        and the request hangs until codex's own idle timeout.
+
+        Reproduces the rq_X production scenario where post-P6
+        stream_relay wiring was suspected of breaking the
+        registration contract from ad7b2f1."""
+        _sw.reset_state()
+        proj_sid = "proj-register-test"
+
+        started_evt = asyncio.Event()
+        release_evt = asyncio.Event()
+
+        class _Hanging:
+            status_code = 200
+            headers: dict = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def aread(self):
+                return b""
+
+            async def aiter_raw(self):
+                # Push one byte so STATUS path fires, then hang until
+                # released — mimics the production trace (upstream
+                # opened, then went silent mid-body).
+                yield b"chunk-1"
+                started_evt.set()
+                await release_evt.wait()
+
+        def stream_fn(self, method, url, **kwargs):
+            return _Hanging()
+
+        # Construct a producer that uses proj_sid.
+        def build_frontier_retry_target(headers, body, reason):
+            return (
+                "http://frontier.test/v1/responses",
+                {"X-Frontier": "1"},
+                body,
+                _make_decision("frontier", reason),
+                _FakeCfg().frontier,
+            )
+
+        class _CfgStallOn(_FakeCfg):
+            stall_watchdog_enabled = True
+
+        cfg = _CfgStallOn()
+        producer = sr.StreamProducer(
+            url="http://local.test/v1/responses",
+            headers={"Authorization": "Bearer x"},
+            body={"model": "x", "input": []},
+            proj_sid=proj_sid,
+            conv_sid="conv-r",
+            decision=_make_decision("local"),
+            timeout=httpx.Timeout(connect=10.0, read=10.0, write=10.0,
+                                  pool=10.0),
+            transport=None,
+            erg_key="conv-r",
+            request_id="rid-r",
+            cfg=cfg,
+            log=_RecordingLog(),
+            build_frontier_retry_target=build_frontier_retry_target,
+            resolve_api_key=lambda b, c: "fk",
+        )
+        q: asyncio.Queue = asyncio.Queue()
+        consumer = sr.StreamConsumer(
+            chunk_q=q, translator=None,
+            proj_sid=proj_sid, conv_sid="conv-r",
+            keepalive_interval=10.0,
+            capture_outgoing=lambda b: b,
+            intercept_completed=lambda b: b,
+            cfg=cfg, log=_RecordingLog(), url="http://local.test/v1",
+            on_status_error=lambda s, b: None,
+        )
+        sup = sr.StallSupervisor(proj_sid, enabled=True)
+
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            gen = sr.relay_stream(
+                chunk_q=q, producer=producer, consumer=consumer,
+                supervisor=sup, keepalive_interval=10.0)
+
+            # Pull bytes from relay_stream until the producer is alive
+            # (started_evt set after upstream's first chunk).
+            collected: list[bytes] = []
+            try:
+                # First __anext__: initial keepalive frame.
+                collected.append(await asyncio.wait_for(
+                    gen.__anext__(), timeout=1.0))
+                # Second __anext__: producer task scheduled + supervisor
+                # registered, consumer drains STATUS+first chunk.
+                # Wait for upstream first-chunk signal first to ensure
+                # the producer is mid-flight before we assert.
+                async def _drain_one():
+                    return await gen.__anext__()
+
+                drain_task = asyncio.create_task(_drain_one())
+                await asyncio.wait_for(started_evt.wait(), timeout=1.0)
+                # Now the producer task is hanging at `await release_evt`,
+                # which is EXACTLY the production scenario at stall fire.
+
+                # CONTRACT: the producer task must be registered.
+                active = _sw.get_active_task(proj_sid)
+                assert active is not None, (
+                    "stream_relay did not register the producer task "
+                    "with stall_watchdog — cancel_active_task will return "
+                    "False at stall fire and the request will hang.")
+                assert not active.done(), (
+                    "producer task already done — registration was stale")
+                # Cancel to clean up the test.
+                release_evt.set()
+                try:
+                    collected.append(await asyncio.wait_for(
+                        drain_task, timeout=1.0))
+                except (StopAsyncIteration, asyncio.CancelledError):
+                    pass
+            finally:
+                release_evt.set()
+                await gen.aclose()
+                _sw.reset_state()
+
+    @pytest.mark.asyncio
+    async def test_relay_emits_stall_cancelled_not_stall_kill(self):
+        """End-to-end: simulate a wedged upstream, fire the watchdog,
+        and verify the path produces a StallCancelledError (cancellation
+        worked) rather than leaving the producer hung (stall_kill
+        fallback)."""
+        _sw.reset_state()
+        proj_sid = "proj-cancel-test"
+
+        started_evt = asyncio.Event()
+
+        class _Hanging:
+            status_code = 200
+            headers: dict = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def aread(self):
+                return b""
+
+            async def aiter_raw(self):
+                yield b"first-chunk"
+                started_evt.set()
+                # Hang forever — caller MUST cancel to unblock.
+                await asyncio.sleep(60)
+
+        def stream_fn(self, method, url, **kwargs):
+            return _Hanging()
+
+        class _CfgStallOn(_FakeCfg):
+            stall_watchdog_enabled = True
+
+        cfg = _CfgStallOn()
+
+        def build_frontier_retry_target(headers, body, reason):
+            return (
+                "http://frontier.test/v1/responses",
+                {"X-Frontier": "1"},
+                body,
+                _make_decision("frontier", reason),
+                cfg.frontier,
+            )
+
+        producer = sr.StreamProducer(
+            url="http://local.test/v1/responses",
+            headers={"Authorization": "Bearer x"},
+            body={"model": "x", "input": []},
+            proj_sid=proj_sid,
+            conv_sid="conv-c",
+            decision=_make_decision("local"),
+            timeout=httpx.Timeout(connect=10.0, read=10.0, write=10.0,
+                                  pool=10.0),
+            transport=None,
+            erg_key="conv-c",
+            request_id="rid-c",
+            cfg=cfg,
+            log=_RecordingLog(),
+            build_frontier_retry_target=build_frontier_retry_target,
+            resolve_api_key=lambda b, c: "fk",
+        )
+        q: asyncio.Queue = asyncio.Queue()
+        consumer = sr.StreamConsumer(
+            chunk_q=q, translator=None,
+            proj_sid=proj_sid, conv_sid="conv-c",
+            keepalive_interval=10.0,
+            capture_outgoing=lambda b: b,
+            intercept_completed=lambda b: b,
+            cfg=cfg, log=_RecordingLog(), url="http://local.test/v1",
+            on_status_error=lambda s, b: None,
+        )
+        sup = sr.StallSupervisor(proj_sid, enabled=True)
+
+        # Race: relay_stream consumes; once the producer hangs, we
+        # invoke cancel_active_task (simulating the watchdog), and
+        # the consumer must surface StallCancelledError (NOT just
+        # silence and a hung queue.get).
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            collected: list[bytes] = []
+            raised: list[Exception] = []
+
+            async def _consume():
+                try:
+                    async for b in sr.relay_stream(
+                            chunk_q=q, producer=producer,
+                            consumer=consumer, supervisor=sup,
+                            keepalive_interval=10.0):
+                        collected.append(b)
+                except _sw.StallCancelledError as e:
+                    raised.append(e)
+                except Exception as e:  # noqa: BLE001
+                    raised.append(e)
+
+            consume_task = asyncio.create_task(_consume())
+            # Wait until the producer is hanging mid-aiter_raw.
+            await asyncio.wait_for(started_evt.wait(), timeout=1.0)
+            # Simulate the watchdog firing cancel_active_task.
+            ok = _sw.cancel_active_task(proj_sid)
+            assert ok, (
+                "cancel_active_task returned False — producer task "
+                "was not registered (this is the stall_kill bug).")
+            # Wait for the consumer to surface the cancellation.
+            await asyncio.wait_for(consume_task, timeout=2.0)
+            assert raised, "no exception surfaced after cancel"
+            assert isinstance(raised[0], _sw.StallCancelledError), (
+                f"expected StallCancelledError, got {type(raised[0])}")
+        _sw.reset_state()
 
 
 # ─── Terminator helper ───────────────────────────────────────────────────

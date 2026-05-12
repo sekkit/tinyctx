@@ -275,11 +275,22 @@ class StreamProducer:
                 conv_sid=self._conv_sid,
                 elapsed_silent_s=elapsed,
             )
+            # IMPORTANT: use put_nowait — `await chunk_q.put(...)` here
+            # is itself cancellable. If a second cancel lands during the
+            # await (race: cancel arrives between the first CancelledError
+            # being caught and the synthetic reaching the consumer), the
+            # synthetic never gets delivered, the consumer hangs on
+            # `await chunk_q.get()` forever, and stall_watchdog's next
+            # cancel_active_task sweep sees the task as done() → emits
+            # `stall_kill` instead of `stall_cancelled`. chunk_q has no
+            # maxsize bound in this codepath, so put_nowait will not
+            # raise QueueFull — but we still guard for safety.
             try:
-                await chunk_q.put((_ERR, synthetic))
-            except Exception:  # noqa: BLE001 — queue may already be closed
-                # Why: consumer may have terminated already; nothing to
-                # do with the synthetic error in that case.
+                chunk_q.put_nowait((_ERR, synthetic))
+            except asyncio.QueueFull:  # noqa: BLE001 — defensive only
+                # Why: chunk_q is unbounded in production; this branch
+                # is theoretically unreachable. Swallow rather than
+                # mask the original CancelledError if it ever fires.
                 pass
         except Exception as exc:  # noqa: BLE001
             await chunk_q.put((_ERR, exc))
