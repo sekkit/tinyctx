@@ -167,6 +167,9 @@ def _extract_tail_usage(raw_buffer: str
         try:
             completion = int(m.group(1))
         except (ValueError, TypeError):
+            # Why: regex matched a non-numeric value (malformed
+            # upstream JSON). Leave completion=None so the caller
+            # falls through to the output_tokens probe below.
             pass
     if completion is None:
         m = _OUTPUT_TOKENS_RE.search(tail)
@@ -174,6 +177,9 @@ def _extract_tail_usage(raw_buffer: str
             try:
                 completion = int(m.group(1))
             except (ValueError, TypeError):
+                # Why: same as above; if both probes yield non-int,
+                # caller treats completion=None as "unknown" and
+                # skips the empty-response guard for this turn.
                 pass
     # finish_reason from chat / status from responses-api
     finish = ""

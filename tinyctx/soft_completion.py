@@ -336,6 +336,9 @@ def _parse_response(text: str) -> ClassifyResult | None:
         try:
             p = max(0.0, min(1.0, float(m_p.group(1))))
         except (ValueError, TypeError):
+            # Why: classifier emitted a non-numeric `p` — keep the
+            # default of 0.5 (uncertain) and let downstream policy
+            # decide based on `soft_punt` alone.
             pass
     m_r = _REASON_RE.search(text)
     reason = (m_r.group(1) if m_r else "[salvaged]")[:200]
@@ -573,7 +576,10 @@ def accumulate_chunk(proj_sid: str, chunk: bytes) -> None:
         return
     try:
         text = chunk.decode("utf-8", errors="ignore")
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — never break the streaming hot path
+        # Why: decode on a hot streaming path must not raise. `errors=
+        # "ignore"` already covers UTF-8 issues; this guards against
+        # exotic input types passed by tests/mocks. Drop the chunk.
         return
     buf = _OUTPUT_BUFFER[proj_sid] + text
     if len(buf) > _BUFFER_MAX:
@@ -815,7 +821,10 @@ def write_punt_forensics(
     + composing the args repeatedly. Returns dump path str or None."""
     try:
         from . import forensics as _fx
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — forensics is optional
+        # Why: forensics module is optional/test-mocked. If import fails
+        # we silently skip the dump — classification result is already
+        # returned to the caller.
         return None
     raw = _OUTPUT_BUFFER.get(proj_sid, "") or ""
     path = _fx.write_forensics_dump(

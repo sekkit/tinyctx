@@ -90,7 +90,9 @@ class StallSupervisor:
         self._task = task
         try:
             _stall.register_task(self.proj_sid, task)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — watchdog register is advisory
+            # Why: register failure means the watchdog can't cancel
+            # this task by name; stall flag-only path still fires.
             pass
 
     def unregister(self) -> None:
@@ -98,7 +100,9 @@ class StallSupervisor:
             return
         try:
             _stall.unregister_task(self.proj_sid, self._task)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — watchdog unregister is cleanup
+            # Why: unregister failure leaves a stale entry; the watchdog
+            # auto-ages-out completed tasks.
             pass
 
     def clear(self) -> None:
@@ -106,7 +110,8 @@ class StallSupervisor:
             return
         try:
             _stall.clear(self.proj_sid)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — watchdog cleanup
+            # Why: clear failure is cosmetic; stale entries age out.
             pass
 
 
@@ -251,7 +256,8 @@ class StreamProducer:
                 if action.backoff_s > 0:
                     try:
                         await asyncio.sleep(action.backoff_s)
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — sleep interruption non-fatal
+                        # Why: sleep cancelled — retry loop continues.
                         pass
         except asyncio.CancelledError:
             # Stall watchdog (or shutdown) cancelled us — surface as
@@ -261,7 +267,7 @@ class StreamProducer:
             # the live SSE socket and must own termination.
             try:
                 elapsed = _stall.seconds_since_event(self._proj_sid)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — elapsed is for telemetry only
                 elapsed = None
             synthetic = _stall.StallCancelledError(
                 "stall_watchdog_cancelled_relay",
@@ -271,7 +277,9 @@ class StreamProducer:
             )
             try:
                 await chunk_q.put((_ERR, synthetic))
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — queue may already be closed
+                # Why: consumer may have terminated already; nothing to
+                # do with the synthetic error in that case.
                 pass
         except Exception as exc:  # noqa: BLE001
             await chunk_q.put((_ERR, exc))
@@ -282,7 +290,9 @@ class StreamProducer:
         try:
             from . import empty_response_guard as _erg
             _erg.force_next_to_frontier(self._erg_key, reason)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
+            # Why: missing this flag means next turn routes to default
+            # backend; current turn is already escalating regardless.
             pass
 
     def _apply_retry_action(
@@ -337,7 +347,9 @@ class StreamProducer:
         # threshold window before the watchdog ever fires.
         try:
             _stall.mark_event(self._proj_sid, conv_sid=self._conv_sid)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — watchdog mark is advisory
+            # Why: missing the mark just leaves the OLD timer running
+            # for one more cycle. Retry still proceeds.
             pass
         self._attempt_url = new_url
         self._attempt_headers = new_headers
@@ -421,7 +433,9 @@ class StreamConsumer:
                 if self._cfg.stall_watchdog_enabled:
                     try:
                         _stall.mark_event(self._proj_sid, conv_sid=self._conv_sid)
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — watchdog mark is advisory
+                        # Why: missing one mark is non-fatal; the next
+                        # chunk's mark will refresh the timer.
                         pass
                 if err_body is not None:
                     self._on_status_error(status_code, err_body)
@@ -448,7 +462,8 @@ class StreamConsumer:
         if self._cfg.stall_watchdog_enabled:
             try:
                 _stall.mark_event(self._proj_sid, conv_sid=self._conv_sid)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — watchdog mark is advisory
+                # Why: per-chunk timer refresh; one missed mark non-fatal.
                 pass
         # Soft-completion buffer: accumulate raw upstream bytes. The
         # behavioral classifier runs ONCE at stream end so the hot path
@@ -457,7 +472,9 @@ class StreamConsumer:
             try:
                 from . import soft_completion as _sc
                 _sc.accumulate_chunk(self._proj_sid, payload)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — accumulator is observability
+                # Why: soft-completion accumulator failure must not
+                # drop the chunk from the downstream client.
                 pass
         out_list: list[bytes] = []
         if self._translator is None:
@@ -518,7 +535,10 @@ async def relay_stream(
             producer_task.cancel()
             try:
                 await producer_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 — cleanup, never raise
+                # Why: producer was cancelled by finally-block cleanup;
+                # CancelledError (expected) and any other surfaced error
+                # are swallowed because the response is already done.
                 pass
         supervisor.unregister()
 

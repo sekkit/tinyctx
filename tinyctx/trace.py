@@ -213,6 +213,9 @@ class RequestTrace:
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(d, default=str, ensure_ascii=False) + "\n")
         except OSError:
+            # Why: trace emission is best-effort telemetry; a log-write
+            # failure (disk full, fs read-only) must not fail the
+            # request that's emitting the trace.
             pass
 
 
@@ -230,6 +233,8 @@ def iter_traces(log_dir: Path, *, since: str | None = None
             files = [f for f in files
                      if _date_from_stem(f.stem) >= target]
         except ValueError:
+            # Why: caller passed an unparseable `since` value — fall
+            # through to "no filter" so traces are still returned.
             pass
     for f in files:
         try:
@@ -240,6 +245,7 @@ def iter_traces(log_dir: Path, *, since: str | None = None
                 try:
                     d = json.loads(line)
                 except json.JSONDecodeError:
+                    # Why: malformed JSONL line; skip.
                     continue
                 d.pop("event", None)
                 d.pop("t", None)
@@ -248,6 +254,7 @@ def iter_traces(log_dir: Path, *, since: str | None = None
                 kw = {k: v for k, v in d.items() if k in allowed}
                 yield RequestTrace(**kw)
         except OSError:
+            # Why: log file rotated or unreadable; skip to next file.
             continue
 
 
@@ -392,6 +399,8 @@ def watch(log_dir: Path, *, verbose: bool = False) -> None:
                     try:
                         d = json.loads(line)
                     except json.JSONDecodeError:
+                        # Why: incomplete line at the tail of live JSONL
+                        # — skip; the next poll iteration will see it.
                         continue
                     allowed = set(RequestTrace.__dataclass_fields__.keys())
                     kw = {k: v for k, v in d.items() if k in allowed}

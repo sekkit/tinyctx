@@ -134,6 +134,9 @@ def write_forensics_dump(
     try:
         forensics_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
+        # Why: forensics is best-effort post-mortem capture. If the dir
+        # can't be created (read-only fs, permissions), drop the dump
+        # silently rather than break the caller's failure-path code.
         return None
     now = time.time()
     dump = {
@@ -162,6 +165,9 @@ def write_forensics_dump(
                                     indent=2),
                         encoding="utf-8")
     except OSError:
+        # Why: forensic dump write failed (disk full, permissions). Best-
+        # effort capture — return None so the caller knows nothing was
+        # written, but never propagate the failure to the request path.
         return None
     # Roll: keep at most `max_dumps`
     try:
@@ -171,8 +177,12 @@ def write_forensics_dump(
                 try:
                     old.unlink()
                 except OSError:
+                    # Why: per-file unlink failure during rollover; skip
+                    # this file and continue trimming the rest.
                     pass
     except OSError:
+        # Why: glob/sort of the forensics dir failed; skip rollover this
+        # call. Disk pressure will be resolved when the next dump succeeds.
         pass
     return path
 
@@ -203,8 +213,12 @@ def list_dumps(forensics_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
                     "trigger": trigger,
                 })
             except OSError:
+                # Why: per-file stat/read failure (file may have been
+                # rolled away mid-listing). Skip and continue.
                 continue
     except OSError:
+        # Why: forensics dir glob failed; return whatever we collected
+        # so far rather than crash the dashboard endpoint.
         pass
     return out
 

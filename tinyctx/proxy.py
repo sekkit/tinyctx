@@ -115,7 +115,10 @@ def _log(event: str, **fields: Any) -> None:
         log_path = CFG.log_dir / f"tinyctx-{time.strftime('%Y%m%d')}.jsonl"
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-    except Exception:
+    except Exception:  # noqa: BLE001 — _log must never raise
+        # Why: _log is called everywhere including hot streaming paths.
+        # A disk-write failure (full, read-only, perms) must not bubble
+        # up — stderr emission above already happened.
         pass
 
 
@@ -336,6 +339,9 @@ def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
         if tok:
             return tok
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        # Why: codex auth.json missing / malformed / wrong shape — all
+        # are normal for clients not using ChatGPT subscription auth.
+        # Returning None falls through to the no-key case in callers.
         pass
     return None
 
@@ -443,7 +449,7 @@ async def _start_stall_watchdog_on_startup() -> None:
         escalate_key = conv_sid if conv_sid else proj_sid
         try:
             _phase_set(proj_sid, RequestPhase.stalled, "")
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — phase emission is telemetry; stall handler must continue
             pass
         # Cancel-and-retry: if the relay producer task is registered for
         # this proj_sid, cancel it so the consumer wakes up, emits a
@@ -454,19 +460,23 @@ async def _start_stall_watchdog_on_startup() -> None:
         cancelled = False
         try:
             cancelled = _stall.cancel_active_task(proj_sid)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — best-effort task cancel
+            # Why: cancel_active_task may race with task already done.
+            # Treat as "not cancelled" and continue with flag-only path.
             cancelled = False
         try:
             from . import empty_response_guard as _erg
             _erg.force_next_to_frontier(escalate_key, "mid_stream_stall")
             _phase_set(proj_sid, RequestPhase.escalated_to_frontier, "")
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — escalation hint; stall handler must continue
+            # Why: setting the escalation flag is an optimization for
+            # the NEXT turn; current turn already cancelled above.
             pass
         trigger_label = "stall_cancelled" if cancelled else "stall_kill"
         elapsed: float | None = None
         try:
             elapsed = _stall.seconds_since_event(proj_sid)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — elapsed is for logging only
             elapsed = None
         try:
             _log(trigger_label, session=proj_sid, conv_sid=conv_sid,
@@ -474,7 +484,7 @@ async def _start_stall_watchdog_on_startup() -> None:
                  threshold_s=CFG.stall_threshold_s,
                  elapsed_silent_s=elapsed,
                  task_cancelled=cancelled)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — _log already swallows internally; belt+suspenders
             pass
         if CFG.forensics_enabled:
             try:
@@ -492,7 +502,9 @@ async def _start_stall_watchdog_on_startup() -> None:
                            "elapsed_silent_s": elapsed},
                     max_dumps=CFG.forensics_max_dumps,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — forensics is best-effort
+                # Why: forensics dump in the stall path must never crash
+                # the watchdog. forensics module itself swallows errors.
                 pass
 
     _STALL_WATCHDOG_TASK = _stall.start_watchdog(
@@ -512,7 +524,11 @@ async def _stop_stall_watchdog_on_shutdown() -> None:
     task.cancel()
     try:
         await task
-    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001 — shutdown handler
+        # Why: shutdown handler awaiting the cancelled watchdog. Both
+        # CancelledError (expected) and any other exception (broken
+        # watchdog state) are swallowed because we're already shutting
+        # down — nothing useful to do with the error.
         pass
 
 
@@ -614,7 +630,9 @@ async def responses(request: Request) -> Any:
     try:
         from . import tool_metrics as _tm
         _tm.record_from_body(body)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — tool_metrics is observability
+        # Why: tool_metrics is observability for the dashboard; a
+        # parse failure must not affect routing or request handling.
         pass
 
     requested_model = (body.get("model") or "").lower()
@@ -1275,7 +1293,9 @@ async def responses(request: Request) -> Any:
                 headers=headers,
                 request_started_at=time.time(),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — forensics snapshot is best-effort
+            # Why: snapshot capture failure must not block the request;
+            # post-mortem just won't have the request body if it fires.
             pass
 
     _phase_set(proj_sid, RequestPhase.backend_streaming, trace.request_id)
@@ -1440,7 +1460,10 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                             from . import empty_response_guard as _erg
                             _erg.force_next_to_frontier(
                                 erg_key, action.escalate_flag_reason)
-                        except Exception:  # noqa: BLE001
+                        except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
+                            # Why: missing this flag means next turn
+                            # routes to default backend (no correctness
+                            # loss; this turn's response already returned).
                             pass
                     return JSONResponse(
                         {"error": {"message": str(exc),
@@ -1452,7 +1475,7 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                         from . import empty_response_guard as _erg
                         _erg.force_next_to_frontier(
                             erg_key, action.escalate_flag_reason)
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
                         pass
                 if trace is not None:
                     trace.status = r.status_code
@@ -1492,7 +1515,7 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                         from . import empty_response_guard as _erg
                         _erg.force_next_to_frontier(
                             erg_key, action.escalate_flag_reason)
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
                         pass
                 retry_state.record_escalation()
             _log("retry_attempted",
@@ -1514,12 +1537,17 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             # client-side idle timeout would fire first.
             try:
                 _stall.mark_event(sid, conv_sid=conv_sid)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — watchdog mark is advisory
+                # Why: stall_watchdog mark-event resets the timer for the
+                # new attempt. If it fails the retry still proceeds — the
+                # OLD timer just stays in effect for one more cycle.
                 pass
             if action.backoff_s > 0:
                 try:
                     await asyncio.sleep(action.backoff_s)
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001 — sleep interruption is non-fatal
+                    # Why: sleep can raise on cancellation; the retry
+                    # loop continues regardless.
                     pass
             cur_url, cur_headers, cur_decision = new_url, new_headers, new_decision
             # loop continues — try again
@@ -1701,7 +1729,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             extra={"status": status_code, "url": url},
                             max_dumps=CFG.forensics_max_dumps,
                         )
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — forensics dump is best-effort
+                        # Why: post-mortem dump must not interfere with
+                        # returning the upstream error to the client.
                         pass
 
             chunk_q: asyncio.Queue = asyncio.Queue()
@@ -1867,7 +1897,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                          session=proj_sid,
                                          trigger="punt_via_stream_rewrite",
                                          path=str(fpath))
-                            except Exception:  # noqa: BLE001
+                            except Exception:  # noqa: BLE001 — forensics dump is best-effort
                                 pass
                     else:
                         _log("soft_completion_stream_rewrite_skipped",
@@ -1912,7 +1942,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 try:
                                     from . import soft_completion as _sc
                                     _sc.accumulate_chunk(proj_sid, chunk)
-                                except Exception:  # noqa: BLE001
+                                except Exception:  # noqa: BLE001 — accumulator is observability
+                                    # Why: soft-completion accumulator
+                                    # failure must not drop the chunk
+                                    # for the downstream client.
                                     pass
                             # NOTE: stream rewrite intercept is wired in
                             # the keepalive path above; this no-keepalive
@@ -1971,7 +2004,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         if CFG.stall_watchdog_enabled:
             try:
                 _stall.clear(proj_sid)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — watchdog cleanup in finally
+                # Why: clear-in-finally must never raise. Stale entries
+                # in stall_watchdog are auto-aged-out.
                 pass
         elapsed = round(time.time() - started, 3)
         _log("stream_done", session=proj_sid, route=decision.route, bytes=bytes_out,

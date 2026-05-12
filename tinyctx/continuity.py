@@ -46,6 +46,9 @@ def _next_compaction_index(session_root: Path) -> int:
         try:
             n = max(n, int(f.stem.split("-", 1)[1]))
         except (IndexError, ValueError):
+            # Why: malformed stem (e.g. compaction-foo.md from manual
+            # editing) — skip it and keep scanning. Caller derives next
+            # index from the well-formed files.
             continue
     return n + 1
 
@@ -96,9 +99,13 @@ def save_compaction(project_root: Path, session_id: str, summary: str,
             latest.unlink()
         os.symlink(p, latest)
     except (OSError, NotImplementedError):
+        # Symlink unsupported (Windows, restricted fs) — fall back to copy.
         try:
             latest.write_text(p.read_text())
         except OSError:
+            # Why: latest.md is a convenience pointer for recall; if
+            # both symlink and copy fail, the compaction itself is
+            # already persisted at `p` so recall can still find it.
             pass
     return p
 
@@ -114,6 +121,8 @@ def latest_structured(project_root: Path) -> dict[str, Any] | None:
     try:
         return json.loads(json_path.read_text())
     except (OSError, json.JSONDecodeError):
+        # Why: corrupted or unreadable sidecar — caller treats None as
+        # "no structured recall available" and falls back to markdown.
         return None
 
 

@@ -55,10 +55,14 @@ def _file_lock(path: Path):
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
+            # Why: lock release in `finally` — fd may already be closed
+            # by a concurrent path; cannot raise out of cleanup.
             pass
         try:
             os.close(fd)
         except OSError:
+            # Why: same fd may have been closed by exec-time cleanup;
+            # double-close is a no-op we must swallow in `finally`.
             pass
 
 

@@ -88,6 +88,8 @@ def _log(msg: str) -> None:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}  {msg}\n")
     except OSError:
+        # Why: _log itself must never raise. Logging failure (disk full,
+        # read-only fs) is acceptable; bootstrap continues silently.
         pass
 
 
@@ -180,8 +182,10 @@ def bootstrap_uv_via_curl(*, dry_run: bool = False) -> tuple[bool, str]:
     finally:
         try:
             tmp.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            # Why: temp installer script cleanup is best-effort; install
+            # already finished (success or failure), so swallow but log.
+            _log(f"tmp installer unlink failed: {type(e).__name__}: {e}")
 
 
 def install_globally(state: State, *, dry_run: bool = False

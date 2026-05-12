@@ -309,6 +309,9 @@ def _consume_responses_stream(lines) -> tuple[str, dict | None, str | None]:
         try:
             evt = json.loads(data)
         except json.JSONDecodeError:
+            # Why: SSE data frame from upstream may be malformed
+            # (keepalive or partial chunk). Skip; downstream gets
+            # whatever deltas we did parse.
             continue
         et = evt.get("type")
         if et == "response.output_text.delta":

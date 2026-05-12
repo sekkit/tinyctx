@@ -160,6 +160,8 @@ async def stream_events(log_dir: Path,
         try:
             size = current_path.stat().st_size
         except OSError:
+            # Why: file may have been rotated/unlinked between checks
+            # in this tail loop. Skip this poll and retry next tick.
             continue
         if size < pos:
             # log rotated / truncated
@@ -175,6 +177,9 @@ async def stream_events(log_dir: Path,
                 chunk = f.read()
                 pos = f.tell()
         except OSError:
+            # Why: log file may have been rotated mid-read. Skip this
+            # poll; the watcher loop retries with the rotated file
+            # next tick (size-shrink check above handles the rewind).
             continue
         for line in chunk.splitlines():
             line = line.strip()
@@ -183,6 +188,9 @@ async def stream_events(log_dir: Path,
             try:
                 evt = json.loads(line)
             except json.JSONDecodeError:
+                # Why: JSONL line corrupted (partial write during rotate
+                # or upstream truncation). Skip the line; the dashboard
+                # is best-effort visibility, not audit-grade.
                 continue
             formatted = _format_event_for_dashboard(evt)
             if formatted is None:
@@ -368,6 +376,9 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
                 try:
                     e = json.loads(line)
                 except json.JSONDecodeError:
+                    # Why: partial-write line in JSONL — skip it. The
+                    # aggregator is statistical, single skipped lines
+                    # are noise-floor.
                     continue
                 if e.get("t", 0) < cutoff:
                     continue
@@ -397,6 +408,9 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
                         if e.get("keepalives_emitted", 0) > 0:
                             keepalive_saves += 1
     except OSError:
+        # Why: log file unreadable or rotated mid-scan. Return whatever
+        # we aggregated so far; dashboard shows partial counts rather
+        # than 500-erroring the endpoint.
         pass
 
     result = {
@@ -437,6 +451,8 @@ def recent_events(log_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
             f.seek(max(0, size - 262144))
             chunk = f.read()
     except OSError:
+        # Why: today's log was rotated/unlinked between exists() and
+        # open. Return empty so the dashboard renders without crashing.
         return []
     for line in chunk.splitlines():
         line = line.strip()
@@ -445,6 +461,8 @@ def recent_events(log_dir: Path, limit: int = 30) -> list[dict[str, Any]]:
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
+            # Why: partial-write line at the tail of a live JSONL.
+            # Skip the malformed line and keep parsing the rest.
             continue
         formatted = _format_event_for_dashboard(e)
         if formatted is not None:

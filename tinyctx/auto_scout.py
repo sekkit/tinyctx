@@ -92,7 +92,10 @@ def get_scout(cwd: str | Path | None) -> str | None:
         sp = scout.scout_path(root)
         if sp.is_file():
             return sp.read_text(encoding="utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — best-effort getter, docstring guarantees no-raise
+        # Why: any resolve/read failure (broken symlink, ENOENT race,
+        # perms) just disables scout injection for this turn — caller
+        # contract is "None means no scout available".
         pass
     return None
 
@@ -133,7 +136,8 @@ def schedule_bootstrap(cwd: str | Path | None,
         return
     try:
         root = Path(cwd).resolve()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — fire-and-forget, never raise
+        # Why: cwd unresolvable (malformed path); skip bootstrap.
         return
     if not root.is_dir():
         return
@@ -147,6 +151,8 @@ def schedule_bootstrap(cwd: str | Path | None,
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
+        # Why: no running loop in this thread (sync caller). Bootstrap
+        # is opportunistic — skip rather than spin up a new loop.
         return
     loop.create_task(
         asyncio.to_thread(_bootstrap_sync, root, install_graphify))
@@ -180,7 +186,9 @@ def _bootstrap_sync(root: Path, install_graphify: bool) -> None:
             model = backend.model or scout.DEFAULT_MODEL
             api_key = (os.environ.get(backend.api_key_env)
                        if backend.api_key_env else None)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — config load is optional
+            # Why: config unavailable (test env, broken TOML). Fall
+            # back to scout's hard defaults so bootstrap still works.
             base_url = scout.DEFAULT_BASE_URL
             model = scout.DEFAULT_MODEL
             api_key = None
@@ -215,7 +223,9 @@ def _try_graphify(root: Path, install_graphify: bool) -> dict[str, Any] | None:
                     check=False,
                 )
                 cmd = shutil.which("graphify")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — pipx install optional
+                # Why: pipx install failed (network, permissions). Fall
+                # through to fallback_scan rather than crash bootstrap.
                 cmd = None
     if not cmd:
         return None
@@ -227,7 +237,9 @@ def _try_graphify(root: Path, install_graphify: bool) -> dict[str, Any] | None:
             timeout=_GRAPHIFY_TIMEOUT_S,
             check=False,
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — graphify probe optional
+        # Why: graphify run failed (timeout, OOM, crash). Fall back to
+        # scanning files manually rather than abort bootstrap.
         return None
     # graphify writes to graphify-out/graph.json by convention
     gj = root / "graphify-out" / "graph.json"
@@ -235,7 +247,9 @@ def _try_graphify(root: Path, install_graphify: bool) -> dict[str, Any] | None:
         return None
     try:
         return json.loads(gj.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — graph parse optional
+        # Why: graphify-out/graph.json is corrupted or unreadable.
+        # Returning None routes to _fallback_scan.
         return None
 
 
@@ -261,13 +275,17 @@ def _fallback_scan(root: Path) -> dict[str, Any] | None:
                 text = path.read_text(
                     encoding="utf-8", errors="replace"
                 )[:_FALLBACK_MAX_FILE_BYTES]
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — per-file read optional
+                # Why: single-file read failed (binary, permission,
+                # broken symlink). Skip the file, keep scanning.
                 continue
             if not text.strip():
                 continue
             try:
                 rel = str(path.relative_to(root))
             except ValueError:
+                # Why: path doesn't sit under root (symlink escape);
+                # skip rather than emit an unstable rel-path.
                 continue
             nodes.append({
                 "id": rel,
@@ -275,7 +293,9 @@ def _fallback_scan(root: Path) -> dict[str, Any] | None:
                 "deps": [],
             })
             n_files += 1
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — rglob iteration may hit permissions
+        # Why: rglob can raise on permission-denied directories on some
+        # filesystems. Return None so caller knows fallback failed too.
         return None
     if not nodes:
         return None

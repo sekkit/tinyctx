@@ -69,9 +69,46 @@ class DetectedTool:
 # ────────────────────────────── detection ──────────────────────────────
 
 
+# Common user-install locations that don't always make it into the
+# launchd / systemd PATH the proxy inherits. Fixes false-negative
+# 2026-05-10 where mcp_registry logged "no graphify or gitnexus on PATH"
+# even though both were installed — proxy was launched by launchd
+# whose default PATH excludes ~/.local/bin and ~/.local/node/bin.
+#
+# Order: prefer node/bin first because gitnexus + many JS-installed CLIs
+# live there; user-local then system bin then homebrew.
+_FALLBACK_BIN_DIRS: tuple[str, ...] = (
+    "~/.local/node/bin",
+    "~/.local/bin",
+    "~/.cargo/bin",
+    "~/.bun/bin",
+    "/opt/homebrew/bin",   # Apple Silicon brew
+    "/usr/local/bin",      # Intel brew + many GUI app installs
+)
+
+
+def _which_with_fallbacks(name: str) -> str | None:
+    """`shutil.which` first; on miss, scan a small allowlist of standard
+    user-install directories for an executable file with that name.
+    Returns absolute path or None.
+
+    Why: when the proxy is started by launchd / systemd / a stripped
+    shell, $PATH often omits ~/.local/bin etc., causing detect_*
+    to miss legitimately installed tools. The fallback scan only adds
+    a handful of `os.path.isfile` checks — cheap and bounded."""
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in _FALLBACK_BIN_DIRS:
+        cand = os.path.join(os.path.expanduser(d), name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def detect_gitnexus() -> DetectedTool | None:
-    """Locate gitnexus binary; return None if not on PATH."""
-    p = shutil.which("gitnexus")
+    """Locate gitnexus binary; return None if not on PATH (or fallback dirs)."""
+    p = _which_with_fallbacks("gitnexus")
     if not p:
         return None
     return DetectedTool(
@@ -104,7 +141,7 @@ def detect_graphify() -> DetectedTool | None:
     one project). Detection still happens so the proxy can use graphify
     in auto_scout (offline graph build for static project context).
     """
-    p = shutil.which("graphify")
+    p = _which_with_fallbacks("graphify")
     if not p:
         return None
     return DetectedTool(
@@ -173,6 +210,10 @@ def _backup_once_per_day(path: Path) -> Path | None:
         shutil.copy2(path, bak)
         return bak
     except OSError:
+        # Why: daily-backup is best-effort safety net; if copy fails
+        # (no space, permissions), proceed without a backup rather
+        # than abort registration. Returning None signals the caller
+        # to surface "no backup" in the user message.
         return None
 
 

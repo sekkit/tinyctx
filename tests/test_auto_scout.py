@@ -285,3 +285,32 @@ def test_auto_scout_defaults_to_enabled():
     assert cfg.auto_scout is True
     # auto-install pipx is intrusive; default off
     assert cfg.auto_scout_install_graphify is False
+
+
+# ─── P9: lock-in test for CATEGORY A defensive swallow ─────────────────────
+# `get_scout` docstring says "Never raises". Pin that here so a future
+# refactor that lets Path.resolve() blow up regresses loudly.
+
+
+def test_get_scout_swallows_resolve_errors(monkeypatch):
+    """get_scout must return None on malformed cwd, never raise."""
+    from tinyctx import auto_scout
+
+    class _Boom:
+        def __fspath__(self):
+            raise RuntimeError("simulated path resolution failure")
+
+    out = auto_scout.get_scout(_Boom())  # should not raise
+    assert out is None
+
+
+def test_schedule_bootstrap_swallows_resolve_errors():
+    """schedule_bootstrap must return cleanly on broken cwd."""
+    from tinyctx import auto_scout
+
+    class _Boom:
+        def __fspath__(self):
+            raise RuntimeError("simulated path resolution failure")
+
+    # No assertion needed — just must not raise
+    auto_scout.schedule_bootstrap(_Boom())

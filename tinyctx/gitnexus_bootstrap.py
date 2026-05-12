@@ -92,6 +92,8 @@ def _log(msg: str) -> None:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
+        # Why: _log itself must never raise — callers use it on hot
+        # paths and a logging failure should not abort bootstrap.
         pass
 
 
@@ -139,8 +141,10 @@ def detect_state(codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
                                capture_output=True, text=True, timeout=5)
             s.node_version = (r.stdout or "").strip()
             s.node_meets_min = _node_major(s.node_version) >= MIN_NODE_MAJOR
-        except (subprocess.SubprocessError, OSError):
-            pass
+        except (subprocess.SubprocessError, OSError) as e:
+            # Detection probe: leave node_version empty so bootstrap
+            # downgrades to "node not usable" rather than crashing.
+            _log(f"node probe failed: {type(e).__name__}: {e}")
 
     npm_path = os.environ.get("TINYCTX_GITNEXUS_NPM") or _which("npm")
     if npm_path:
@@ -156,8 +160,11 @@ def detect_state(codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
         try:
             text = codex_config.read_text(encoding="utf-8", errors="replace")
             s.codex_config_has_gitnexus = _GITNEXUS_CONFIG_MARKER in text
-        except OSError:
-            pass
+        except OSError as e:
+            # Detection probe: codex config exists but unreadable.
+            # Leave codex_config_has_gitnexus=False so bootstrap retries
+            # patching (idempotent — re-patch is safe).
+            _log(f"codex config read failed: {type(e).__name__}: {e}")
 
     s.license_acked = LICENSE_ACK_FILE.is_file()
     return s
@@ -386,8 +393,10 @@ def _cmd_uninstall(codex_path: Path, *,
         try:
             LICENSE_ACK_FILE.unlink()
             actions.append("removed license ack file")
-        except OSError:
-            pass
+        except OSError as e:
+            # Why: best-effort cleanup on uninstall; missing/locked file
+            # should not abort the uninstall flow.
+            _log(f"license ack unlink failed: {type(e).__name__}: {e}")
     if not quiet:
         for a in actions:
             print(f"  ✓ {a}")

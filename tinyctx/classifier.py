@@ -220,6 +220,8 @@ def load_jsonl(path: Path) -> tuple[list[list[float]], list[int]]:
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            # Why: training JSONL line is malformed (manual edit, partial
+            # write). Skip — training tolerates noise.
             continue
         feats = row.get("features") or {}
         if not isinstance(feats, dict):

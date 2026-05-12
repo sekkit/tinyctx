@@ -490,7 +490,10 @@ class RelayErrorTerminator:
                     self._log("stream_error_will_retry_same_backend",
                               session=proj_sid,
                               streak=self._streak[proj_sid])
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — phase emission is telemetry, not load-bearing
+                # Why: phase tracking is observability. A telemetry
+                # failure must never crash the post-stream error path —
+                # the actual retry decision is already committed above.
                 pass
 
         # Forensics

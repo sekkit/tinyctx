@@ -120,6 +120,9 @@ def _gc_old_sessions(retention_days: int) -> int:
                     shutil.rmtree(sdir)
                     deleted += 1
             except OSError:
+                # Why: cleanup is best-effort over the GC window; a
+                # single stat/rmtree failure (race with another writer,
+                # symlink loop) should not abort the rest of the sweep.
                 continue
     return deleted
 

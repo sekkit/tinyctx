@@ -174,11 +174,17 @@ async def update(
                     latest.unlink()
                 os.symlink(md_path, latest)
             except (OSError, NotImplementedError):
+                # Why: symlink unsupported (Windows, restricted fs) —
+                # fall back to copy. The digest is already at md_path.
                 try:
                     latest.write_text(md)
                 except OSError:
+                    # Why: both symlink and copy failed; the digest
+                    # itself is persisted, recall can still find it.
                     pass
         except OSError:
+            # Why: digest write failed (disk full, permissions). Skip
+            # this digest cycle; historian retries next compaction.
             pass
 
     return True

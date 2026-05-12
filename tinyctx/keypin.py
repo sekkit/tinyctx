@@ -65,6 +65,9 @@ def _extract_path(tool_input: object) -> str | None:
         try:
             tool_input = json.loads(tool_input)
         except json.JSONDecodeError:
+            # Why: tool_input wasn't a JSON-encoded dict (legacy event
+            # shape). No path extractable — return None so the caller
+            # skips this event without crashing.
             return None
     if not isinstance(tool_input, dict):
         return None
@@ -84,6 +87,8 @@ def _iter_rollout_files(rollout_dir: Path, *, days: int) -> Iterable[Path]:
             if p.stat().st_mtime < cutoff:
                 continue
         except OSError:
+            # Why: file vanished between glob and stat (codex rolling
+            # rollouts mid-scan). Skip; the scan is over remaining files.
             continue
         yield p
 
@@ -101,6 +106,7 @@ def scan_rollouts(rollout_dir: Path = _DEFAULT_ROLLOUT_DIR,
                 try:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
+                    # Why: malformed rollout line — skip and keep scanning.
                     continue
                 tool_name = ev.get("tool_name") or (
                     ev.get("payload") or {}).get("tool_name") or ""
@@ -112,6 +118,8 @@ def scan_rollouts(rollout_dir: Path = _DEFAULT_ROLLOUT_DIR,
                 if path:
                     counts[path] += 1
         except OSError:
+            # Why: rollout file unreadable or rotated mid-read; skip
+            # and continue scanning the rest of the rollout corpus.
             continue
     return counts
 
@@ -128,9 +136,13 @@ def filter_to_project(counts: Counter[str], project_root: Path) -> Counter[str]:
             try:
                 rel = resolved.relative_to(proj)
             except ValueError:
+                # Why: path is outside this project — by design we keep
+                # only intra-project Reads, so drop it.
                 continue
             out[str(rel)] += n
         except (OSError, RuntimeError):
+            # Why: resolve() raised on a symlink loop or unreachable
+            # path — drop the entry, don't break the whole filter.
             continue
     return out
 
@@ -201,8 +213,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from . import registry
             registry.register(root)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Why: auto-register is a convenience; keypin's primary
+            # contract is writing keyfiles.md. Surface to stderr but
+            # don't fail the CLI.
+            sys.stderr.write(
+                f"(registry register failed: {type(e).__name__}: {e})\n")
         print(path)
         return 0
 

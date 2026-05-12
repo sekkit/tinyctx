@@ -144,6 +144,9 @@ def gather_scan_targets(graph_path: Path, project_root: Path,
         try:
             content = f.read_text(errors="replace")
         except OSError:
+            # Why: candidate file vanished or is unreadable (permissions,
+            # broken symlink). Emit a placeholder ScannedNode with empty
+            # snippet so the caller still sees the node id.
             continue
         out.append(ScannedNode(
             nid=nid,
@@ -242,8 +245,14 @@ def build_scout(graph_path: Path, project_root: Path, *,
     try:
         from . import registry
         registry.register(project_root)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Why: auto-registration is a convenience for `tinyctx-dreamer`;
+        # scout itself is the primary contract. Log and continue so a
+        # registry write failure (e.g. read-only home dir) doesn't
+        # abort the scout build.
+        import sys as _sys
+        _sys.stderr.write(
+            f"[scout] auto-register failed: {type(e).__name__}: {e}\n")
     manifest = {
         "version": CACHE_VERSION,
         "project_root": str(project_root.resolve()),

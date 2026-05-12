@@ -1059,7 +1059,10 @@ def _extract_shell_history(items: list, *, last_n: int = 15,
                     cmd_preview = " ".join(str(c) for c in cmd)
                 elif isinstance(cmd, str):
                     cmd_preview = cmd
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — tool args may be non-JSON
+                # Why: shell tool args usually JSON but legacy callers
+                # send raw strings. Fall through to `_short_args` below
+                # so we still produce a preview rather than blank.
                 pass
         if not cmd_preview:
             cmd_preview = _short_args(args, limit=160)

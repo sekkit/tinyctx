@@ -145,7 +145,9 @@ def _record_unknown_tool_drop(
              site=site,
              valid_tool_count=(len(valid_tool_names)
                                if valid_tool_names is not None else None))
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — forensics breadcrumb, never raise
+        # Why: this helper's docstring guarantees no-raise; the drop
+        # has already happened, the log line is observability.
         pass
 
 
@@ -161,6 +163,8 @@ def _coerce_value(raw: str) -> Any:
         if s[0] in "{[\"" or s[0].isdigit() or s[0] == "-":
             return json.loads(s)
     except (ValueError, json.JSONDecodeError):
+        # Why: value looked like JSON but failed to parse — fall
+        # through and keep the raw string (intent-preserving).
         pass
     return raw  # keep verbatim (multi-line text, code, etc.)
 
@@ -588,6 +592,9 @@ def _classify_final_answer(text: str) -> dict | None:
     try:
         import httpx
     except ImportError:
+        # Why: httpx is a required runtime dep but we import lazily here
+        # to avoid circular imports at module load. Missing httpx (test
+        # mocking, slim install) just disables the classifier.
         return None
 
     payload = {
@@ -629,6 +636,8 @@ def _classify_final_answer(text: str) -> dict | None:
                     try:
                         evt = json.loads(data)
                     except json.JSONDecodeError:
+                        # Why: malformed SSE frame (truncated keepalive
+                        # or non-JSON marker). Skip and keep streaming.
                         continue
                     et = evt.get("type")
                     if et == "response.output_text.delta":
@@ -640,7 +649,10 @@ def _classify_final_answer(text: str) -> dict | None:
                         if isinstance(t, str) and t:
                             final_text = t
         out = (final_text if final_text is not None else "".join(deltas)).strip()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — classifier is optional optimization
+        # Why: classifier call timed out / network blip / proxy down.
+        # Returning None disables the classifier's verdict for this
+        # turn — caller falls back to default behavior.
         return None
 
     if not out:
@@ -652,6 +664,8 @@ def _classify_final_answer(text: str) -> dict | None:
     try:
         parsed = json.loads(m.group())
     except json.JSONDecodeError:
+        # Why: classifier model emitted a brace-block that isn't valid
+        # JSON. Treat as no-verdict so caller skips the gate.
         return None
     if not isinstance(parsed, dict):
         return None
@@ -694,7 +708,9 @@ def _ask_advisor_for_continuation(text: str, options: list[str]) -> str | None:
             context=("Classifier-detected awaiting-user message:\n\n"
                      + text[-2000:]),
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — advisor is optional
+        # Why: advisor call failed (timeout, network, frontier outage).
+        # Returning None lets the original stream pass through unmodified.
         return None
     if result.get("error") or not result.get("text"):
         return None
@@ -731,7 +747,9 @@ def _try_auto_answer_text_choice(text: str) -> str | None:
             question=question,
             context="text-level choice intercept (TINYCTX_AUTO_USER_INPUT=1)",
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — advisor is optional
+        # Why: advisor unavailable — fall back to passing the original
+        # choice prompt through to the user's UI.
         return None
     if result.get("error") or not result.get("text"):
         return None
@@ -767,6 +785,9 @@ def _try_auto_answer_user_input(arguments_json: str) -> str | None:
     try:
         args = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError:
+        # Why: malformed request_user_input arguments — let the
+        # original tool call bubble up to codex's UI rather than
+        # synthesize a bogus auto-decision.
         return None
     questions = args.get("questions") or []
     if not questions:
@@ -804,7 +825,9 @@ def _try_auto_answer_user_input(arguments_json: str) -> str | None:
                     "TINYCTX_AUTO_USER_INPUT, so this routes through advisor "
                     "instead of bubbling up to Codex.app's UI.",
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — advisor is optional
+        # Why: advisor unavailable — fall back to letting codex emit
+        # the UI prompt for the user to click.
         return None
     if result.get("error") or not result.get("text"):
         return None
@@ -885,6 +908,8 @@ class ChatToResponsesTranslator:
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
+                # Why: malformed SSE data frame in chat-completions
+                # stream. Skip and continue parsing the next line.
                 continue
             if data.get("object") != "chat.completion.chunk":
                 continue
@@ -1088,14 +1113,16 @@ class ChatToResponsesTranslator:
                      enabled=_enabled, no_tool_calls=_no_tool_calls,
                      has_text=_has_text, text_len=len(self._text_buf),
                      will_run=(_enabled and _no_tool_calls and _has_text))
-            except Exception:
+            except Exception:  # noqa: BLE001 — telemetry only
+                # Why: log emit failure must not block the classifier path.
                 pass
             if _enabled and _no_tool_calls and _has_text:
                 _classify = _classify_final_answer(self._text_buf)
                 try:
                     from tinyctx.proxy import _log
                     _log("classifier_result", result=_classify)
-                except Exception:
+                except Exception:  # noqa: BLE001 — telemetry only
+                    # Why: log emit failure must not block downstream logic.
                     pass
                 if _classify and _classify.get("await_user"):
                     _opts = _classify.get("options") or []

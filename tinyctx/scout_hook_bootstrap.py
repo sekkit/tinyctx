@@ -40,6 +40,7 @@ def _log(msg: str) -> None:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}  {msg}\n")
     except OSError:
+        # Why: _log itself must never raise — hook bootstrap is advisory.
         pass
 
 

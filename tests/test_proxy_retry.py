@@ -1242,3 +1242,24 @@ class TestRetryEscalateRebuildsFrontierAuth:
         assert frontier_h.get("x-codex-session-id") == "sess-xyz", (
             f"x-codex-session-id must survive the retry-escalate header "
             f"rebuild; got {frontier_h}")
+
+
+# ─── P9: lock-in tests for CATEGORY A defensive swallow ────────────────────
+# `proxy._log` must never raise even if disk writes fail. Pin that here.
+
+
+def test_proxy_log_swallows_disk_write_failure(monkeypatch, tmp_path):
+    """proxy._log must not propagate disk errors to callers."""
+    from tinyctx import proxy
+
+    # Force the JSONL write into a path that triggers OSError
+    bad_dir = tmp_path / "readonly"
+    bad_dir.mkdir()
+    bad_dir.chmod(0o500)  # read-execute, not writable
+    monkeypatch.setattr(proxy.CFG, "log_dir", bad_dir)
+    monkeypatch.setattr(proxy.CFG, "verbose", True)
+    try:
+        # Should NOT raise even though we can't write to bad_dir
+        proxy._log("test_event_p9_lockin", session="x", value=42)
+    finally:
+        bad_dir.chmod(0o700)

@@ -47,6 +47,8 @@ def _iter_events(log_dir: Path, since: str | None = None) -> Iterable[dict[str, 
                 if d < target:
                     continue
             except ValueError:
+                # Why: non-date stem (e.g. "tinyctx-archive.jsonl"). Skip
+                # the date filter and read the file like any other.
                 pass
         try:
             for line in f.read_text(errors="replace").splitlines():
@@ -56,8 +58,11 @@ def _iter_events(log_dir: Path, since: str | None = None) -> Iterable[dict[str, 
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError:
+                    # Why: malformed JSONL line (partial write); skip.
                     continue
         except OSError:
+            # Why: file unreadable (locked, rotated); skip and move
+            # on to the next file in the list.
             continue
 
 

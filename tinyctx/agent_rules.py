@@ -50,6 +50,9 @@ def _load_template() -> str | None:
     try:
         return _TEMPLATE_PATH.read_text(encoding="utf-8")
     except OSError:
+        # Why: bundled template is missing or unreadable (package
+        # truncated, fs error). Returning None disables injection
+        # silently — docstring contract: "never blocks".
         return None
 
 

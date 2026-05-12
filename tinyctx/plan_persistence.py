@@ -115,6 +115,9 @@ def save_plan(state_dir: Path, cwd: str, plan_text: str,
             if existing.get("plan_text") == plan_text:
                 return False
     except Exception:  # noqa: BLE001
+        # Why: existing file may be missing, unreadable, or contain
+        # malformed JSON. Fall through to overwrite — the new payload
+        # supersedes whatever's there.
         pass
     payload = {
         "cwd": cwd,
@@ -147,6 +150,8 @@ def load_plan(state_dir: Path, cwd: str,
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        # Why: persisted plan corrupted or unreadable — caller treats
+        # None as "no plan to inject" (no behavior loss; user re-creates).
         return None
     updated_at = float(data.get("updated_at", 0) or 0)
     if updated_at <= 0:
@@ -218,6 +223,8 @@ def list_plans(state_dir: Path) -> list[dict[str, Any]]:
                 "plan_chars": len(data.get("plan_text", "") or ""),
             })
         except (json.JSONDecodeError, OSError):
+            # Why: one corrupted plan file shouldn't hide the rest from
+            # the dashboard listing.
             continue
     return out
 

@@ -83,6 +83,8 @@ def parse_judge_output(text: str) -> tuple[str, dict[str, Any]]:
             md = (text[: m.start()] + text[m.end():]).strip()
             return md or text.strip(), structured
         except json.JSONDecodeError:
+            # Why: fenced block content isn't valid JSON — fall through
+            # to the bare-object heuristic below rather than abort.
             pass
 
     # Heuristic bare-object: take the LAST {...} block and try to parse it.
@@ -100,6 +102,7 @@ def parse_judge_output(text: str) -> tuple[str, dict[str, Any]]:
                 md = text.replace(cand, "").strip()
                 return md or text.strip(), structured
         except json.JSONDecodeError:
+            # Why: this candidate isn't valid JSON; try the next one.
             continue
 
     return text.strip(), structured

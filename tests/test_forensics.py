@@ -165,3 +165,48 @@ def test_default_config_enabled():
     assert cfg.forensics_max_dumps >= 30
     # Disk-spam control: only HIGH-confidence punts (p ≥ 0.9)
     assert cfg.forensics_punt_threshold >= 0.85
+
+
+# ─── P9: lock-in tests for CATEGORY A defensive swallows ──────────────────
+# These tests pin the "never raises" contract documented in the module
+# docstring. Future refactors that drop the swallow would regress here.
+
+
+def test_write_dump_returns_none_when_dir_unwritable(tmp_path, monkeypatch):
+    """forensics_dir.mkdir failure must return None, not raise."""
+    from tinyctx import forensics
+    forensics.reset_state()
+
+    class _BlowOnMkdir:
+        def __init__(self, p: Path):
+            self._p = p
+
+        def mkdir(self, **kw):
+            raise OSError("simulated readonly fs")
+
+        def __truediv__(self, other):
+            return self._p / other
+
+        def glob(self, pat):
+            return iter(())
+
+        def exists(self):
+            return False
+
+    # Pass the spy as forensics_dir; write_forensics_dump should swallow
+    out = forensics.write_forensics_dump(
+        forensics_dir=_BlowOnMkdir(tmp_path),
+        proj_sid="p1",
+        trigger="x",
+        response_buffer="",
+    )
+    assert out is None  # no crash, just signal failure
+
+
+def test_list_dumps_swallows_glob_failure(tmp_path, monkeypatch):
+    """list_dumps over an unreadable forensics dir must return [], not raise."""
+    from tinyctx import forensics
+    bad_dir = tmp_path / "no-such"
+    # is_file False, but exists() is True via the .exists() shortcut
+    out = forensics.list_dumps(bad_dir)
+    assert out == []  # graceful empty result

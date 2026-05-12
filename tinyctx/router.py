@@ -223,7 +223,9 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
                     f"classifier p(escalate)={prob:.2f}",
                     est_input_tokens=est, turn_count=turns,
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 — classifier is advisory, not load-bearing
+            # Why: classifier missing or feature-extractor failed
+            # (training-only deps). Fall through to default local route.
             pass
 
     return Decision("local", "small/short -> cheap path",
@@ -251,6 +253,9 @@ def _resolve_api_key_from_env(backend, codex_auth: str | None = None) -> str | N
         if tok:
             return tok
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        # Why: codex auth.json missing / malformed / wrong shape — all
+        # are normal for clients not using ChatGPT subscription auth.
+        # Returning None lets the caller fall through to "no api key".
         pass
     return None
 

@@ -82,6 +82,8 @@ def _log(msg: str) -> None:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
+        # Why: _log itself must never raise — bootstrap log is advisory,
+        # not load-bearing for behavior.
         pass
 
 
@@ -262,15 +264,18 @@ def bootstrap_uv_via_curl(*, dry_run: bool = False
         # Clean up
         try:
             tmp_script.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            # Why: best-effort temp cleanup after successful install.
+            _log(f"tmp installer unlink failed: {type(e).__name__}: {e}")
         return True, "uv bootstrapped to ~/.local/bin/uv"
     finally:
         if tmp_script.is_file():
             try:
                 tmp_script.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                # Why: best-effort finally-block cleanup; the install
+                # outcome is already decided by this point.
+                _log(f"tmp installer unlink (finally) failed: {type(e).__name__}: {e}")
 
 
 def install_globally(state: State, *, dry_run: bool = False

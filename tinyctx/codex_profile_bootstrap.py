@@ -79,6 +79,7 @@ def _log(msg: str) -> None:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
+        # Why: _log itself must never raise — bootstrap log is advisory.
         pass
 
 
@@ -123,8 +124,10 @@ def detect_state(codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
             from ._codex_toml import has_mcp_block
             s.has_provider_block = has_mcp_block(codex_config, _PROVIDER_MARKER)
             s.has_profile_block = has_mcp_block(codex_config, _PROFILE_MARKER)
-        except OSError:
-            pass
+        except OSError as e:
+            # Detection probe: config exists but unreadable. Leave both
+            # flags False so bootstrap re-patches (idempotent — safe).
+            _log(f"codex config probe failed: {type(e).__name__}: {e}")
     return s
 
 

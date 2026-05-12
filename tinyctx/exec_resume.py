@@ -219,6 +219,9 @@ def resolve_session_id(cwd: str,
             f"file:{db}?mode=ro",
             uri=True, timeout=2.0)
     except sqlite3.Error:
+        # Why: codex db missing/locked. Resume side process simply
+        # won't fire — returning None propagates to "no_session_for_cwd"
+        # and the caller falls back to a regular request.
         return None
     try:
         cur = conn.execute(
@@ -227,11 +230,14 @@ def resolve_session_id(cwd: str,
             (cwd,))
         row = cur.fetchone()
     except sqlite3.Error:
+        # Why: schema drift or transient lock — exec_resume is
+        # best-effort; returning None disables this poke only.
         return None
     finally:
         try:
             conn.close()
         except sqlite3.Error:
+            # Why: close-in-finally must never raise.
             pass
     return row[0] if row else None
 
@@ -374,15 +380,17 @@ async def _spawn_exec_resume(
             try:
                 proc.kill()
             except ProcessLookupError:
+                # Why: process already exited between timeout fire
+                # and kill() — nothing to terminate.
                 pass
             log_fh.write(f"\n# tinyctx: timed out after {timeout_s}s, killed\n")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 — never crash the side process supervisor
             log_fh.write(f"\n# tinyctx: wait error: {e}\n")
         finally:
             try:
                 log_fh.write(f"\n# exit_code={proc.returncode}\n")
                 log_fh.close()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — finally cleanup, log handle may be closed
                 pass
 
     asyncio.create_task(_wait_then_close())
@@ -465,7 +473,10 @@ async def poke(
                     from . import empty_response_guard as _erg
                     _erg.force_next_to_frontier(
                         proj_sid, "exec_resume_exhausted")
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001 — escalation hint, not load-bearing
+                    # Why: force_next_to_frontier is an optimization
+                    # hint; missing it means the next turn lands on
+                    # the default route (no correctness loss).
                     pass
             _HISTORY.append(rec)
             return rec
