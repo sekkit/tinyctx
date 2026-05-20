@@ -41,7 +41,13 @@ from .compactor import (
     build_responses_api_sse,
     compact_with_debate,
 )
-from .config import BackendCfg, Config, effective_proactive_compact_threshold, load_config
+from .config import (
+    BackendCfg,
+    Config,
+    effective_proactive_compact_threshold,
+    effective_strip_request_fields,
+    load_config,
+)
 from .continuity import save_compaction
 from . import historian
 from . import lingua
@@ -1117,10 +1123,11 @@ async def responses(request: Request) -> Any:
         trace.tools_before = len(ts)
         trace.tools_after = len(ts)
 
-    if backend.strip_request_fields:
+    strip_fields = effective_strip_request_fields(backend)
+    if strip_fields:
         before_keys = set(body.keys())
         body = strip_unsupported_responses_fields(
-            body, drop=backend.strip_request_fields)
+            body, drop=strip_fields)
         trace.fields_stripped = sorted(before_keys - set(body.keys()))
     if backend.inject_defaults:
         body = inject_responses_defaults(body, backend.inject_defaults)
@@ -1237,7 +1244,7 @@ async def responses(request: Request) -> Any:
     else:
         # Local backend speaks chat-completions. Convert the body and fix URL.
         url = backend.base_url.rstrip("/") + "/chat/completions"
-        forward_body = normalize_for_chat(body)
+        forward_body = normalize_for_chat(body, strip_tools=backend.strip_tools)
 
     trace.target_url = url
     trace.is_stream = is_stream
@@ -2120,7 +2127,7 @@ async def _compactor_response(body: dict[str, Any], backend: BackendCfg,
         url = backend.base_url.rstrip("/") + ("/responses"
                                               if backend.wire_api == "responses"
                                               else "/chat/completions")
-        forward_body = body if backend.wire_api == "responses" else normalize_for_chat(body)
+        forward_body = body if backend.wire_api == "responses" else normalize_for_chat(body, strip_tools=backend.strip_tools)
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=180.0, pool=10.0)
         return await _forward(url, {"Content-Type": "application/json"},
                               forward_body, is_stream, sid,

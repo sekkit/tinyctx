@@ -27,8 +27,18 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import httpx
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+from .config_io import (
+    effective_config,
+    env_overrides,
+    merge_sections_into_toml,
+    read_config_text,
+    save_config_text,
+)
+from .config_schema import config_presets, config_schema, validate_sections
 
 
 _START_TS = time.time()
@@ -729,6 +739,247 @@ _DASHBOARD_HTML = """<!doctype html>
 """
 
 
+_CONFIG_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tinyctx Config Center</title>
+<style>
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --line:#334155; --text:#e5e7eb; --accent:#38bdf8; --ok:#22c55e; --bad:#ef4444; }
+body { margin:0; font:14px/1.45 ui-sans-serif,system-ui,Segoe UI,Arial; background:linear-gradient(135deg,#020617,#111827); color:var(--text); }
+main { max-width:1180px; margin:0 auto; padding:28px; }
+h1 { margin:0 0 4px; font-size:28px; }
+p { color:var(--muted); }
+.grid { display:grid; grid-template-columns:260px 1fr 320px; gap:16px; align-items:start; }
+.card { background:rgba(15,23,42,.88); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 20px 60px rgba(0,0,0,.25); }
+.preset { width:100%; text-align:left; margin:8px 0; padding:10px; border:1px solid var(--line); border-radius:12px; background:#0b1220; color:var(--text); cursor:pointer; }
+.preset:hover { border-color:var(--accent); }
+fieldset { border:1px solid var(--line); border-radius:14px; margin:0 0 14px; padding:12px; }
+legend { color:#bae6fd; padding:0 8px; }
+label { display:grid; grid-template-columns:190px 1fr; gap:10px; align-items:center; margin:8px 0; }
+input, select, textarea { width:100%; box-sizing:border-box; border:1px solid var(--line); border-radius:10px; padding:8px 10px; background:#020617; color:var(--text); }
+textarea { min-height:70px; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+.row { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+button { border:0; border-radius:999px; padding:9px 14px; background:var(--accent); color:#00111f; font-weight:700; cursor:pointer; }
+button.secondary { background:#1e293b; color:var(--text); border:1px solid var(--line); }
+pre { white-space:pre-wrap; overflow:auto; max-height:340px; background:#020617; border:1px solid var(--line); border-radius:12px; padding:12px; }
+.ok { color:var(--ok); } .bad { color:var(--bad); } .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>tinyctx Config Center</h1>
+  <p>Visual editor for <code>~/.tinyctx/config.toml</code>. Presets get you close; validation and test calls catch the sharp edges.</p>
+  <div class="grid">
+    <section class="card">
+      <h2>Presets</h2>
+      <div id="presets"></div>
+    </section>
+    <section class="card">
+      <h2>Core Config</h2>
+      <form id="config-form"></form>
+      <div class="row">
+        <button type="button" id="validate">Validate</button>
+        <button type="button" id="save">Save</button>
+        <button type="button" id="test-local" class="secondary">Test Local</button>
+        <button type="button" id="test-frontier" class="secondary">Test Frontier</button>
+      </div>
+    </section>
+    <aside class="card">
+      <h2>Status</h2>
+      <p id="path" class="muted"></p>
+      <h3>Result</h3>
+      <pre id="result">Loading…</pre>
+      <h3>Env Overrides</h3>
+      <pre id="env"></pre>
+    </aside>
+  </div>
+</main>
+<script>
+const core = {
+  server: ["host", "port", "verbose"],
+  routing: ["force_route", "redirect_compaction_to_local", "sanitize_encrypted_content", "escalate_input_tokens", "escalate_turn_count", "escalate_on_error_streak"],
+  local: ["base_url", "wire_api", "model", "context_window", "timeout_s", "strip_tools", "api_key_env", "headers"],
+  frontier: ["base_url", "wire_api", "model", "timeout_s", "api_key_env"]
+};
+let state = {};
+let schema = {};
+let presets = {};
+
+function $(id) { return document.getElementById(id); }
+function show(obj) { $("result").textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2); }
+function fieldId(section, key) { return `${section}__${key}`; }
+
+async function load() {
+  const res = await fetch("/api/v1/config");
+  state = await res.json();
+  schema = state.schema.sections;
+  presets = state.presets;
+  $("path").textContent = state.path;
+  $("env").textContent = JSON.stringify(state.env_overrides, null, 2);
+  renderPresets();
+  renderForm(state.effective);
+  show({loaded: true, needs_restart_after_save: true});
+}
+
+function renderPresets() {
+  $("presets").innerHTML = "";
+  Object.entries(presets).forEach(([name, preset]) => {
+    const btn = document.createElement("button");
+    btn.className = "preset";
+    btn.type = "button";
+    btn.innerHTML = `<strong>${preset.label}</strong><br><span class="muted">${preset.description}</span>`;
+    btn.onclick = () => {
+      applySections(preset.sections);
+      show({preset: name, applied: preset.sections});
+    };
+    $("presets").appendChild(btn);
+  });
+}
+
+function renderForm(effective) {
+  const form = $("config-form");
+  form.innerHTML = "";
+  for (const [section, keys] of Object.entries(core)) {
+    const fs = document.createElement("fieldset");
+    fs.innerHTML = `<legend>[${section}]</legend>`;
+    keys.forEach(key => {
+      const value = (effective[section] || {})[key];
+      const meta = (schema[section] || []).find(f => f.name === key) || {};
+      const row = document.createElement("label");
+      row.innerHTML = `<span>${key}</span>`;
+      let input;
+      if (meta.type === "boolean") {
+        input = document.createElement("select");
+        input.innerHTML = '<option value=""></option><option value="true">true</option><option value="false">false</option>';
+        input.value = value === true ? "true" : value === false ? "false" : "";
+      } else if (meta.type === "enum") {
+        input = document.createElement("select");
+        input.innerHTML = '<option value=""></option>' + (meta.options || []).map(v => `<option value="${v}">${v}</option>`).join("");
+        input.value = value ?? "";
+      } else if (meta.type === "object") {
+        input = document.createElement("textarea");
+        input.value = value && Object.keys(value).length ? JSON.stringify(value, null, 2) : "";
+      } else {
+        input = document.createElement("input");
+        input.value = value ?? "";
+      }
+      input.id = fieldId(section, key);
+      input.dataset.type = meta.type || "string";
+      row.appendChild(input);
+      fs.appendChild(row);
+    });
+    form.appendChild(fs);
+  }
+}
+
+function collectSections() {
+  const sections = {};
+  for (const [section, keys] of Object.entries(core)) {
+    sections[section] = {};
+    keys.forEach(key => {
+      const input = $(fieldId(section, key));
+      if (!input) return;
+      const raw = input.value.trim();
+      if (raw === "") return;
+      if (input.dataset.type === "boolean") sections[section][key] = raw === "true";
+      else if (input.dataset.type === "integer") sections[section][key] = Number.parseInt(raw, 10);
+      else if (input.dataset.type === "object") {
+        try { sections[section][key] = JSON.parse(raw); }
+        catch (e) { sections[section][key] = raw; }
+      } else sections[section][key] = raw;
+    });
+    if (!Object.keys(sections[section]).length) delete sections[section];
+  }
+  return sections;
+}
+
+function applySections(sections) {
+  for (const [section, values] of Object.entries(sections || {})) {
+    for (const [key, value] of Object.entries(values || {})) {
+      const input = $(fieldId(section, key));
+      if (!input) continue;
+      input.value = typeof value === "object" && value !== null ? JSON.stringify(value, null, 2) : String(value);
+    }
+  }
+}
+
+async function post(url) {
+  const res = await fetch(url, {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({sections: collectSections()})});
+  const data = await res.json();
+  show(data);
+}
+$("validate").onclick = () => post("/api/v1/config/validate");
+$("save").onclick = () => post("/api/v1/config/save");
+$("test-local").onclick = () => post("/api/v1/config/test-local");
+$("test-frontier").onclick = () => post("/api/v1/config/test-frontier");
+load().catch(err => show({error: String(err)}));
+</script>
+</body>
+</html>
+"""
+
+
+def _payload_sections(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict) and isinstance(payload.get("sections"), dict):
+        return payload["sections"]
+    return {}
+
+
+def _write_allowed(request: Request) -> bool:
+    if os.environ.get("TINYCTX_DASHBOARD_WRITE") == "1":
+        return True
+    host = (request.client.host if request.client else "") or ""
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _merged_effective_sections(sections: dict[str, Any]) -> dict[str, Any]:
+    merged = effective_config()
+    try:
+        parsed = read_config_text().get("parsed") or {}
+    except Exception:
+        parsed = {}
+    for section, values in parsed.items():
+        if isinstance(values, dict):
+            merged.setdefault(section, {}).update(values)
+    for section, values in sections.items():
+        if isinstance(values, dict):
+            merged.setdefault(section, {}).update(values)
+    return merged
+
+
+def _backend_headers(backend: dict[str, Any]) -> dict[str, str]:
+    headers = dict(backend.get("headers") or {})
+    api_key_env = backend.get("api_key_env")
+    if api_key_env and "Authorization" not in headers:
+        api_key = os.environ.get(str(api_key_env))
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _json_error(message: str, status_code: int = 400, **extra: Any) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message, **extra}, status_code=status_code)
+
+
+def _safe_preview(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            if "data" in data and isinstance(data["data"], list):
+                return json.dumps(data["data"][:3], ensure_ascii=False)[:500]
+            if "choices" in data:
+                return json.dumps(data["choices"][:1], ensure_ascii=False)[:500]
+            if "output" in data:
+                return json.dumps(data["output"][:1], ensure_ascii=False)[:500]
+            if "error" in data:
+                return json.dumps(data["error"], ensure_ascii=False)[:500]
+        return json.dumps(data, ensure_ascii=False)[:500]
+    except Exception:
+        return (getattr(response, "text", "") or "")[:500]
+
+
 # ─── FastAPI route registration ────────────────────────────────────────────
 
 
@@ -738,6 +989,140 @@ def register(app: Any, log_dir: Path) -> None:
     @app.get("/dashboard")
     def _dashboard_html() -> HTMLResponse:
         return HTMLResponse(_DASHBOARD_HTML)
+
+    @app.get("/dashboard/config")
+    def _dashboard_config_html() -> HTMLResponse:
+        return HTMLResponse(_CONFIG_HTML)
+
+    @app.get("/api/v1/config")
+    def _api_v1_config() -> JSONResponse:
+        try:
+            current = read_config_text()
+            return JSONResponse({
+                **current,
+                "schema": config_schema(),
+                "presets": config_presets(),
+                "effective": effective_config(),
+                "env_overrides": env_overrides(),
+            })
+        except Exception as e:  # noqa: BLE001 - config page should surface parse errors
+            return _json_error(str(e), status_code=400)
+
+    @app.post("/api/v1/config/validate")
+    async def _api_v1_config_validate(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            return _json_error("invalid JSON body")
+        sections = _payload_sections(payload)
+        result = validate_sections(sections)
+        try:
+            current = read_config_text()
+            result["rendered"] = merge_sections_into_toml(current["raw"], sections)
+        except Exception as e:  # noqa: BLE001
+            result["render_error"] = str(e)
+        return JSONResponse(result)
+
+    @app.post("/api/v1/config/save")
+    async def _api_v1_config_save(request: Request) -> JSONResponse:
+        if not _write_allowed(request):
+            return _json_error(
+                "config writes require localhost or TINYCTX_DASHBOARD_WRITE=1",
+                status_code=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return _json_error("invalid JSON body")
+        sections = _payload_sections(payload)
+        result = validate_sections(sections)
+        if not result["ok"]:
+            return JSONResponse(result, status_code=400)
+        try:
+            current = read_config_text()
+            rendered = merge_sections_into_toml(current["raw"], sections)
+            saved = save_config_text(rendered)
+            return JSONResponse({
+                "ok": True,
+                **saved,
+                "needs_restart": True,
+                "warnings": result["warnings"],
+            })
+        except Exception as e:  # noqa: BLE001
+            return _json_error(str(e), status_code=400)
+
+    @app.post("/api/v1/config/test-local")
+    async def _api_v1_config_test_local(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            return _json_error("invalid JSON body")
+        sections = _payload_sections(payload)
+        result = validate_sections(sections)
+        if not result["ok"]:
+            return JSONResponse(result, status_code=400)
+        backend = _merged_effective_sections(sections).get("local", {})
+        base_url = str(backend.get("base_url") or "").rstrip("/")
+        model = str(backend.get("model") or "local")
+        wire_api = str(backend.get("wire_api") or "chat")
+        if not base_url:
+            return _json_error("local.base_url is required")
+        headers = _backend_headers(backend)
+        try:
+            with httpx.Client(timeout=10) as client:
+                models = client.get(f"{base_url}/models", headers=headers)
+                if wire_api == "responses":
+                    body = {
+                        "model": model,
+                        "input": "Reply with pong.",
+                        "stream": False,
+                        "max_output_tokens": 16,
+                    }
+                    completion = client.post(f"{base_url}/responses", json=body, headers=headers)
+                else:
+                    body = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Reply with pong."}],
+                        "stream": False,
+                        "max_tokens": 16,
+                    }
+                    completion = client.post(f"{base_url}/chat/completions", json=body, headers=headers)
+            return JSONResponse({
+                "ok": models.status_code < 400 and completion.status_code < 400,
+                "models_status": models.status_code,
+                "completion_status": completion.status_code,
+                "models_preview": _safe_preview(models),
+                "completion_preview": _safe_preview(completion),
+            })
+        except Exception as e:  # noqa: BLE001
+            return _json_error(str(e), status_code=502)
+
+    @app.post("/api/v1/config/test-frontier")
+    async def _api_v1_config_test_frontier(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            return _json_error("invalid JSON body")
+        sections = _payload_sections(payload)
+        result = validate_sections(sections)
+        if not result["ok"]:
+            return JSONResponse(result, status_code=400)
+        backend = _merged_effective_sections(sections).get("frontier", {})
+        base_url = str(backend.get("base_url") or "")
+        is_codex_official = "chatgpt.com/backend-api/codex" in base_url
+        return JSONResponse({
+            "ok": bool(base_url and backend.get("wire_api") and backend.get("model")),
+            "base_url": base_url,
+            "wire_api": backend.get("wire_api"),
+            "model": backend.get("model"),
+            "official_codex_backend": is_codex_official,
+            "requires_openai_api_key": False if is_codex_official else bool(backend.get("api_key_env")),
+            "message": (
+                "Codex official backend uses Codex/ChatGPT auth; OPENAI_API_KEY is not required."
+                if is_codex_official else
+                "Non-official frontier should set api_key_env when the provider requires a key."
+            ),
+        })
 
     @app.get("/dashboard/stream")
     async def _dashboard_stream(request: Request) -> StreamingResponse:

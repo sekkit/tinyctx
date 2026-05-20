@@ -76,6 +76,9 @@ context_safe_fraction = 0.85
 # model = "Qwen/Qwen2.5-Coder-32B-Instruct"
 # api_key_env = "TINYCTX_LOCAL_API_KEY"
 # timeout_s = 180
+# # Enable only when a vLLM/SGLang+LMCache gateway consumes prompt_cache_key.
+# # tinyctx does not import or manage LMCache; this only preserves cache hints.
+# lmcache_passthrough = true
 
 
 [frontier]

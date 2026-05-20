@@ -441,9 +441,12 @@ def _flatten_tool_output(output: Any) -> str:
         return str(output)
 
 
-def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
+def normalize_for_chat(body: dict[str, Any], *, strip_tools: bool = False) -> dict[str, Any]:
     """Convert a Responses-style body to a chat-completions body for backends
     that only speak chat (LMStudio default endpoint, Ollama, etc.).
+
+    If *strip_tools* is True, tools and tool_choice are omitted entirely.
+    Use this for backends like vLLM without --enable-auto-tool-choice.
 
     This is intentionally minimal and lossy - keeps user/assistant text and
     tool calls but drops reasoning items. Use only when the local backend
@@ -460,9 +463,17 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
         "stream": body.get("stream", False),
     }
     # carry over a few common knobs if present
-    for k in ("temperature", "top_p", "max_tokens", "tool_choice", "stop"):
+    for k in ("temperature", "top_p", "max_tokens", "stop"):
         if k in body:
             out[k] = body[k]
+    # tool_choice and tools: only forward when strip_tools is False.
+    # vLLM without --enable-auto-tool-choice rejects any request that
+    # contains "tools", so we strip both by default for chat backends.
+    # The caller (proxy) can override via strip_tools=False.
+    if not strip_tools:
+        tc = body.get("tool_choice")
+        if tc is not None and tc != "auto":
+            out["tool_choice"] = tc
     # Responses-API uses `max_output_tokens`; chat-completions uses
     # `max_tokens`. Translate when the chat field is absent so any cap
     # set via `inject_responses_defaults` (e.g. local.inject_defaults
@@ -473,8 +484,8 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
     # Convert tools from Responses API format to chat-completions format.
     # Responses: {"type": "function", "name": "x", "parameters": {...}, "description": "..."}
     # Chat:      {"type": "function", "function": {"name": "x", "parameters": {...}, "description": "..."}}
-    #
-    if "tools" in body and isinstance(body["tools"], list):
+    # Skip entirely when strip_tools=True (vLLM without --enable-auto-tool-choice).
+    if not strip_tools and "tools" in body and isinstance(body["tools"], list):
         chat_tools = []
         for t in body["tools"]:
             if not isinstance(t, dict):
@@ -496,6 +507,12 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
     if isinstance(instr, str) and instr.strip():
         out["messages"].append({"role": "system", "content": instr})
     src = body.get("input") or body.get("messages") or []
+    # Responses API allows `input` to be a plain string (shorthand for a
+    # single user message). Normalize to a list so the rest of the function
+    # can iterate uniformly.
+    if isinstance(src, str):
+        out["messages"].append({"role": "user", "content": src})
+        return out
     if not isinstance(src, list):
         return out
 
@@ -622,7 +639,23 @@ def normalize_for_chat(body: dict[str, Any]) -> dict[str, Any]:
                 msg["reasoning_content"] = rc
             merged.append(msg)
 
-    out["messages"].extend(merged)
+    system_msgs = [msg for msg in out["messages"] if msg.get("role") == "system"]
+    system_msgs.extend(msg for msg in merged if msg.get("role") == "system")
+    non_system_msgs = [msg for msg in merged if msg.get("role") != "system"]
+    out["messages"] = []
+    if system_msgs:
+        system_parts: list[str] = []
+        for msg in system_msgs:
+            content = msg.get("content")
+            if isinstance(content, str):
+                system_parts.append(content)
+            else:
+                system_parts.append(json.dumps(content, ensure_ascii=False, default=str))
+        out["messages"].append({
+            "role": "system",
+            "content": "\n\n".join(part for part in system_parts if part),
+        })
+    out["messages"].extend(non_system_msgs)
 
     # ── DeepSeek thinking-mode reasoning_content compat ──
     # codex 0.128+ ships `type=reasoning` items with empty content/summary/

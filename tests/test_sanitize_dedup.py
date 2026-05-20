@@ -399,6 +399,26 @@ def test_normalize_for_chat_stubs_assistant_reasoning_content():
             "every assistant message must carry reasoning_content (even if empty)"
 
 
+def test_normalize_for_chat_hoists_late_system_messages():
+    from tinyctx.sanitize import normalize_for_chat
+    body = {
+        "model": "x",
+        "instructions": "base system",
+        "input": [
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "developer", "content": "late policy"},
+            {"type": "message", "role": "user", "content": "second"},
+        ],
+    }
+
+    out = normalize_for_chat(body)
+    messages = out["messages"]
+    roles = [m["role"] for m in messages]
+
+    assert roles == ["system", "user", "user"]
+    assert messages[0]["content"] == "base system\n\nlate policy"
+
+
 def test_flatten_tool_output_strips_input_image():
     """codex 0.128+ tool outputs are lists mixing text and base64 PNGs;
     DeepSeek's chat-completions API rejects `input_image` with HTTP 400.

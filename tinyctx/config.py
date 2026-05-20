@@ -26,6 +26,13 @@ def _env(name: str, default: str | None = None) -> str | None:
     return v if v not in (None, "") else default
 
 
+def _env_bool(name: str) -> bool | None:
+    v = _env(name)
+    if v is None:
+        return None
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Namespaced views (P8)
 #
@@ -306,6 +313,10 @@ class BackendCfg:
     # we get here.
     supported_tool_types: tuple[str, ...] = ("function",)
     strip_request_fields: tuple[str, ...] = ("client_metadata", "prompt_cache_key")
+    # Opt-in passthrough for LMCache-enabled local vLLM/SGLang stacks that
+    # consume cache metadata before the OpenAI-compatible backend validates
+    # the request. This does not import or manage LMCache directly.
+    lmcache_passthrough: bool = False
     # Dotted-path defaults injected when codex omits a field a strict
     # backend requires. LMStudio 0.4 demands text.format on /v1/responses;
     # OpenAI's backend treats it as optional. Frontier overrides this to
@@ -319,6 +330,9 @@ class BackendCfg:
     # itself; false for frontier (the OpenAI backend already returns
     # structured items).
     translate_tool_calls: bool = True
+    # Strip tools and tool_choice from requests sent to this backend.
+    # Enable for vLLM / backends without --enable-auto-tool-choice.
+    strip_tools: bool = False
     # Hard caps. Unlike `inject_defaults` (which only sets if missing),
     # these LOWER the field's value when it exceeds the cap. Useful when
     # codex sends `max_output_tokens=128000` (default high value) and we
@@ -1063,6 +1077,14 @@ def effective_proactive_compact_threshold(cfg: "Config") -> int:
     return max(0, base - buffer)
 
 
+def effective_strip_request_fields(backend: BackendCfg) -> tuple[str, ...]:
+    """Return top-level request fields to drop for this backend."""
+    fields = tuple(backend.strip_request_fields or ())
+    if backend.lmcache_passthrough:
+        fields = tuple(f for f in fields if f != "prompt_cache_key")
+    return fields
+
+
 def load_config() -> Config:
     """Layered config: file provides base values; env vars override.
 
@@ -1111,4 +1133,7 @@ def load_config() -> Config:
     vb = _env("TINYCTX_VERBOSE")
     if vb is not None:
         cfg.verbose = vb == "1"
+    lmcache = _env_bool("TINYCTX_LOCAL_LMCACHE_PASSTHROUGH")
+    if lmcache is not None:
+        cfg.local.lmcache_passthrough = lmcache
     return cfg
