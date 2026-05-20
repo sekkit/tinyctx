@@ -202,6 +202,19 @@ class RequestTrace:
     lingua_chars_before: int = 0
     lingua_chars_after: int = 0
 
+    # Task Orchestrator / Symphony-inspired supervisor. Records the
+    # current-turn Skill/MCP guidance tinyctx injected before routing.
+    orchestrator_injected: bool = False
+    orchestrator_task_type: str = ""
+    orchestrator_confidence: float = 0.0
+    orchestrator_skills: list[str] = field(default_factory=list)
+    orchestrator_mcp: list[str] = field(default_factory=list)
+    orchestrator_dynamic_skill_hash: str = ""
+    orchestrator_rationale: str = ""
+    task_id: str = ""
+    task_title: str = ""
+    task_state: str = ""
+
     def emit(self, log_dir: Path) -> None:
         """Write one `request_trace` JSONL event to today's log file."""
         log_dir.mkdir(parents=True, exist_ok=True)

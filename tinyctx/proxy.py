@@ -51,6 +51,7 @@ from .config import (
 from .continuity import save_compaction
 from . import historian
 from . import lingua
+from .orchestration_runtime import apply_orchestration
 from .read_delta import collapse_repeated_reads
 from .router import (
     Decision,
@@ -364,10 +365,10 @@ def _build_frontier_retry_target(
     """Rebuild url/headers/body for a retry that escalates to frontier.
 
     Used by the unified retry layer (retry_policy.classify_failure ==
-    retry_escalate) to switch from local to frontier mid-request. We
-    reuse the same `body` (frontier accepts every codex-emitted role/
-    field/tool-type natively, so no transform needed) but rebuild the
-    URL + auth headers from the frontier backend config.
+    retry_escalate) to switch from local to frontier mid-request.
+    Crucially, this can run after a local `wire_api=chat` normalization,
+    so `body` may be in chat-completions shape (`messages` + local model).
+    We coerce to frontier Responses shape and rewrite model.
 
     `request` may be None when called from a context that doesn't have
     the FastAPI Request handy (e.g. retry inside a stream producer).
@@ -377,6 +378,7 @@ def _build_frontier_retry_target(
     """
     backend = CFG.frontier
     url = backend.base_url.rstrip("/") + "/responses"
+    retry_body = _coerce_frontier_retry_body(body, backend)
     headers = (_forward_headers(request, backend) if request is not None
                else {"Content-Type": "application/json",
                      "Accept": "text/event-stream"})
@@ -385,7 +387,40 @@ def _build_frontier_retry_target(
         f"retry_escalate: {reason}",
         is_compaction=False,
     )
-    return url, headers, body, decision, backend
+    return url, headers, retry_body, decision, backend
+
+
+def _coerce_frontier_retry_body(
+    body: dict[str, Any],
+    backend: BackendCfg,
+) -> dict[str, Any]:
+    """Convert local retry payload into frontier-friendly Responses shape."""
+    try:
+        out = json.loads(json.dumps(body))
+    except (TypeError, ValueError):
+        out = dict(body) if isinstance(body, dict) else {}
+    if not isinstance(out, dict):
+        out = {}
+
+    if backend.model:
+        out["model"] = backend.model
+
+    # Escalation can happen after local `wire_api=chat` conversion.
+    # Frontier /responses expects `input`, not `messages`.
+    if "messages" in out:
+        if "input" not in out:
+            out["input"] = out.get("messages")
+        out.pop("messages", None)
+
+    # Chat payloads use max_tokens; responses payloads use max_output_tokens.
+    if "max_tokens" in out and "max_output_tokens" not in out:
+        try:
+            out["max_output_tokens"] = int(out["max_tokens"])
+        except (TypeError, ValueError):
+            pass
+        out.pop("max_tokens", None)
+
+    return out
 
 
 def _session_id(request: Request, body: dict[str, Any]) -> str:
@@ -1074,6 +1109,31 @@ async def responses(request: Request) -> Any:
         except Exception as e:  # noqa: BLE001
             _log("agent_rules_inject_error", session=sid, error=str(e))
 
+    # Task Orchestrator: classify task type with local heuristics/planner,
+    # suggest Skill/MCP usage, optionally inject a validated Dynamic Skill
+    # playbook, and stamp TaskRecord metadata into request trace.
+    if CFG.orchestrator_enabled:
+        try:
+            project_root_hdr = request.headers.get("x-codex-cwd") or ""
+            body, task_record = apply_orchestration(
+                body,
+                cfg=CFG,
+                trace=trace,
+                session_id=sid,
+                project_root=project_root_hdr,
+            )
+            if CFG.orchestrator_trace_decisions and task_record is not None:
+                _log(
+                    "orchestrator_applied",
+                    session=sid,
+                    task_id=task_record.task_id,
+                    task_type=task_record.task_type,
+                    injected=trace.orchestrator_injected,
+                    dynamic_skill_hash=trace.orchestrator_dynamic_skill_hash,
+                )
+        except Exception as e:  # noqa: BLE001
+            _log("orchestrator_error", session=sid, error=str(e))
+
     # Inject the advisor sub-agent usage hint into instructions BEFORE
     # rewrite_model — the inject function reads body.model to skip the
     # advisor's own sub-thread (model="tinyctx-frontier"). After this
@@ -1613,9 +1673,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     translator: StreamTranslator | ChatToResponsesTranslator | None
     valid_names = (_extract_valid_tool_names(body)
                    if CFG.unknown_tool_call_protection else None)
+    auto_user_input_enabled = os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") != "0"
     if chat_to_responses:
         translator = ChatToResponsesTranslator(valid_tool_names=valid_names)
-    elif translate_tool_calls:
+    elif translate_tool_calls or auto_user_input_enabled:
         translator = StreamTranslator(valid_tool_names=valid_names)
     else:
         translator = None

@@ -98,6 +98,12 @@ def _format_event_for_dashboard(e: dict[str, Any]) -> dict[str, Any] | None:
             "self_classify_p": e.get("self_classify_p", 0.0),
             "self_classify_reason": (e.get("self_classify_reason", "") or "")[:80],
             "self_classify_overrode": bool(e.get("self_classify_overrode")),
+            "orchestrator_injected": bool(e.get("orchestrator_injected")),
+            "orchestrator_task_type": (e.get("orchestrator_task_type", "") or "")[:40],
+            "orchestrator_confidence": float(e.get("orchestrator_confidence", 0.0) or 0.0),
+            "orchestrator_skills": list((e.get("orchestrator_skills") or []))[:3],
+            "orchestrator_mcp": list((e.get("orchestrator_mcp") or []))[:3],
+            "task_state": (e.get("task_state", "") or "")[:20],
             "session_id": (e.get("session_id", "") or "")[:24],
         })
     elif ev == "soft_completion_classified":
@@ -617,7 +623,13 @@ _DASHBOARD_HTML = """<!doctype html>
         badge = `<span class="badge b-skip">turn</span>`;
         info = `t=${e.turn_count} ${e.elapsed_s.toFixed(1)}s ${kb(e.bytes_in)}→${kb(e.bytes_out)} ${e.route}`;
       }
-      return badge + info;
+      const orch = e.orchestrator_injected
+        ? ` · orch=${escapeHTML(e.orchestrator_task_type || "unknown")}(${Number(e.orchestrator_confidence || 0).toFixed(2)})`
+          + (Array.isArray(e.orchestrator_skills) && e.orchestrator_skills.length
+            ? ` skills=${escapeHTML(e.orchestrator_skills.join(","))}` : "")
+          + (e.task_state ? ` state=${escapeHTML(e.task_state)}` : "")
+        : "";
+      return badge + info + orch;
     }
     if (ev === "soft_completion_classified") {
       const cls = e.soft_punt && e.p >= 0.7 ? "b-punt" : "b-okp";

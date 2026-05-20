@@ -23,6 +23,56 @@ from tinyctx.retry_policy import (
 )
 
 
+def test_coerce_frontier_retry_body_rewrites_chat_shape_for_responses():
+    from tinyctx import proxy
+    from tinyctx.config import BackendCfg
+
+    src = {
+        "model": "yuyu-qwen3.6-27b-int4",
+        "messages": [{"role": "user", "content": "Reply with pong."}],
+        "max_tokens": 64,
+        "stream": True,
+    }
+
+    out = proxy._coerce_frontier_retry_body(
+        src,
+        BackendCfg(
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.5",
+        ),
+    )
+
+    assert out["model"] == "gpt-5.5"
+    assert "messages" not in out
+    assert out["input"] == [{"role": "user", "content": "Reply with pong."}]
+    assert out["max_output_tokens"] == 64
+    assert "max_tokens" not in out
+    assert src["model"] == "yuyu-qwen3.6-27b-int4"
+
+
+def test_coerce_frontier_retry_body_keeps_existing_input():
+    from tinyctx import proxy
+    from tinyctx.config import BackendCfg
+
+    src = {
+        "model": "local",
+        "input": [{"role": "user", "content": "keep me"}],
+        "messages": [{"role": "assistant", "content": "drop me"}],
+    }
+
+    out = proxy._coerce_frontier_retry_body(
+        src,
+        BackendCfg(
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.5",
+        ),
+    )
+
+    assert out["model"] == "gpt-5.5"
+    assert out["input"] == [{"role": "user", "content": "keep me"}]
+    assert "messages" not in out
+
+
 # ─── classify_failure pure unit tests ─────────────────────────────────────
 
 

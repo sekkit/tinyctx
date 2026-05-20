@@ -289,6 +289,11 @@ class StreamTranslator:
     _emitted_calls: int = 0       # output_index counter for new function_call items
     _saw_partial: dict[str, bool] = field(default_factory=dict)
     _partial: str = ""            # partial event bytes carried across feed() calls
+    _assistant_text: str = ""
+    _has_live_tool_calls: bool = False
+    _auto_decision_emitted: bool = False
+    _synthetic_output_index: int = 900_000
+    _pending_user_input: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Set of tool names codex's dispatcher will accept. When not None, any
     # emitted function_call whose name isn't in the set is rewritten to a
     # synthetic `shell echo` call so codex can dispatch it cleanly. None
@@ -326,6 +331,11 @@ class StreamTranslator:
                      "sequence_number": self._next_seq()},
                 )
         self._buffers.clear()
+        if self._pending_user_input:
+            for pending in self._pending_user_input.values():
+                for raw in pending.get("raw_events", []):
+                    yield raw.encode("utf-8")
+            self._pending_user_input.clear()
         if self._partial:
             # Last event without trailing \n\n. Forward as-is.
             tail = self._partial.encode("utf-8")
@@ -343,6 +353,86 @@ class StreamTranslator:
             yield raw_event.encode("utf-8")
             return
 
+        if ev_type == "response.output_item.added":
+            item = data_obj.get("item") if isinstance(data_obj, dict) else None
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                item_id = str(item.get("id") or "")
+                name = str(item.get("name") or "")
+                if self._auto_user_input_enabled() and name == "request_user_input" and item_id:
+                    self._pending_user_input[item_id] = {
+                        "raw_events": [raw_event],
+                        "arguments": str(item.get("arguments") or ""),
+                    }
+                    return
+                self._has_live_tool_calls = True
+            yield raw_event.encode("utf-8")
+            return
+
+        if ev_type == "response.function_call_arguments.delta":
+            item_id = str(data_obj.get("item_id") or "")
+            pending = self._pending_user_input.get(item_id)
+            if pending is not None:
+                pending["raw_events"].append(raw_event)
+                delta = data_obj.get("delta")
+                if isinstance(delta, str) and delta:
+                    pending["arguments"] = str(pending.get("arguments") or "") + delta
+                return
+            yield raw_event.encode("utf-8")
+            return
+
+        if ev_type == "response.function_call_arguments.done":
+            item_id = str(data_obj.get("item_id") or "")
+            pending = self._pending_user_input.get(item_id)
+            if pending is not None:
+                pending["raw_events"].append(raw_event)
+                args = data_obj.get("arguments")
+                if isinstance(args, str):
+                    pending["arguments"] = args
+                return
+            yield raw_event.encode("utf-8")
+            return
+
+        if ev_type == "response.output_item.done":
+            item = data_obj.get("item") if isinstance(data_obj, dict) else None
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                item_id = str(item.get("id") or "")
+                pending = self._pending_user_input.pop(item_id, None)
+                if pending is not None:
+                    pending["raw_events"].append(raw_event)
+                    args = item.get("arguments")
+                    if isinstance(args, str):
+                        pending["arguments"] = args
+                    choice_text = _try_auto_answer_user_input(
+                        str(pending.get("arguments") or "")
+                    )
+                    if choice_text is None:
+                        self._has_live_tool_calls = True
+                        for raw in pending.get("raw_events", []):
+                            yield raw.encode("utf-8")
+                        return
+                    self._auto_decision_emitted = True
+                    yield from self._emit_synthetic_assistant_message(choice_text)
+                    return
+                self._has_live_tool_calls = True
+            yield raw_event.encode("utf-8")
+            return
+
+        if ev_type == "response.completed":
+            if self._auto_user_input_enabled() and not self._auto_decision_emitted:
+                text_choice = _try_auto_answer_text_choice(self._assistant_text)
+                if text_choice is not None:
+                    self._auto_decision_emitted = True
+                    yield from self._emit_synthetic_assistant_message(text_choice)
+                else:
+                    classifier_choice = self._classifier_decision_text()
+                    if classifier_choice is not None:
+                        self._auto_decision_emitted = True
+                        yield from self._emit_synthetic_assistant_message(
+                            classifier_choice
+                        )
+            yield raw_event.encode("utf-8")
+            return
+
         if ev_type == "response.output_text.delta":
             item_id = str(data_obj.get("item_id", ""))
             delta = data_obj.get("delta", "")
@@ -357,6 +447,7 @@ class StreamTranslator:
             if not _PARTIAL_OPEN_RE.search(buf):
                 # Safe to flush everything as plain text.
                 self._buffers[item_id] = ""
+                self._append_assistant_text(buf)
                 yield self._build_event(
                     "response.output_text.delta",
                     {"type": "response.output_text.delta",
@@ -379,6 +470,7 @@ class StreamTranslator:
             head, mid, tail = _split_around_tool_calls(buf)
             self._buffers[item_id] = tail
             if head.strip():
+                self._append_assistant_text(head)
                 yield self._build_event(
                     "response.output_text.delta",
                     {"type": "response.output_text.delta",
@@ -392,6 +484,97 @@ class StreamTranslator:
 
         # All other event types: forward unchanged.
         yield raw_event.encode("utf-8")
+
+    def _classifier_decision_text(self) -> str | None:
+        enabled = self._auto_user_input_enabled()
+        no_tool_calls = not self._has_live_tool_calls
+        has_text = bool(self._assistant_text and self._assistant_text.strip())
+        try:
+            from tinyctx.proxy import _log
+            _log(
+                "classifier_gate",
+                enabled=enabled,
+                no_tool_calls=no_tool_calls,
+                has_text=has_text,
+                text_len=len(self._assistant_text),
+                will_run=(enabled and no_tool_calls and has_text),
+            )
+        except Exception:
+            pass
+        if not (enabled and no_tool_calls and has_text):
+            return None
+        classify = _classify_final_answer(self._assistant_text)
+        try:
+            from tinyctx.proxy import _log
+            _log("classifier_result", result=classify)
+        except Exception:
+            pass
+        if not (classify and classify.get("await_user")):
+            return None
+        options = classify.get("options") or []
+        cont = _ask_advisor_for_continuation(self._assistant_text, options)
+        return cont
+
+    def _append_assistant_text(self, text: str) -> None:
+        if not text:
+            return
+        self._assistant_text += text
+        if len(self._assistant_text) > 16_000:
+            self._assistant_text = self._assistant_text[-16_000:]
+
+    @staticmethod
+    def _auto_user_input_enabled() -> bool:
+        return os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") != "0"
+
+    def _emit_synthetic_assistant_message(self, text: str) -> Iterator[bytes]:
+        if not text:
+            return
+        self._synthetic_output_index += 1
+        oidx = self._synthetic_output_index
+        item_id = "msg_auto_" + uuid.uuid4().hex[:16]
+        yield self._build_event(
+            "response.output_item.added",
+            {"type": "response.output_item.added",
+             "output_index": oidx,
+             "item": {"id": item_id, "type": "message", "role": "assistant",
+                      "status": "in_progress", "content": []},
+             "sequence_number": self._next_seq()},
+        )
+        yield self._build_event(
+            "response.content_part.added",
+            {"type": "response.content_part.added",
+             "item_id": item_id, "output_index": oidx, "content_index": 0,
+             "part": {"type": "output_text", "text": ""},
+             "sequence_number": self._next_seq()},
+        )
+        yield self._build_event(
+            "response.output_text.delta",
+            {"type": "response.output_text.delta",
+             "item_id": item_id, "output_index": oidx, "content_index": 0,
+             "delta": text, "sequence_number": self._next_seq()},
+        )
+        yield self._build_event(
+            "response.output_text.done",
+            {"type": "response.output_text.done",
+             "item_id": item_id, "output_index": oidx, "content_index": 0,
+             "text": text, "sequence_number": self._next_seq()},
+        )
+        yield self._build_event(
+            "response.content_part.done",
+            {"type": "response.content_part.done",
+             "item_id": item_id, "output_index": oidx, "content_index": 0,
+             "part": {"type": "output_text", "text": text},
+             "sequence_number": self._next_seq()},
+        )
+        yield self._build_event(
+            "response.output_item.done",
+            {"type": "response.output_item.done",
+             "output_index": oidx,
+             "item": {"id": item_id, "type": "message", "role": "assistant",
+                      "status": "completed",
+                      "content": [{"type": "output_text", "text": text}]},
+             "sequence_number": self._next_seq()},
+        )
 
     # ────────── synthesized event builders ──────────
 

@@ -403,6 +403,191 @@ def test_auto_answer_skips_malformed_or_empty():
             _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved
 
 
+def _responses_event(event_name: str, payload: dict) -> bytes:
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload)}\n\n"
+    ).encode("utf-8")
+
+
+def test_stream_translator_intercepts_request_user_input_when_enabled():
+    import os as _os
+    import tinyctx.advisor as _adv
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _adv.call_advisor = lambda **kw: {
+        "text": "Q1: B — pick the safer reversible option.",
+        "usage": None,
+        "error": None,
+    }
+    try:
+        t = StreamTranslator()
+        args = json.dumps({
+            "questions": [{"header": "Pick A or B", "options": ["A", "B"]}]
+        })
+        events = [
+            _delta_event("Considering options..."),
+            _responses_event("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "name": "request_user_input",
+                    "arguments": "",
+                    "call_id": "fc_1",
+                },
+                "sequence_number": 1,
+            }),
+            _responses_event("response.function_call_arguments.delta", {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "delta": args,
+                "sequence_number": 2,
+            }),
+            _responses_event("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "arguments": args,
+                "sequence_number": 3,
+            }),
+            _responses_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": "request_user_input",
+                    "arguments": args,
+                    "call_id": "fc_1",
+                },
+                "sequence_number": 4,
+            }),
+            _responses_event("response.completed", {
+                "type": "response.completed",
+                "response": {"id": "resp_1", "status": "completed"},
+                "sequence_number": 5,
+            }),
+        ]
+        out = _events_to_str(b for e in events for b in t.feed(e))
+        out += _events_to_str(t.flush())
+        assert "advisor auto-decision" in out
+        assert "Q1: B" in out
+        assert "request_user_input" not in out
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_stream_translator_request_user_input_passthrough_when_disabled():
+    import os as _os
+    import tinyctx.advisor as _adv
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "0"
+    _adv.call_advisor = lambda **kw: {
+        "text": "SHOULD NOT BE USED",
+        "usage": None,
+        "error": None,
+    }
+    try:
+        t = StreamTranslator()
+        args = json.dumps({
+            "questions": [{"header": "Pick A or B", "options": ["A", "B"]}]
+        })
+        events = [
+            _responses_event("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_2",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "name": "request_user_input",
+                    "arguments": "",
+                    "call_id": "fc_2",
+                },
+                "sequence_number": 1,
+            }),
+            _responses_event("response.function_call_arguments.delta", {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_2",
+                "output_index": 1,
+                "delta": args,
+                "sequence_number": 2,
+            }),
+            _responses_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_2",
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": "request_user_input",
+                    "arguments": args,
+                    "call_id": "fc_2",
+                },
+                "sequence_number": 3,
+            }),
+        ]
+        out = _events_to_str(b for e in events for b in t.feed(e))
+        out += _events_to_str(t.flush())
+        assert "request_user_input" in out
+        assert "advisor auto-decision" not in out
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
+def test_stream_translator_text_choice_intercept_on_responses_completed():
+    import os as _os
+    import tinyctx.advisor as _adv
+
+    saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
+    saved_adv = _adv.call_advisor
+    _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
+    _adv.call_advisor = lambda **kw: {
+        "text": "Pick: A — fewer moving parts.",
+        "usage": None,
+        "error": None,
+    }
+    try:
+        t = StreamTranslator()
+        text = "请选择：\nA → 方案一\nB → 方案二"
+        events = [
+            _delta_event(text),
+            _responses_event("response.completed", {
+                "type": "response.completed",
+                "response": {"id": "resp_2", "status": "completed"},
+                "sequence_number": 9,
+            }),
+        ]
+        out = _events_to_str(b for e in events for b in t.feed(e))
+        out += _events_to_str(t.flush())
+        assert "advisor auto-decision" in out
+        assert "text-choice intercept" in out
+        assert "Pick: A" in out
+    finally:
+        if saved_env is None:
+            _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
+        else:
+            _os.environ["TINYCTX_AUTO_USER_INPUT"] = saved_env
+        _adv.call_advisor = saved_adv
+
+
 def test_detect_text_choice_chinese_arrow_format():
     """The exact format observed in the live RayNeo session — Chinese
     cue + A/B options with arrow markers — should be detected."""

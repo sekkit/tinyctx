@@ -991,6 +991,16 @@ class Config:
     # scanner works without this.
     auto_scout_install_graphify: bool = False
 
+    # Task Orchestrator: local-model task typing + Skill/MCP recommendation
+    # injection. Keeps the actual Codex tool execution unchanged; tinyctx
+    # only appends current-task guidance to instructions.
+    orchestrator_enabled: bool = True
+    orchestrator_min_confidence: float = 0.62
+    orchestrator_dynamic_skill_enabled: bool = True
+    orchestrator_dynamic_skill_min_confidence: float = 0.78
+    orchestrator_inject_max_chars: int = 2000
+    orchestrator_trace_decisions: bool = True
+
     # LLMLingua-2 pre-escalation prompt compression for the frontier path.
     # Microsoft's LLMLingua-2 (microsoft/LLMLingua, MIT) compresses tool-
     # result payloads before forwarding to the frontier model. Empirically
@@ -1113,6 +1123,18 @@ def load_config() -> Config:
         for k, v in (data.get("routing") or {}).items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
+        orch_map = {
+            "enabled": "orchestrator_enabled",
+            "min_confidence": "orchestrator_min_confidence",
+            "dynamic_skill_enabled": "orchestrator_dynamic_skill_enabled",
+            "dynamic_skill_min_confidence": "orchestrator_dynamic_skill_min_confidence",
+            "inject_max_chars": "orchestrator_inject_max_chars",
+            "trace_decisions": "orchestrator_trace_decisions",
+        }
+        for k, v in (data.get("orchestrator") or {}).items():
+            attr = orch_map.get(k)
+            if attr and hasattr(cfg, attr):
+                setattr(cfg, attr, v)
 
     # Step 3 — env overrides
     for env_key, attr in (
