@@ -30,6 +30,9 @@ import pytest
 def test_detect_gitnexus_returns_none_when_missing(monkeypatch):
     from tinyctx import mcp_registry
     monkeypatch.setattr("shutil.which", lambda c: None)
+    # Also disable fallback dir scan — otherwise a real gitnexus
+    # installed in ~/.local/node/bin would make detect succeed.
+    monkeypatch.setattr(mcp_registry, "_FALLBACK_BIN_DIRS", ())
     assert mcp_registry.detect_gitnexus() is None
 
 
@@ -69,6 +72,49 @@ def test_detect_all_combines_present_tools(monkeypatch):
     out = mcp_registry.detect_all()
     names = sorted(t.name for t in out)
     assert names == ["gitnexus", "graphify"]
+
+
+def test_which_with_fallbacks_falls_back_when_path_misses(monkeypatch, tmp_path):
+    """Regression: launchd-started proxy has $PATH that excludes
+    ~/.local/bin etc., so `shutil.which` returns None even when the
+    binary is installed. The fallback dir scan must catch it.
+    Live trace 2026-05-10 root cause."""
+    from tinyctx import mcp_registry
+    fake_dir = tmp_path / "user-local-bin"
+    fake_dir.mkdir()
+    fake_bin = fake_dir / "gitnexus"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n")
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr("shutil.which", lambda c: None)
+    monkeypatch.setattr(mcp_registry, "_FALLBACK_BIN_DIRS",
+                         (str(fake_dir),))
+    found = mcp_registry._which_with_fallbacks("gitnexus")
+    assert found == str(fake_bin)
+    # Full detect picks it up
+    t = mcp_registry.detect_gitnexus()
+    assert t is not None
+    assert t.binary_path == str(fake_bin)
+
+
+def test_which_with_fallbacks_returns_none_when_truly_absent(monkeypatch):
+    from tinyctx import mcp_registry
+    monkeypatch.setattr("shutil.which", lambda c: None)
+    monkeypatch.setattr(mcp_registry, "_FALLBACK_BIN_DIRS", ())
+    assert mcp_registry._which_with_fallbacks("definitely-not-installed") is None
+
+
+def test_which_with_fallbacks_skips_non_executable(monkeypatch, tmp_path):
+    """A file at the candidate path that lacks +x must NOT count —
+    otherwise we'd return a path the user can't execute."""
+    from tinyctx import mcp_registry
+    fake_dir = tmp_path / "bin"
+    fake_dir.mkdir()
+    no_exec = fake_dir / "graphify"
+    no_exec.write_text("not executable")
+    no_exec.chmod(0o644)  # no +x
+    monkeypatch.setattr("shutil.which", lambda c: None)
+    monkeypatch.setattr(mcp_registry, "_FALLBACK_BIN_DIRS", (str(fake_dir),))
+    assert mcp_registry._which_with_fallbacks("graphify") is None
 
 
 # ─── config writer ──────────────────────────────────────────────────────────
@@ -233,6 +279,8 @@ def test_unregister_no_op_when_no_managed_block(tmp_path):
 def test_bootstrap_logs_when_no_tools_present(monkeypatch, tmp_path):
     from tinyctx import mcp_registry
     monkeypatch.setattr("shutil.which", lambda c: None)
+    # Disable fallback so detect can't accidentally find a real install
+    monkeypatch.setattr(mcp_registry, "_FALLBACK_BIN_DIRS", ())
     events: list = []
     def lf(ev, **fields): events.append((ev, fields))
     out = mcp_registry.bootstrap(config_path=tmp_path / "x.toml", log_fn=lf)

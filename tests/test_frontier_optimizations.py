@@ -148,6 +148,79 @@ def test_trim_tools_recent_window_respected():
 
 # --- end-to-end: confirm the trim accomplishes a meaningful byte savings ---
 
+def test_frontier_trim_tools_disabled_by_default():
+    """User directive 2026-05-10: trim disabled by default. Even after
+    fixing essentials list, trimming creates a class of rare-tool-
+    starvation bugs (any tool not in essentials AND not in recent window
+    is silently invisible). Cost: ~10k extra tokens per frontier
+    request — user accepts this for full tool availability."""
+    from tinyctx.config import Config
+    cfg = Config()
+    assert cfg.frontier_trim_tools is False, (
+        "frontier_trim_tools must default to False — re-enabling without "
+        "the user's directive risks the spawn_agent / advisor-trim class "
+        "of bugs (live trace 2026-05-10).")
+
+
+def test_trim_tools_default_essentials_keep_spawn_agent():
+    """Regression test for 2026-05-10: spawn_agent / wait_agent / etc.
+    were absent from `frontier_tools_essentials` defaults, so even though
+    the user had multi_agent=true + [agents.advisor] registered, the
+    advisor agent was unreachable on frontier route — `spawn_agent`
+    silently dropped every turn (chicken-and-egg: agent never used it,
+    so trim never kept it). Defaults must include the codex 0.128+
+    multi-agent protocol tool names verbatim."""
+    from tinyctx.config import Config
+    cfg = Config()
+    essentials = set(cfg.frontier_tools_essentials)
+    # Multi-agent protocol — spawn / wait are minimum viable; close /
+    # resume are kept for symmetry.
+    assert "spawn_agent" in essentials
+    assert "wait_agent" in essentials
+    assert "close_agent" in essentials
+    assert "resume_agent" in essentials
+    # User-input request channel — without it, the agent has no
+    # legit clarification path and falls back to plain text (which
+    # soft_completion classifier flags as a punt).
+    assert "request_user_input" in essentials
+
+
+def test_trim_tools_keeps_spawn_agent_even_when_unused():
+    """Regression test: with the new defaults, spawn_agent must survive
+    trimming even when it never appears in body.input — that's the
+    chicken-and-egg fix."""
+    from tinyctx.config import Config
+    cfg = Config()
+    body = {
+        "tools": [
+            _make_tool("shell"),
+            _make_tool("apply_patch"),
+            _make_tool("spawn_agent"),
+            _make_tool("wait_agent"),
+            _make_tool("mcp__youtube__search"),  # never used → should drop
+            _make_tool("mcp__notion__create_page"),  # never used → should drop
+        ],
+        "input": [
+            # User asked something; agent has not yet called any tool.
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text",
+                          "text": "this needs careful thought"}]},
+        ],
+    }
+    out, info = trim_tools_for_frontier(
+        body, recent_window=10,
+        essentials=cfg.frontier_tools_essentials,
+    )
+    kept = set(info["kept_names"])
+    assert "spawn_agent" in kept, (
+        "spawn_agent must be kept even when unused — otherwise advisor "
+        "is unreachable forever (the bug we just fixed)")
+    assert "wait_agent" in kept
+    # Never-used non-essentials still dropped — trim still working
+    assert "mcp__youtube__search" not in kept
+    assert "mcp__notion__create_page" not in kept
+
+
 def test_trim_tools_bytes_savings_realistic():
     """Sanity: trimming 50 → 5 tools where each tool is ~200-byte description
     yields a measurable shrink. Not a strict assertion on exact bytes —

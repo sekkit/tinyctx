@@ -190,14 +190,14 @@ def compression_pagerank(
     nodes (Aider-style chat-token personalization), composed multiplicatively
     with J0.
     """
+    if not nodes:
+        return {}
     compute_unwrapped(nodes)
     compute_compression(nodes)
     compute_j0(nodes, beta=beta)
 
     ids = list(nodes.keys())
     n = len(ids)
-    if n == 0:
-        return {}
     idx = {nid: i for i, nid in enumerate(ids)}
 
     # Out-edges (each ref counts as 1; could be weighted by reference multiplicity).

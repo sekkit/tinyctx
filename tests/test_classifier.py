@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 
 from tinyctx.classifier import (
     FEATURE_ORDER, Features, Model, extract_features, train, load_jsonl,
+    _sigmoid, _fit_standardization, model_path, main,
 )
 
 
@@ -133,6 +134,240 @@ def test_router_uses_classifier_when_present():
             mp.write_text(backup)
         router_mod._CLASSIFIER = None
         router_mod._CLASSIFIER_LOADED = False
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: feature-extraction edge cases, score boundaries,
+# fallback paths, CLI behaviour, and Config integration.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_features_empty_body_defaults():
+    """An empty dict should produce a Features instance whose every field is
+    zero (or 0.0 in the case of code_density, which is computed)."""
+    f = extract_features({})
+    assert f.est_tokens == 0.0
+    assert f.log_est_tokens == 0.0
+    assert f.turn_count == 0.0
+    assert f.error_streak == 0.0
+    assert f.is_compaction == 0.0
+    assert f.tool_call_count == 0.0
+    assert f.max_message_chars == 0.0
+    assert f.code_density == 0.0
+    assert f.has_apply_patch == 0.0
+    assert f.has_image == 0.0
+    assert f.instructions_chars == 0.0
+    assert f.to_vector() == [0.0] * len(FEATURE_ORDER)
+
+
+def test_extract_features_handles_non_string_instructions_and_non_list_tools():
+    """Non-string instructions and non-list tools should be silently ignored
+    rather than raising — extract_features must be defensive."""
+    body = {"instructions": {"unexpected": "dict"}, "tools": "not a list"}
+    f = extract_features(body)
+    assert f.instructions_chars == 0.0
+    assert f.has_apply_patch == 0.0
+
+
+def test_extract_features_skips_non_dict_items_and_finds_image_url():
+    """Items that aren't dicts must be skipped; image_url-typed parts must
+    still set has_image."""
+    body = {
+        "input": [
+            "stray-string-not-a-dict",
+            42,
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": "http://x"},
+                {"type": "output_text", "text": "plain text"},
+            ]},
+        ],
+    }
+    f = extract_features(body)
+    assert f.has_image == 1.0
+    assert f.max_message_chars == float(len("plain text"))
+
+
+def test_extract_features_code_density_heuristic_picks_up_def_and_semicolon():
+    """code_density should fire on `    def ` or `;` even without triple
+    backticks — and equal 1.0 when every char is in a code-tagged message."""
+    body = {
+        "input": [
+            {"role": "user", "content": "    def helper():\n        return 1"},
+        ],
+    }
+    f = extract_features(body)
+    assert f.code_density == 1.0
+
+
+def test_extract_features_is_compaction_flag_propagates():
+    f = extract_features({}, is_compaction=True)
+    assert f.is_compaction == 1.0
+
+
+def test_sigmoid_boundary_values():
+    """_sigmoid should be 0.5 at z=0 and asymptote to 1.0 / 0.0 for large
+    magnitudes — both branches of the implementation are exercised."""
+    assert math.isclose(_sigmoid(0.0), 0.5, abs_tol=1e-12)
+    assert _sigmoid(50.0) > 0.999_999
+    assert _sigmoid(-50.0) < 1e-6
+    # Branch coverage: positive z and negative z each must produce a value
+    # in (0, 1).
+    assert 0.0 < _sigmoid(5.0) < 1.0
+    assert 0.0 < _sigmoid(-5.0) < 1.0
+
+
+def test_model_predict_threshold_boundary_exact_and_extremes():
+    """Predict must return 1 iff probability >= threshold — boundary
+    inclusive on the high side, exclusive on the low side."""
+    # Construct a model whose predict_proba(0-vector) is exactly 0.5.
+    m = Model(weights=[0.0] * len(FEATURE_ORDER), bias=0.0,
+              feature_means=[0.0] * len(FEATURE_ORDER),
+              feature_stds=[1.0] * len(FEATURE_ORDER))
+    x = [0.0] * len(FEATURE_ORDER)
+    assert math.isclose(m.predict_proba(x), 0.5, abs_tol=1e-12)
+    # threshold == probability => predict 1 (>=)
+    assert m.predict(x, threshold=0.5) == 1
+    # threshold just above => predict 0
+    assert m.predict(x, threshold=0.5 + 1e-9) == 0
+    # threshold == 0.0 always 1, threshold == 1.0 only if prob>=1.0
+    assert m.predict(x, threshold=0.0) == 1
+    assert m.predict(x, threshold=1.0) == 0
+
+
+def test_model_standardize_handles_zero_std():
+    """A zero feature_std should be replaced by 1.0 to avoid divide-by-zero."""
+    m = Model(weights=[1.0] * len(FEATURE_ORDER), bias=0.0,
+              feature_means=[0.0] * len(FEATURE_ORDER),
+              feature_stds=[0.0] * len(FEATURE_ORDER))
+    z = m.standardize([7.0] * len(FEATURE_ORDER))
+    # zero std -> divisor becomes 1.0, value passes through unchanged.
+    assert z == [7.0] * len(FEATURE_ORDER)
+
+
+def test_train_empty_inputs_returns_default_model():
+    m = train([], [])
+    assert isinstance(m, Model)
+    assert m.n_train == 0
+    assert m.weights == [0.0] * len(FEATURE_ORDER)
+    assert m.bias == 0.0
+
+
+def test_fit_standardization_constant_column_uses_unit_std():
+    """When every value in a column is identical, variance is zero — the
+    helper must coerce std to 1.0 so callers don't divide by zero."""
+    X = [[5.0, 1.0], [5.0, 2.0], [5.0, 3.0]]
+    means, stds = _fit_standardization(X)
+    assert means[0] == 5.0
+    assert stds[0] == 1.0
+    assert math.isclose(means[1], 2.0, abs_tol=1e-12)
+    assert stds[1] > 0
+
+
+def test_load_jsonl_skips_malformed_and_missing_features():
+    """Malformed JSON, blank lines and rows without a dict `features` field
+    must be silently dropped without raising."""
+    with TemporaryDirectory() as td:
+        p = Path(td) / "labels.jsonl"
+        p.write_text(
+            "\n"
+            "not valid json at all\n"
+            + json.dumps({"features": "not-a-dict", "label": 1}) + "\n"
+            + json.dumps({"features": {"est_tokens": 5}, "label": 0}) + "\n"
+            + json.dumps({"features": {"est_tokens": 9}}) + "\n"  # missing label -> 0
+        )
+        X, y = load_jsonl(p)
+        assert len(X) == 2
+        assert y == [0, 0]
+        assert X[0][FEATURE_ORDER.index("est_tokens")] == 5.0
+        assert X[1][FEATURE_ORDER.index("est_tokens")] == 9.0
+
+
+def test_model_path_lives_under_home_tinyctx():
+    """The default model path must live in ~/.tinyctx and be a Path object."""
+    p = model_path()
+    assert isinstance(p, Path)
+    assert p.name == "classifier.json"
+    assert p.parent.name == ".tinyctx"
+    assert p.parent.parent == Path.home()
+
+
+def test_router_falls_back_to_heuristic_when_classifier_file_missing():
+    """If no model file exists at the expected path, router.decide must
+    silently fall back to the heuristic and never raise."""
+    from tinyctx import router as router_mod
+    from tinyctx.classifier import model_path
+    mp = model_path()
+    backup = mp.read_text() if mp.exists() else None
+    try:
+        if mp.exists():
+            mp.unlink()
+        router_mod._CLASSIFIER = None
+        router_mod._CLASSIFIER_LOADED = False
+        from tinyctx.config import Config
+        cfg = Config()
+        body = {
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "hi"}],
+        }
+        d = router_mod.decide(body, cfg)
+        # No model -> heuristic-only path; small request stays local.
+        assert d.route == "local"
+    finally:
+        if backup is not None:
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            mp.write_text(backup)
+        router_mod._CLASSIFIER = None
+        router_mod._CLASSIFIER_LOADED = False
+
+
+def test_config_self_classify_threshold_default_is_07():
+    """The Config default for self_classify_threshold must be 0.7 — proxy.py
+    reads this to gate self-classification escalation."""
+    from tinyctx.config import Config
+    cfg = Config()
+    assert isinstance(cfg.self_classify_threshold, float)
+    assert math.isclose(cfg.self_classify_threshold, 0.7, abs_tol=1e-9)
+
+
+def test_main_cli_train_then_predict_roundtrip(capsys):
+    """The CLI `train` then `predict` commands should round-trip without
+    error and emit a probability in [0, 1]."""
+    with TemporaryDirectory() as td:
+        labels = Path(td) / "labels.jsonl"
+        labels.write_text(
+            json.dumps({"features": {"est_tokens": 10}, "label": 0}) + "\n"
+            + json.dumps({"features": {"est_tokens": 80_000}, "label": 1}) + "\n"
+        )
+        out = Path(td) / "model.json"
+        rc = main(["train", str(labels), "--output", str(out), "--epochs", "5"])
+        assert rc == 0
+        assert out.is_file()
+        # Verify the persisted JSON is a valid Model.
+        m = Model.from_json(out.read_text())
+        assert m.n_train == 2
+
+        rc = main(["predict", "est_tokens=50000", "--model", str(out)])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "p(escalate)=" in captured.out
+        assert "pred=" in captured.out
+
+
+def test_main_cli_predict_handles_non_numeric_value(capsys):
+    """When a predict feature value isn't numeric, the CLI must coerce to
+    0.0 rather than raise."""
+    with TemporaryDirectory() as td:
+        m = Model(weights=[0.0] * len(FEATURE_ORDER), bias=0.0,
+                  feature_means=[0.0] * len(FEATURE_ORDER),
+                  feature_stds=[1.0] * len(FEATURE_ORDER), n_train=1)
+        out = Path(td) / "model.json"
+        out.write_text(m.to_json())
+        rc = main(["predict", "est_tokens=not-a-number", "--model", str(out)])
+        assert rc == 0
+        captured = capsys.readouterr()
+        # bias=0, weights=0, x=0 => prob=0.5 -> pred=frontier (>=0.5)
+        assert "p(escalate)=0.5000" in captured.out
+        assert "pred=frontier" in captured.out
 
 
 if __name__ == "__main__":

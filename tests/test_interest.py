@@ -14,11 +14,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tinyctx.interest import (
+    _normalize_log,
     compression_pagerank,
     compute_compression,
     compute_j0,
     compute_unwrapped,
     load_graph,
+    main,
     rank_for_query,
     Node,
 )
@@ -121,6 +123,161 @@ def test_load_graph_roundtrip():
         nodes = load_graph(str(path))
         assert set(nodes) == {"a", "b"}
         assert nodes["a"].deps == ["b"]
+
+
+def test_pagerank_empty_graph_returns_empty_dict():
+    assert compression_pagerank({}) == {}
+
+
+def test_pagerank_single_node_gets_full_mass():
+    only = Node("solo", wrapped_sig=3, wrapped_body=5, deps=[])
+    nodes = _g(only)
+    pr = compression_pagerank(nodes, iterations=20)
+    assert set(pr) == {"solo"}
+    assert abs(pr["solo"] - 1.0) < 1e-9
+
+
+def test_pagerank_is_deterministic():
+    """Same input must produce same ranks (no RNG, no dict-iteration entropy)."""
+    p = Node("p", 1, 0, [])
+    a = Node("a", 2, 0, ["p", "p"])
+    b = Node("b", 2, 0, ["a"])
+    c = Node("c", 2, 0, ["a", "b"])
+    nodes_a = _g(p, a, b, c)
+    nodes_b = _g(p, a, b, c)
+    # compression_pagerank mutates nodes; rebuild to be fair.
+    pr1 = compression_pagerank(nodes_a, iterations=40)
+    pr2 = compression_pagerank(nodes_b, iterations=40)
+    assert pr1 == pr2
+
+
+def test_normalize_log_all_equal_returns_half():
+    """When max == min, normalization can't divide by zero; spec is to return 0.5."""
+    assert _normalize_log([0.0, 0.0, 0.0]) == [0.5, 0.5, 0.5]
+    assert _normalize_log([7.5, 7.5]) == [0.5, 0.5]
+
+
+def test_normalize_log_min_max_endpoints():
+    """Smallest input maps to 0.0; largest maps to 1.0."""
+    out = _normalize_log([0.0, 1.0, 1000.0])
+    assert out[0] == 0.0
+    assert out[-1] == 1.0
+    # middle value strictly between endpoints
+    assert 0.0 < out[1] < 1.0
+
+
+def test_compute_unwrapped_handles_cycles_without_crashing():
+    """Cycles are tolerated; the module's docstring acknowledges this."""
+    a = Node("a", 1, 0, ["b"])
+    b = Node("b", 1, 0, ["c"])
+    c = Node("c", 1, 0, ["a"])
+    nodes = _g(a, b, c)
+    compute_unwrapped(nodes)  # must not raise / recurse forever
+    # every node got a non-zero unwrapped_sig
+    for nid in ("a", "b", "c"):
+        assert nodes[nid].unwrapped_sig >= 1
+
+
+def test_compute_unwrapped_unknown_dep_treated_as_primitive():
+    a = Node("a", 1, 0, ["nope_does_not_exist"])
+    nodes = _g(a)
+    compute_unwrapped(nodes)
+    # wrapped_sig=1 + 1 (unknown dep treated as primitive of length 1)
+    assert nodes["a"].unwrapped_sig == 2
+
+
+def test_beta_extremes_change_j0_weighting():
+    """beta=1.0 -> j0 == normalized(t0); beta=0.0 -> j0 == normalized(i0)."""
+    p = Node("p", 1, 0, [])
+    deep_chain = Node("deep", 2, 0, ["p"] * 20)        # high T0, modest I0
+    fat_body = Node("fat", 2, 200, [])                  # tiny T0, high I0
+    nodes = _g(p, deep_chain, fat_body)
+    compute_unwrapped(nodes)
+    compute_compression(nodes)
+    # beta=1: j0 dominated by T0 normalization, so 'deep' ranks above 'fat'
+    compute_j0(nodes, beta=1.0)
+    j_deep_t = nodes["deep"].j0
+    j_fat_t = nodes["fat"].j0
+    # beta=0: j0 dominated by I0 normalization, so 'fat' ranks above 'deep'
+    compute_j0(nodes, beta=0.0)
+    j_deep_i = nodes["deep"].j0
+    j_fat_i = nodes["fat"].j0
+    assert j_deep_t > j_fat_t, f"beta=1 should favour deep: {j_deep_t} vs {j_fat_t}"
+    assert j_fat_i > j_deep_i, f"beta=0 should favour fat: {j_fat_i} vs {j_deep_i}"
+
+
+def test_load_graph_default_field_values():
+    """Missing wrapped_signature/wrapped_body/deps fall back to documented defaults."""
+    with TemporaryDirectory() as td:
+        path = Path(td) / "graph.json"
+        path.write_text(json.dumps({"nodes": [{"id": "minimal"}]}))
+        nodes = load_graph(str(path))
+        assert nodes["minimal"].wrapped_sig == 1   # default wrapped_signature
+        assert nodes["minimal"].wrapped_body == 0
+        assert nodes["minimal"].deps == []
+
+
+def test_rank_for_query_empty_query_falls_back_to_unbiased():
+    """No query tokens => no seed personalization, but ranking still works."""
+    p = Node("p", 1, 0, [])
+    a = Node("a", 2, 0, ["p"])
+    b = Node("b", 2, 0, ["a"])
+    nodes = _g(p, a, b)
+    ranked = rank_for_query(nodes, [], budget=3)
+    assert len(ranked) == 3
+    # ranks form a probability distribution (no seed -> still teleports via J0)
+    total = sum(score for _, score in ranked)
+    assert 0.99 < total < 1.01
+
+
+def test_rank_for_query_filters_blank_strings():
+    """Empty/whitespace tokens are dropped; only non-empty strings personalize."""
+    p = Node("p", 1, 0, [])
+    a = Node("alpha_node", 2, 0, ["p"] * 5)
+    b = Node("beta_node", 2, 0, ["p"] * 5)
+    nodes = _g(p, a, b)
+    # Empty strings get filtered out by `if q` so this behaves like no-query.
+    ranked_blank = rank_for_query(nodes, ["", "", ""], budget=3)
+    ranked_none = rank_for_query(nodes, [], budget=3)
+    # rebuild fresh nodes since compression_pagerank mutates
+    p2 = Node("p", 1, 0, [])
+    a2 = Node("alpha_node", 2, 0, ["p"] * 5)
+    b2 = Node("beta_node", 2, 0, ["p"] * 5)
+    nodes2 = _g(p2, a2, b2)
+    ranked_none = rank_for_query(nodes2, [], budget=3)
+    assert dict(ranked_blank) == dict(ranked_none)
+
+
+def test_main_cli_no_args_returns_exit_code_2(capsys):
+    rc = main([])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "usage" in err.lower()
+
+
+def test_main_cli_with_empty_graph_returns_1(capsys, tmp_path):
+    p = tmp_path / "empty.json"
+    p.write_text(json.dumps({"nodes": []}))
+    rc = main([str(p)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "no nodes" in err.lower()
+
+
+def test_main_cli_runs_and_prints_ranking(capsys, tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({
+        "nodes": [
+            {"id": "src/a.py:foo", "wrapped_signature": 3, "wrapped_body": 0, "deps": ["b"]},
+            {"id": "b", "wrapped_signature": 1, "wrapped_body": 0, "deps": []},
+        ]
+    }))
+    rc = main([str(p), "foo"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # Both node ids appear, query-personalized one ranks high.
+    assert "src/a.py:foo" in out
+    assert "T0=" in out and "I0=" in out
 
 
 if __name__ == "__main__":
