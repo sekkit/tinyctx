@@ -39,9 +39,10 @@ codex CLI ──HTTP──▶ tinyctx-proxy (FastAPI, 127.0.0.1:4141)
 | `force_route=local/frontier` | 强制 | 配置或环境变量 |
 | 检测到 codex compaction handoff prompt | local | `_COMPACTION_FINGERPRINTS` 三个正则 |
 | `error_streak ≥ escalate_on_error_streak` | frontier | per-session 错误连击计数 |
+| local rolling failure rate ≥ `adaptive_model_failure_rate_threshold` | frontier | SmallCode-style adaptive model select（默认 3 calls / 30% / 20-sample window） |
 | `est_tokens ≥ local.context_window × safe_fraction` | frontier | 优先使用 backend 自带上下文窗口（动态），没设则退回 `escalate_input_tokens` 绝对值 |
 | `turn_count ≥ escalate_turn_count` | frontier | 对话轮数门槛 |
-| 学得分类器 `p(escalate) ≥ 0.7` | frontier | 可选，见 §11 |
+| 学得分类器 `p(escalate) ≥ 0.7` | local/advisor-only（默认）或 frontier（legacy 开关） | 可选，见 §11 |
 | 默认 | local | "small/short → cheap path" |
 
 `is_compaction_request()` 是高杠杆关键：把 codex 的 handoff summary 调用本身从 frontier 改路到 local，省掉一大笔 frontier 计费。
@@ -63,6 +64,7 @@ codex CLI ──HTTP──▶ tinyctx-proxy (FastAPI, 127.0.0.1:4141)
 ### 2.4 Per-session 状态
 
 - `_SESSION_ERROR_STREAK`：错误连击；HTTP ≥400 / 网络错 +1，正常 +0；高于阈值触发 frontier 升级
+- `adaptive_model.STATE`：按 backend key 维护 local 最近 N 次成功/失败；失败率过高时自动把 `auto` 请求切到 frontier，显式 `tinyctx-local` 仍优先
 - `_MUTATOR`：`CacheAwareMutator`，控制 history-mutation 的 cache 友好门控（见 §4.4）
 - `_PROACTIVE_SUMMARY_CACHE`：proactive_compact 的 bucket 化 summary 缓存
 
@@ -502,6 +504,7 @@ shell 脚本（[scripts/](scripts)）：
 `plugin.json`（marketplace 清单）：
 - `model_providers.tinyctx`：base_url=127.0.0.1:4141/v1，wire_api="responses"，retries 4/10
 - `profiles.tinyctx`：使用上面 provider，model=`tinyctx-auto`，context_window=400000，auto_compact_token_limit=64000
+- `profiles.tinyctx-goal`：长时间 `/goal` 专用 profile，启用 `features.goals`，context_window=1050000，auto_compact_token_limit=997500，`approval_policy=never`，`sandbox_mode=danger-full-access`
 - 兼容 codex >= 0.124.0
 - 加载 `hooks/hooks.json`
 

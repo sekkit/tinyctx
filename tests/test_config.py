@@ -74,6 +74,7 @@ def test_backendcfg_minimal_defaults() -> None:
     bc = BackendCfg(base_url="https://example.com")
     assert bc.base_url == "https://example.com"
     assert bc.api_key_env is None
+    assert bc.forward_authorization is True
     assert bc.model == ""
     assert bc.wire_api == "responses"
     assert bc.timeout_s == 300.0
@@ -120,6 +121,10 @@ def test_config_routing_thresholds_disabled_by_default() -> None:
     assert cfg.escalate_input_tokens == 0
     assert cfg.escalate_turn_count == 0
     assert cfg.escalate_on_error_streak == 2
+    assert cfg.adaptive_model_enabled is True
+    assert cfg.adaptive_model_min_calls == 3
+    assert cfg.adaptive_model_failure_rate_threshold == 0.3
+    assert cfg.adaptive_model_sample_size == 20
 
 
 def test_config_compaction_redirect_defaults_on() -> None:
@@ -143,6 +148,9 @@ def test_config_sanitize_defaults() -> None:
     assert cfg.sanitize_encrypted_content is True
     assert cfg.dedup_tool_calls is False
     assert cfg.purge_failed_tool_inputs is False
+    assert cfg.result_shrink_enabled is True
+    assert cfg.result_shrink_after_turns == 1
+    assert cfg.result_shrink_min_bytes == 12_000
     assert cfg.failed_input_after_turns == 4
     assert cfg.mutation_ttl_s == 300.0
     assert cfg.mutation_threshold == 0.65
@@ -202,6 +210,7 @@ def test_config_self_classify_defaults() -> None:
     cfg = Config()
     assert cfg.self_classify_enabled is True
     assert cfg.self_classify_threshold == 0.7
+    assert cfg.self_classify_escalates_to_frontier is False
     assert cfg.self_classify_timeout_s == 30.0
 
 
@@ -393,6 +402,7 @@ def test_config_local_backend_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = Config()
     assert cfg.local.base_url == "http://127.0.0.1:1234/v1"
     assert cfg.local.api_key_env == "TINYCTX_LOCAL_API_KEY"
+    assert cfg.local.forward_authorization is False
     assert cfg.local.model == "qwen3.6-27b"
     assert cfg.local.wire_api == "chat"
     assert cfg.local.timeout_s == 180.0
@@ -503,10 +513,12 @@ def _isolate_load_config(
     """Point HOME at a clean tmp dir and clear TINYCTX_* knobs so the
     test starts from defaults."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("TINYCTX_CONFIG", raising=False)
     monkeypatch.delenv("TINYCTX_LOG_DIR", raising=False)
     monkeypatch.delenv("TINYCTX_FORCE_ROUTE", raising=False)
     monkeypatch.delenv("TINYCTX_VERBOSE", raising=False)
+    monkeypatch.delenv("TINYCTX_ADAPTIVE_MODEL_ENABLED", raising=False)
     _clear_backend_env(monkeypatch)
     return tmp_path
 
@@ -553,6 +565,7 @@ frontier_trim_tools = true
 [local]
 base_url = "http://lan-host:1234/v1"
 model = "custom-local"
+forward_authorization = true
 
 [frontier]
 base_url = "https://example.com/v1"
@@ -573,6 +586,7 @@ escalate_input_tokens = 60000
     # [local]
     assert cfg.local.base_url == "http://lan-host:1234/v1"
     assert cfg.local.model == "custom-local"
+    assert cfg.local.forward_authorization is True
     # [frontier]
     assert cfg.frontier.base_url == "https://example.com/v1"
     assert cfg.frontier.context_window == 500_000
@@ -637,6 +651,15 @@ def test_load_config_force_route_env(
     monkeypatch.setenv("TINYCTX_FORCE_ROUTE", "local")
     cfg = load_config()
     assert cfg.force_route == "local"
+
+
+def test_load_config_adaptive_model_env_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate_load_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("TINYCTX_ADAPTIVE_MODEL_ENABLED", "0")
+    cfg = load_config()
+    assert cfg.adaptive_model_enabled is False
 
 
 def test_load_config_verbose_env_zero(
@@ -706,7 +729,13 @@ def test_routing_namespace_reads_top_level_defaults() -> None:
     assert cfg.routing.escalate_on_error_streak == cfg.escalate_on_error_streak
     assert cfg.routing.escalate_input_tokens == cfg.escalate_input_tokens
     assert cfg.routing.redirect_compaction_to_local is cfg.redirect_compaction_to_local
+    assert cfg.routing.adaptive_model_enabled is cfg.adaptive_model_enabled
+    assert cfg.routing.adaptive_model_min_calls == cfg.adaptive_model_min_calls
     assert cfg.routing.self_classify_threshold == cfg.self_classify_threshold
+    assert (
+        cfg.routing.self_classify_escalates_to_frontier
+        is cfg.self_classify_escalates_to_frontier
+    )
 
 
 def test_routing_namespace_write_propagates_to_top_level() -> None:
@@ -717,6 +746,10 @@ def test_routing_namespace_write_propagates_to_top_level() -> None:
     assert cfg.force_route == "frontier"
     cfg.routing.escalate_input_tokens = 12345
     assert cfg.escalate_input_tokens == 12345
+    cfg.routing.adaptive_model_enabled = False
+    assert cfg.adaptive_model_enabled is False
+    cfg.routing.self_classify_escalates_to_frontier = True
+    assert cfg.self_classify_escalates_to_frontier is True
 
 
 def test_routing_top_level_write_visible_via_namespace() -> None:
@@ -728,6 +761,10 @@ def test_routing_top_level_write_visible_via_namespace() -> None:
     assert cfg.routing.force_route == "local"
     cfg.redirect_compaction_to_local = False
     assert cfg.routing.redirect_compaction_to_local is False
+    cfg.adaptive_model_min_calls = 9
+    assert cfg.routing.adaptive_model_min_calls == 9
+    cfg.self_classify_escalates_to_frontier = True
+    assert cfg.routing.self_classify_escalates_to_frontier is True
 
 
 def test_stall_namespace_reads_and_writes() -> None:

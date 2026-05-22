@@ -108,7 +108,7 @@ def test_mark_timestamp_advances_with_time():
     from tinyctx import session_state as ss
     ss.reset_all()
     ss.mark_timestamp("c1", "ns", "evt")
-    time.sleep(0.02)
+    time.sleep(0.05)
     elapsed = ss.seconds_since("c1", "ns", "evt")
     assert elapsed >= 0.02
 

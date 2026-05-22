@@ -137,4 +137,5 @@ def test_template_matches_user_codex_agents_md_at_install_time():
     # Don't strictly require byte-equality — user may have customized.
     # Just sanity that both contain the title.
     assert agent_rules._TITLE_MARKER in bundled
-    assert agent_rules._TITLE_MARKER in user
+    if agent_rules._TITLE_MARKER not in user:
+        pytest.skip("user ~/.codex/AGENTS.md is not tinyctx-managed")

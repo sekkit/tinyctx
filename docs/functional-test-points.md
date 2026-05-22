@@ -7,7 +7,7 @@ file is added.
 
 ## Routing and Proxy
 
-- **Route decision engine** — local/frontier decisions, compaction routing, token/turn thresholds, classifier fallback, self-classify escalation, and model capability defaults. Covered by `tests/test_router.py`, `tests/test_dynamic_thresholds.py`, `tests/test_classifier.py`, `tests/test_self_classify.py`.
+- **Route decision engine** — local/frontier decisions, compaction routing, token/turn thresholds, adaptive local-failure routing, classifier fallback, advisor-only self-classify recommendations, and model capability defaults. Covered by `tests/test_router.py`, `tests/test_dynamic_thresholds.py`, `tests/test_classifier.py`, `tests/test_self_classify.py`, `tests/test_adaptive_model.py`.
 - **Proxy forwarding contract** — `/v1/responses`, `/v1/chat/completions`, forced route model IDs, encrypted reasoning scrub, local/frontier fake-backend routing, retry policy, and compactor fallback behavior. Covered by `tests/test_proxy_integration.py`, `tests/test_proxy_retry.py`, `tests/test_proxy_compactor_integration.py`.
 - **Frontier optimization path** — frontier-only tool trimming, advisor-hint suppression, and proactive compaction discipline for expensive models. Covered by `tests/test_frontier_optimizations.py`, `tests/test_proactive_compact.py`.
 - **LMCache passthrough path** — opt-in preservation of `prompt_cache_key` for external vLLM/SGLang+LMCache stacks while default strict-backend stripping remains unchanged. Covered by `tests/test_lmcache_passthrough.py`.

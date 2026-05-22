@@ -53,6 +53,10 @@ class RequestTrace:
     error_streak: int = 0
     requested_model: str = ""
     forced_by_client_model: bool = False
+    adaptive_model_calls: int = 0
+    adaptive_model_failures: int = 0
+    adaptive_model_failure_rate: float = 0.0
+    adaptive_model_triggered: bool = False
 
     # sanitize / scrub / inject — counts and diffs
     encrypted_content_stripped: int = 0
@@ -85,6 +89,9 @@ class RequestTrace:
     bytes_out: int = 0
     translated: bool = False
     translated_calls: int = 0
+    prompt_cache_hit_tokens: int = 0
+    prompt_cache_miss_tokens: int = 0
+    prompt_cache_hit_ratio: float = 0.0
 
     # timing
     elapsed_s: float = 0.0
@@ -336,6 +343,10 @@ def render_verbose(t: RequestTrace) -> str:
         f"  ROUTE        {t.route:<10}  reason: {t.route_reason}",
         f"  TOKENS       est={t.est_input_tokens}  turns={t.turn_count}  "
         f"error_streak={t.error_streak}",
+        f"  ADAPTIVE     calls={t.adaptive_model_calls}  "
+        f"failures={t.adaptive_model_failures}  "
+        f"failure_rate={t.adaptive_model_failure_rate:.0%}  "
+        f"triggered={t.adaptive_model_triggered}",
         f"  COMPACTION   {'yes' if t.is_compaction else 'no'}",
         f"  REQUESTED    model={t.requested_model!r}  "
         f"forced_by_client={t.forced_by_client_model}",

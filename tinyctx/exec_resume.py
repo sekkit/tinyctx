@@ -179,6 +179,31 @@ def _resolve_codex_binary(override: str = "") -> str:
     return found or ""
 
 
+def _spawn_args(codex_bin: str, base_args: list[str]) -> list[str]:
+    """Return argv suitable for the current OS.
+
+    Windows does not honor POSIX shebangs for extensionless test shims.
+    Real Codex installs normally resolve to `.exe` / `.cmd`, but when a
+    shebang script is supplied explicitly, run it through Git/MSYS sh.
+    """
+    if os.name != "nt":
+        return base_args
+    suffix = Path(codex_bin).suffix.lower()
+    if suffix in {".exe", ".cmd", ".bat", ".com"}:
+        return base_args
+    try:
+        first = Path(codex_bin).read_text(
+            encoding="utf-8", errors="ignore")[:2]
+    except OSError:
+        return base_args
+    if first != "#!":
+        return base_args
+    sh = shutil.which("sh") or shutil.which("bash")
+    if not sh:
+        return base_args
+    return [sh, Path(codex_bin).as_posix(), *base_args[1:]]
+
+
 # ─── session_id resolution from sqlite ────────────────────────────────────
 
 
@@ -346,17 +371,19 @@ async def _spawn_exec_resume(
         "-c", f"approval_policy={approval_policy}",
         prompt,
     ]
+    spawn_args = _spawn_args(codex_bin, args)
     # Open log file BEFORE spawn so subprocess writes hit disk immediately.
     log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
     log_fh.write(
         f"# tinyctx exec_resume poke\n"
         f"# ts={ts_token} session_id={session_id} cwd={cwd}\n"
-        f"# args={args!r}\n# ---\n")
+        f"# args={args!r}\n"
+        f"# spawn_args={spawn_args!r}\n# ---\n")
     log_fh.flush()
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            *args,
+            *spawn_args,
             cwd=cwd or None,
             stdout=log_fh,
             stderr=log_fh,

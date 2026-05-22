@@ -121,7 +121,14 @@ class RoutingView(_NSView):
         escalation. 0 = disabled (Advisor-Strategy default).
       redirect_compaction_to_local: Route codex's compaction handoff
         prompt to local. The highest-leverage cost win.
+      goal_control_frontier_enabled: Route `/goal` setup/review/blocker
+        control turns to frontier while ordinary goal execution stays local.
+      adaptive_model_enabled: Track local backend health and route auto
+        requests to frontier while recent local failures exceed threshold.
       self_classify_threshold: Local model's P(escalate) cutoff.
+      self_classify_escalates_to_frontier: Legacy mode: convert that
+        cutoff into a full-turn frontier route instead of advisor-only
+        telemetry. Default false to keep frontier as short consultation.
     """
 
     _FIELD_MAP = {
@@ -129,7 +136,13 @@ class RoutingView(_NSView):
         "escalate_on_error_streak": "escalate_on_error_streak",
         "escalate_input_tokens": "escalate_input_tokens",
         "redirect_compaction_to_local": "redirect_compaction_to_local",
+        "goal_control_frontier_enabled": "goal_control_frontier_enabled",
+        "adaptive_model_enabled": "adaptive_model_enabled",
+        "adaptive_model_min_calls": "adaptive_model_min_calls",
+        "adaptive_model_failure_rate_threshold": "adaptive_model_failure_rate_threshold",
+        "adaptive_model_sample_size": "adaptive_model_sample_size",
         "self_classify_threshold": "self_classify_threshold",
+        "self_classify_escalates_to_frontier": "self_classify_escalates_to_frontier",
     }
 
 
@@ -277,6 +290,11 @@ class ForensicsView(_NSView):
 class BackendCfg:
     base_url: str
     api_key_env: str | None = None
+    # Whether to fall back to the inbound Codex Authorization header /
+    # ~/.codex/auth.json when `api_key_env` is unset or missing.
+    # Local backends default this OFF so custom LMStudio/vLLM tunnels do
+    # not accidentally receive ChatGPT-account bearer tokens.
+    forward_authorization: bool = True
     model: str = ""
     wire_api: str = "responses"
     timeout_s: float = 300.0
@@ -351,6 +369,7 @@ class Config:
     local: BackendCfg = field(default_factory=lambda: BackendCfg(
         base_url=_env("TINYCTX_LOCAL_BASE_URL", "http://127.0.0.1:1234/v1") or "",
         api_key_env="TINYCTX_LOCAL_API_KEY",
+        forward_authorization=False,
         model=_env("TINYCTX_LOCAL_MODEL", "qwen3.6-27b") or "",
         wire_api=_env("TINYCTX_LOCAL_WIRE_API", "chat") or "chat",
         timeout_s=float(_env("TINYCTX_LOCAL_TIMEOUT_S", "180") or 180),
@@ -421,9 +440,27 @@ class Config:
     escalate_turn_count: int = 0            # 0 = disabled (was 15)
     escalate_on_error_streak: int = 2       # repeated tool-failure -> frontier (kept; Anthropic "when stuck")
 
+    # SmallCode-inspired adaptive model select: keep a rolling in-memory
+    # health window for the local backend. If automatic requests have seen
+    # enough recent local failures, route subsequent auto turns to frontier
+    # until successes push the failure rate back below threshold. Explicit
+    # `tinyctx-local` / force_route still wins.
+    adaptive_model_enabled: bool = True
+    adaptive_model_min_calls: int = 3
+    adaptive_model_failure_rate_threshold: float = 0.3
+    adaptive_model_sample_size: int = 20
+
     # If true, the compaction handoff prompt is always routed to the local model.
     # This is the highest-leverage cost win and the reason this proxy exists.
     redirect_compaction_to_local: bool = True
+
+    # Goal-mode control-plane routing. Ordinary long-running `/goal`
+    # execution stays on the cheap local model, but the high-leverage
+    # judgment turns (contract creation, `done_when` validation,
+    # completion audit, blockers/pivots) route to frontier. The router
+    # only inspects the tail user/control message so a persistent GOAL.md
+    # in history does not make every iteration expensive.
+    goal_control_frontier_enabled: bool = True
 
     # If true, compaction is handled by tinyctx.compactor's 3-role debate +
     # judge merge instead of a single-pass forward. Costs 4× local calls but
@@ -487,6 +524,17 @@ class Config:
     dedup_tool_calls: bool = False
     purge_failed_tool_inputs: bool = False
     failed_input_after_turns: int = 4
+    # Result-level shrink: after a large tool result has sat in history for
+    # N+ assistant turns, replace the bulky payload with a deterministic
+    # summary so later turns don't keep paying for the full blob. Inspired by
+    # Reasonix's turn-end tool-result compaction, but implemented as a
+    # conservative later-turn history transform.
+    result_shrink_enabled: bool = True
+    result_shrink_after_turns: int = 1
+    result_shrink_min_bytes: int = 12_000
+    result_shrink_signal_lines: int = 8
+    result_shrink_head_chars: int = 400
+    result_shrink_tail_chars: int = 800
     mutation_ttl_s: float = 300.0      # default = Anthropic 5-min cache TTL
     mutation_threshold: float = 0.65   # context usage trigger (0..1)
     default_context_window: int = 1_000_000  # used when request doesn't say
@@ -620,19 +668,24 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
-    # Model-driven escalation: ask the LOCAL model itself whether to
-    # escalate this turn to frontier. Aligned with Anthropic Advisor
-    # Strategy (claude.com/blog/the-advisor-strategy) — the executor
-    # decides, not infrastructure-by-bytes. See tinyctx/self_classify.py
-    # for the prompt and contract.
+    # Advisor recommendation classifier: ask the LOCAL model itself
+    # whether this turn deserves stronger strategic guidance. Aligned
+    # with Anthropic Advisor Strategy (claude.com/blog/the-advisor-strategy):
+    # frontier should be a short advisor consultation, not the default
+    # executor for an entire agent loop. See tinyctx/self_classify.py.
     #
-    # Default ON. Cost depends on local backend speed; cached 60s by
-    # per-project key so codex retries don't re-classify. Tool-result
-    # roundtrips are skipped, so this only fires on fresh user queries.
+    # Default ON. This is a local-backend classifier only; by default it
+    # records advisor telemetry and route reasons while keeping execution
+    # local. Tool-result roundtrips are skipped, so this only fires on
+    # fresh user queries.
     self_classify_enabled: bool = True
-    # P(escalate) >= this → frontier. 0.7 matches the existing trained-
-    # classifier threshold. Lower = more aggressive escalation.
+    # P(advisor-needed) >= this → advisor recommendation. Lower = more
+    # aggressive recommendation.
     self_classify_threshold: float = 0.7
+    # Legacy / emergency switch: when true, a self-classify hit routes
+    # the whole turn to frontier. Default false keeps frontier usage near
+    # advisor-strategy levels instead of making frontier the executor.
+    self_classify_escalates_to_frontier: bool = False
     # Time budget for the classifier call. Reasoning-class local models
     # (qwen3.x-think, DeepSeek-R1 family) burn 200-1500 tokens on hidden
     # chain-of-thought before emitting the JSON verdict; at 50 tok/s that
@@ -1152,6 +1205,15 @@ def load_config() -> Config:
     fr = _env("TINYCTX_FORCE_ROUTE")
     if fr is not None:
         cfg.force_route = fr
+    sce = _env_bool("TINYCTX_SELF_CLASSIFY_ESCALATES_TO_FRONTIER")
+    if sce is not None:
+        cfg.self_classify_escalates_to_frontier = sce
+    gcf = _env_bool("TINYCTX_GOAL_CONTROL_FRONTIER_ENABLED")
+    if gcf is not None:
+        cfg.goal_control_frontier_enabled = gcf
+    ame = _env_bool("TINYCTX_ADAPTIVE_MODEL_ENABLED")
+    if ame is not None:
+        cfg.adaptive_model_enabled = ame
     vb = _env("TINYCTX_VERBOSE")
     if vb is not None:
         cfg.verbose = vb == "1"

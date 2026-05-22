@@ -2,12 +2,22 @@
 encrypted_content sanitizer. No network required."""
 from __future__ import annotations
 
+import pytest
+
+from tinyctx import adaptive_model
 from tinyctx.config import Config
-from tinyctx.router import decide, is_compaction_request
+from tinyctx.router import decide, goal_control_signal, is_compaction_request
 from tinyctx.sanitize import strip_encrypted_content
 
 
 CFG = Config()
+
+
+@pytest.fixture(autouse=True)
+def _reset_adaptive_model_state():
+    adaptive_model.reset_state()
+    yield
+    adaptive_model.reset_state()
 
 
 def test_compaction_fingerprint_redirects_to_local():
@@ -80,6 +90,46 @@ def test_turn_count_escalation_can_be_re_enabled():
     d = decide(body, cfg)
     assert d.route == "frontier"
     assert "turn_count" in d.reason
+
+
+def test_goal_command_routes_to_frontier_for_contract_quality():
+    cfg = Config()
+    body = {
+        "input": [{
+            "role": "user",
+            "content": (
+                "/goal compile this into a GOAL.md with done_when, "
+                "scorecard, and verification commands"
+            ),
+        }],
+    }
+    d = decide(body, cfg)
+    assert d.route == "frontier", d.reason
+    assert "goal-control" in d.reason
+
+
+def test_goal_control_does_not_fire_on_tool_result_roundtrip():
+    body = {
+        "input": [
+            {"role": "user", "content": "/goal fix the router"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "GOAL.md contains done_when and scorecard",
+            },
+        ],
+    }
+    assert goal_control_signal(body) == ""
+    d = decide(body, Config())
+    assert d.route == "local", d.reason
+
+
+def test_goal_control_frontier_can_be_disabled():
+    cfg = Config()
+    cfg.goal_control_frontier_enabled = False
+    body = {"input": [{"role": "user", "content": "/goal fix the router"}]}
+    d = decide(body, cfg)
+    assert d.route == "local", d.reason
 
 
 def test_force_route_overrides_everything():
@@ -294,6 +344,29 @@ def test_router_explicit_model_frontier():
     assert d.route == "frontier"
 
 
+def test_router_goal_control_routes_to_frontier():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(body={
+        "input": [{
+            "role": "user",
+            "content": "Forge a goal contract with done_when checks",
+        }],
+    }))
+    assert d.route == "frontier"
+    assert "goal-control" in d.reason
+
+
+def test_router_explicit_local_beats_goal_control():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(
+        requested_model="tinyctx-local",
+        body={"input": [{"role": "user", "content": "/goal write GOAL.md"}]},
+    ))
+    assert d.route == "local"
+
+
 def test_router_explicit_model_beats_capacity_and_classify():
     """If the client explicitly asked for tinyctx-frontier, honor that even
     on a small-token request (don't downgrade to local). Mirrors
@@ -333,6 +406,60 @@ def test_router_error_streak_below_threshold_stays_local():
     assert d.route == "local"
 
 
+def test_router_adaptive_model_escalates_after_local_failures():
+    from tinyctx import adaptive_model
+    from tinyctx.router import Decision, Router
+
+    adaptive_model.reset_state()
+    cfg = _make_router_cfg(
+        adaptive_model_enabled=True,
+        adaptive_model_min_calls=3,
+        adaptive_model_failure_rate_threshold=0.5,
+        adaptive_model_sample_size=5,
+    )
+    local_decision = Decision(
+        route="local",
+        reason="seed",
+        target="http://local.test/v1/chat/completions",
+        model="local-mdl",
+        wire_api="chat",
+    )
+    adaptive_model.record_decision(local_decision, ok=False, max_samples=5)
+    adaptive_model.record_decision(local_decision, ok=False, max_samples=5)
+    adaptive_model.record_decision(local_decision, ok=True, max_samples=5)
+
+    d = Router(cfg).decide(_ctx())
+
+    assert d.route == "frontier"
+    assert "adaptive local failure rate" in d.reason
+    adaptive_model.reset_state()
+
+
+def test_router_explicit_local_beats_adaptive_model_escalation():
+    from tinyctx import adaptive_model
+    from tinyctx.router import Decision, Router
+
+    adaptive_model.reset_state()
+    cfg = _make_router_cfg(
+        adaptive_model_enabled=True,
+        adaptive_model_min_calls=1,
+        adaptive_model_failure_rate_threshold=0.1,
+    )
+    local_decision = Decision(
+        route="local",
+        reason="seed",
+        target="http://local.test/v1/chat/completions",
+        model="local-mdl",
+        wire_api="chat",
+    )
+    adaptive_model.record_decision(local_decision, ok=False, max_samples=5)
+
+    d = Router(cfg).decide(_ctx(requested_model="tinyctx-local"))
+
+    assert d.route == "local"
+    adaptive_model.reset_state()
+
+
 def test_router_capacity_rule_escalates_when_over_safe_cap():
     """est_tokens > local.context_window * safe_fraction → frontier."""
     from tinyctx.router import Router
@@ -356,10 +483,21 @@ def test_router_capacity_rule_disabled_when_safe_fraction_zero():
     assert d.route == "local"
 
 
-def test_router_classify_rule_escalates_above_threshold():
-    """classify_p >= self_classify_threshold → frontier."""
+def test_router_classify_rule_is_advisor_only_by_default():
+    """classify_p >= threshold should recommend advisor, not run frontier."""
     from tinyctx.router import Router
     r = Router(_make_router_cfg(self_classify_threshold=0.7))
+    d = r.decide(_ctx(classify_p=0.85, classify_reason="needs strategy"))
+    assert d.route == "local"
+    assert "advisor-only" in d.reason
+
+
+def test_router_classify_rule_can_legacy_escalate_above_threshold():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg(
+        self_classify_threshold=0.7,
+        self_classify_escalates_to_frontier=True,
+    ))
     d = r.decide(_ctx(classify_p=0.85, classify_reason="needs strategy"))
     assert d.route == "frontier"
     assert "0.85" in d.reason or "self-classify" in d.reason.lower()

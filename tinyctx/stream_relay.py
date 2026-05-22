@@ -50,6 +50,7 @@ from uuid import uuid4
 
 import httpx
 
+from . import adaptive_model
 from . import retry_policy
 from . import stall_watchdog as _stall
 from .request_phase import RequestPhase, set_phase as _phase_set
@@ -214,6 +215,8 @@ class StreamProducer:
                                 async for chunk in r.aiter_raw():
                                     produced_chunk = True
                                     await chunk_q.put((None, chunk))
+                                self._record_adaptive_outcome(
+                                    ok=True, status=r.status_code)
                                 await chunk_q.put((_SENTINEL, None))
                                 return
                 except Exception as e:  # noqa: BLE001
@@ -222,7 +225,11 @@ class StreamProducer:
                 # Failure path.
                 if produced_chunk:
                     if exc_caught is not None:
+                        self._record_adaptive_outcome(
+                            ok=False, status=http_status)
                         raise exc_caught
+                    self._record_adaptive_outcome(
+                        ok=False, status=http_status)
                     await chunk_q.put(
                         (_STATUS, (http_status or 0, err_body_for_retry)))
                     await chunk_q.put((_SENTINEL, None))
@@ -241,6 +248,7 @@ class StreamProducer:
                     retry_after_s=retry_after_s,
                 )
                 self._retry_state.last_action = action
+                self._record_adaptive_outcome(ok=False, status=http_status)
                 if action.decision == "propagate":
                     if action.escalate_flag_reason:
                         self._flag_force_frontier(action.escalate_flag_reason)
@@ -306,6 +314,34 @@ class StreamProducer:
             # backend; current turn is already escalating regardless.
             pass
 
+    def _record_adaptive_outcome(
+        self,
+        *,
+        ok: bool,
+        status: int | None = None,
+    ) -> None:
+        if not getattr(self._cfg, "adaptive_model_enabled", True):
+            return
+        try:
+            health = adaptive_model.record_decision(
+                self._attempt_decision,
+                ok=ok,
+                max_samples=self._cfg.adaptive_model_sample_size,
+            )
+            self._log(
+                "adaptive_model_outcome",
+                session=self._proj_sid,
+                route=self._attempt_decision.route,
+                model=self._attempt_decision.model,
+                ok=ok,
+                status=status,
+                calls=health.calls,
+                failures=health.failures,
+                failure_rate=round(health.failure_rate, 4),
+            )
+        except Exception:  # noqa: BLE001 — adaptive routing is advisory
+            pass
+
     def _apply_retry_action(
         self,
         action: "retry_policy.RetryAction",
@@ -317,9 +353,10 @@ class StreamProducer:
         retry, and reset the stall timer."""
         new_url = self._attempt_url
         new_headers = self._attempt_headers
+        new_body = self._attempt_body
         new_decision = self._attempt_decision
         if action.decision == "retry_escalate":
-            esc_url, _esc_headers_proto, _b, esc_decision, _bk = (
+            esc_url, _esc_headers_proto, esc_body, esc_decision, _bk = (
                 self._build_frontier_retry_target(
                     None, self._attempt_body, action.reason))
             # Rebuild Authorization for the frontier backend so a
@@ -338,6 +375,7 @@ class StreamProducer:
                 merged.pop("Authorization", None)
             new_url = esc_url
             new_headers = merged
+            new_body = esc_body
             new_decision = esc_decision
             if action.escalate_flag_reason:
                 self._flag_force_frontier(action.escalate_flag_reason)
@@ -364,6 +402,7 @@ class StreamProducer:
             pass
         self._attempt_url = new_url
         self._attempt_headers = new_headers
+        self._attempt_body = new_body
         self._attempt_decision = new_decision
 
 

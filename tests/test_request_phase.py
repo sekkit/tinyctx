@@ -117,6 +117,7 @@ def test_request_phase_enum_values_match_spec():
         "received", "classifying", "routing", "backend_streaming",
         "post_stream_classifying", "injecting", "done", "stalled",
         "retrying", "escalated_to_frontier", "empty_guarded",
+        "compacting",
     }
     assert {p.value for p in RequestPhase} == expected
 

@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -55,6 +56,32 @@ MANAGED_END = "# ─── end tinyctx-managed MCP servers ───"
 DEFAULT_CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
 log = logging.getLogger("tinyctx.mcp_registry")
+
+
+def _is_executable_file(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    if os.name != "nt":
+        return os.access(path, os.X_OK)
+    suffix = Path(path).suffix.lower()
+    pathext = {
+        ext.lower()
+        for ext in os.environ.get(
+            "PATHEXT", ".COM;.EXE;.BAT;.CMD;.PS1").split(";")
+        if ext
+    }
+    if suffix in pathext:
+        return True
+    try:
+        if Path(path).read_text(encoding="utf-8", errors="ignore")[:2] == "#!":
+            return True
+    except OSError:
+        return False
+    try:
+        return bool(os.stat(path).st_mode & (
+            stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    except OSError:
+        return False
 
 
 @dataclass
@@ -101,7 +128,7 @@ def _which_with_fallbacks(name: str) -> str | None:
         return p
     for d in _FALLBACK_BIN_DIRS:
         cand = os.path.join(os.path.expanduser(d), name)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        if _is_executable_file(cand):
             return cand
     return None
 

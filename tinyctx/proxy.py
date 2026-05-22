@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -35,6 +36,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from . import adaptive_model
 from . import auto_scout
 from .compactor import (
     build_responses_api_payload,
@@ -67,16 +69,24 @@ from .sanitize import (
     CacheAwareMutator,
     cap_responses_fields,
     collect_failure_signals,
+    compact_input_messages_for_local_responses,
+    condense_instructions_for_local_responses,
     dedup_tool_calls,
     drop_orphan_tool_outputs,
+    embed_instructions_into_user_message,
+    flatten_tool_schemas,
+    hoist_input_messages_to_instructions,
     inject_responses_defaults,
     normalize_for_chat,
     proactive_compact,
     purge_failed_tool_inputs,
+    shrink_large_tool_results,
+    renest_tool_arguments,
     rewrite_input_roles,
     rewrite_model,
     expand_mcp_namespaces,
     inject_advisor_hint,
+    inject_context_mode_unavailable_note,
     scrub_unsupported_tools,
     strip_encrypted_content,
     strip_unsupported_responses_fields,
@@ -156,6 +166,39 @@ def _extract_valid_tool_names(body: dict[str, Any] | Any) -> set[str] | None:
         if isinstance(name, str) and name:
             names.add(name)
     return names or None
+
+
+def _extract_flattened_tool_args(body: dict[str, Any] | Any) -> dict[str, set[str]]:
+    """Recover flattened dotted-arg metadata from the outbound tool schema.
+
+    The proxy flattens nested parameter schemas before forwarding them to the
+    model. On the response path we reconstruct the map by scanning the same
+    forwarded tool list for dotted property names.
+    """
+    if not isinstance(body, dict):
+        return {}
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return {}
+    out: dict[str, set[str]] = {}
+    for entry in tools:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        params = entry.get("parameters")
+        if (not isinstance(name, str) or not name) and isinstance(entry.get("function"), dict):
+            fn = entry["function"]
+            name = fn.get("name")
+            params = fn.get("parameters")
+        if not isinstance(name, str) or not name or not isinstance(params, dict):
+            continue
+        props = params.get("properties")
+        if not isinstance(props, dict):
+            continue
+        flat_keys = {str(k) for k in props.keys() if isinstance(k, str) and "." in k}
+        if flat_keys:
+            out[name] = flat_keys
+    return out
 
 
 _PROACTIVE_SUMMARY_SYSTEM_PROMPT = (
@@ -313,6 +356,10 @@ def _chat_to_responses_payload(chat: dict[str, Any]) -> dict[str, Any]:
                                   usage.get("prompt_tokens", 0) +
                                   usage.get("completion_tokens", 0)),
     }
+    if usage.get("prompt_cache_hit_tokens") is not None:
+        out_usage["prompt_cache_hit_tokens"] = usage.get("prompt_cache_hit_tokens", 0)
+    if usage.get("prompt_cache_miss_tokens") is not None:
+        out_usage["prompt_cache_miss_tokens"] = usage.get("prompt_cache_miss_tokens", 0)
     if isinstance(usage.get("completion_tokens_details"), dict):
         rt = usage["completion_tokens_details"].get("reasoning_tokens")
         if isinstance(rt, int):
@@ -334,6 +381,8 @@ def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
         v = os.environ.get(backend.api_key_env)
         if v:
             return v
+    if not backend.forward_authorization:
+        return None
     # fall back to codex's own Authorization header (passthrough mode)
     if codex_auth:
         return codex_auth
@@ -356,6 +405,34 @@ def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
 
 def _select_backend(decision: Decision) -> BackendCfg:
     return CFG.local if decision.route == "local" else CFG.frontier
+
+
+def _record_adaptive_outcome(
+    decision: Decision,
+    *,
+    ok: bool,
+    status: int | None = None,
+) -> None:
+    if not getattr(CFG, "adaptive_model_enabled", True):
+        return
+    try:
+        health = adaptive_model.record_decision(
+            decision,
+            ok=ok,
+            max_samples=CFG.adaptive_model_sample_size,
+        )
+        _log(
+            "adaptive_model_outcome",
+            route=decision.route,
+            model=decision.model,
+            ok=ok,
+            status=status,
+            calls=health.calls,
+            failures=health.failures,
+            failure_rate=round(health.failure_rate, 4),
+        )
+    except Exception:  # noqa: BLE001 — adaptive routing is advisory
+        pass
 
 
 def _build_frontier_retry_target(
@@ -711,9 +788,9 @@ async def responses(request: Request) -> Any:
             GuardContext,
             GuardPipeline,
             PlanPersistenceInjector,
-            trace_guard_results,
             SoftCompletionGate,
             StuckLoopGuard,
+            trace_guard_results,
         )
         cwd_hdr = request.headers.get("x-codex-cwd") or ""
         state_dir = CFG.log_dir.parent / "state"
@@ -822,12 +899,16 @@ async def responses(request: Request) -> Any:
     except Exception as e:  # noqa: BLE001 — pipeline must never block
         _log("guards_pipeline_error", session=sid, error=str(e))
 
-    # Model-driven escalation (Anthropic Advisor Strategy alignment):
-    # ask the LOCAL model itself whether this turn deserves the advisor.
+    # Advisor recommendation classifier (Anthropic Advisor Strategy
+    # alignment): ask the LOCAL model itself whether this turn deserves
+    # stronger strategic guidance.
     # Runs only when no higher-priority router rule will already escalate
     # — i.e. no compaction, no force_route, no explicit-frontier request,
     # no error_streak. We pass the classifier's score (sc.p) and reason
     # into the RouteContext; the Router's _classify_rule consumes it.
+    # By default a hit stays on the local executor and only records an
+    # advisor recommendation. Legacy full-turn frontier routing is behind
+    # CFG.self_classify_escalates_to_frontier.
     # Failures are silent.
     classify_p = 0.0
     classify_reason = ""
@@ -891,9 +972,16 @@ async def responses(request: Request) -> Any:
                 if sc.escalate and sc.p >= CFG.self_classify_threshold:
                     classify_p = sc.p
                     classify_reason = sc.reason
-                    trace.self_classify_overrode = True
-                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
-                               trace.request_id)
+                    if CFG.self_classify_escalates_to_frontier:
+                        trace.self_classify_overrode = True
+                        _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
+                                   trace.request_id)
+                    else:
+                        _log("self_classify_advisor_recommended",
+                             session=sid,
+                             proj_sid=proj_sid,
+                             p=sc.p,
+                             reason=sc.reason)
         except Exception as e:  # noqa: BLE001 — classifier must never fail forward
             _log("self_classify_error", session=sid, error=str(e))
 
@@ -921,6 +1009,17 @@ async def responses(request: Request) -> Any:
     trace.est_input_tokens = decision.est_input_tokens
     trace.turn_count = decision.turn_count
     trace.error_streak = streak
+    try:
+        _adaptive_health = adaptive_model.local_health(CFG)
+        trace.adaptive_model_calls = _adaptive_health.calls
+        trace.adaptive_model_failures = _adaptive_health.failures
+        trace.adaptive_model_failure_rate = round(
+            _adaptive_health.failure_rate, 4)
+        trace.adaptive_model_triggered = (
+            decision.route == "frontier"
+            and decision.reason.startswith("adaptive local failure rate"))
+    except Exception:  # noqa: BLE001 — observability only
+        pass
 
     # Compaction boundary: codex emitted a handoff-summary request, so
     # the conversation's effective context is about to be rebuilt. Reset
@@ -954,6 +1053,7 @@ async def responses(request: Request) -> Any:
     # threshold). Otherwise leave history untouched so prompt-cache reads
     # stay cheap.
     want_mutation = (CFG.dedup_tool_calls or CFG.purge_failed_tool_inputs
+                     or CFG.result_shrink_enabled
                      or CFG.historian_substitute or CFG.read_delta_enabled)
     trace.mutation_wanted = want_mutation
     if want_mutation:
@@ -1003,6 +1103,19 @@ async def responses(request: Request) -> Any:
                     body, after_turns=CFG.failed_input_after_turns)
                 trace.purged_inputs = _count_purge_placeholders(body) - \
                                       pre_purge.count("[tinyctx: failed input purged")
+            if CFG.result_shrink_enabled:
+                body, rs_info = shrink_large_tool_results(
+                    body,
+                    after_turns=CFG.result_shrink_after_turns,
+                    min_bytes=CFG.result_shrink_min_bytes,
+                    signal_lines=CFG.result_shrink_signal_lines,
+                    head_chars=CFG.result_shrink_head_chars,
+                    tail_chars=CFG.result_shrink_tail_chars,
+                )
+                if rs_info["applied"]:
+                    _log("tool_result_shrink", session=sid,
+                         shrunk=rs_info["shrunk"],
+                         call_ids=rs_info["call_ids"][:20])
             if CFG.historian_substitute:
                 pre_sub = json.dumps(body)
                 body = historian.apply_to_body(
@@ -1178,6 +1291,7 @@ async def responses(request: Request) -> Any:
         trace.advisor_hint_skipped = True
     else:
         body = inject_advisor_hint(body)
+    body = inject_context_mode_unavailable_note(body)
 
     if backend.model:
         body = rewrite_model(body, backend.model)
@@ -1200,6 +1314,14 @@ async def responses(request: Request) -> Any:
         body = expand_mcp_namespaces(
             body,
             prefix_inner=os.environ.get("TINYCTX_MCP_NAME_NO_PREFIX") != "1",
+            no_prefix_namespaces={
+                item.strip() for item in (
+                    os.environ.get(
+                        "TINYCTX_MCP_NO_PREFIX_NAMESPACES",
+                        "mcp__context_mode__,mcp__context-mode__",
+                    ) or ""
+                ).split(",") if item.strip()
+            },
         )
         body = scrub_unsupported_tools(
             body, supported_types=backend.supported_tool_types)
@@ -1238,6 +1360,12 @@ async def responses(request: Request) -> Any:
             _log("cap_fields", session=sid,
                  capped={p: {"from": before_caps[p], "to": after_caps[p]}
                          for p in capped})
+
+    flattened_tool_args: dict[str, set[str]] = {}
+    body, flattened_tool_args, flat_info = flatten_tool_schemas(body)
+    if flat_info.get("applied"):
+        _log("tool_schema_flattened", session=sid,
+             tools=flat_info.get("flattened_tools", []))
 
     # Frontier-only: LLMLingua-2 pre-escalation compression of bulky
     # tool-result payloads. Default off; gated by `frontier_lingua_enabled`.
@@ -1311,6 +1439,7 @@ async def responses(request: Request) -> Any:
             and decision.route == "local"
             and CFG.compactor_debate
             and decision.est_input_tokens >= CFG.compactor_min_history_tokens):
+        _phase_set(proj_sid, RequestPhase.compacting, trace.request_id)
         trace.compactor_used = True
         return await _compactor_response(body, backend, is_stream, proj_sid,
                                          project_root=request.headers.get("x-codex-cwd"),
@@ -1319,6 +1448,28 @@ async def responses(request: Request) -> Any:
     if backend.wire_api == "responses":
         url = backend.base_url.rstrip("/") + "/responses"
         forward_body = body
+        if decision.route == "local":
+            forward_body, _msg_compact = compact_input_messages_for_local_responses(
+                forward_body)
+            if _msg_compact.get("hoisted") or _msg_compact.get("merged_user_messages", 0) > 1:
+                _log("local_input_message_compacted", session=sid,
+                     hoisted=_msg_compact.get("hoisted", 0),
+                     merged_user_messages=_msg_compact.get("merged_user_messages", 0))
+            forward_body, _n_role_hoist = hoist_input_messages_to_instructions(
+                forward_body, roles=("developer", "system"))
+            if _n_role_hoist:
+                _log("role_hoist", session=sid,
+                     count=_n_role_hoist, roles=["developer", "system"])
+            forward_body, _inst_condensed = condense_instructions_for_local_responses(
+                forward_body)
+            if _inst_condensed:
+                _log("local_instructions_condensed", session=sid)
+            inst_val = forward_body.get("instructions")
+            if not isinstance(inst_val, str) or not inst_val.strip():
+                forward_body, _inst_embedded = embed_instructions_into_user_message(
+                    forward_body)
+                if _inst_embedded:
+                    _log("local_instructions_embedded_into_user", session=sid)
         # Older/community LMStudio responses adapters reject role=developer
         # with HTTP 400 ("Unexpected message role."). Rewrite to system on
         # the local route only; frontier (chatgpt.com/backend-api/codex)
@@ -1489,6 +1640,7 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             media_type="text/event-stream",
         )
     started = time.time()
+    flattened_tool_args = _extract_flattened_tool_args(body)
     # ── Unified retry layer ──────────────────────────────────────────
     # Per user directive "凡是中断了都要加重试". The retry_policy
     # classifier decides retry_same / retry_escalate / propagate for each
@@ -1518,6 +1670,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                 conn_error = True
                 exc = e
             if r is not None and r.status_code < 400:
+                _record_adaptive_outcome(
+                    cur_decision, ok=True, status=r.status_code)
                 _SESSION_ERROR_STREAK[sid] = 0
                 break  # success — fall through to payload handling
             # Failure path — classify and decide next action.
@@ -1541,6 +1695,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                 retry_after_s=retry_after,
             )
             retry_state.last_action = action
+            _record_adaptive_outcome(
+                cur_decision, ok=False, status=http_status)
             _SESSION_ERROR_STREAK[sid] += 1
             if action.decision == "propagate":
                 if conn_error:
@@ -1585,8 +1741,9 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             new_url = attempt_url
             new_headers = cur_headers
             new_decision = cur_decision
+            new_body = cur_body
             if action.decision == "retry_escalate":
-                new_url, new_headers, _b, new_decision, _backend = (
+                new_url, new_headers, new_body, new_decision, _backend = (
                     _build_frontier_retry_target(None, cur_body, action.reason))
                 # Preserve codex routing headers (openai-beta,
                 # x-codex-session-id, etc.) from the original request,
@@ -1647,7 +1804,9 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     # Why: sleep can raise on cancellation; the retry
                     # loop continues regardless.
                     pass
-            cur_url, cur_headers, cur_decision = new_url, new_headers, new_decision
+            cur_url, cur_headers, cur_body, cur_decision = (
+                new_url, new_headers, new_body, new_decision
+            )
             # loop continues — try again
         # success branch
         assert r is not None
@@ -1664,7 +1823,11 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
         if translate_tool_calls and isinstance(payload, dict):
             valid_names = (_extract_valid_tool_names(body)
                            if CFG.unknown_tool_call_protection else None)
-            new_payload = rebuild_response(payload, valid_tool_names=valid_names)
+            new_payload = rebuild_response(
+                payload,
+                valid_tool_names=valid_names,
+                flattened_tool_args=flattened_tool_args,
+            )
             if new_payload is not payload:
                 # rebuild swapped some message text → function_call items
                 translated_calls = sum(1 for it in new_payload.get("output", [])
@@ -1676,6 +1839,11 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.bytes_out = len(json.dumps(payload).encode("utf-8")) if isinstance(payload, dict) else 0
             trace.translated = translate_tool_calls
             trace.translated_calls = translated_calls
+            hit, miss = _extract_prompt_cache_usage(payload)
+            trace.prompt_cache_hit_tokens = hit
+            trace.prompt_cache_miss_tokens = miss
+            total = hit + miss
+            trace.prompt_cache_hit_ratio = round(hit / total, 4) if total > 0 else 0.0
             trace.elapsed_s = round(time.time() - started, 3)
             trace.emit(CFG.log_dir)
         return JSONResponse(content=payload, status_code=r.status_code)
@@ -1704,11 +1872,18 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     translator: StreamTranslator | ChatToResponsesTranslator | None
     valid_names = (_extract_valid_tool_names(body)
                    if CFG.unknown_tool_call_protection else None)
+    flattened_tool_args = _extract_flattened_tool_args(body)
     auto_user_input_enabled = os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") != "0"
     if chat_to_responses:
-        translator = ChatToResponsesTranslator(valid_tool_names=valid_names)
+        translator = ChatToResponsesTranslator(
+            valid_tool_names=valid_names,
+            flattened_tool_args=flattened_tool_args,
+        )
     elif translate_tool_calls or auto_user_input_enabled:
-        translator = StreamTranslator(valid_tool_names=valid_names)
+        translator = StreamTranslator(
+            valid_tool_names=valid_names,
+            flattened_tool_args=flattened_tool_args,
+        )
     else:
         translator = None
     # codex.app's SSE parser raises "stream closed before response.completed"
@@ -1887,6 +2062,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     api_key = (os.environ.get(CFG.local.api_key_env)
                                if CFG.local.api_key_env else None)
                     buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
+                    text_excerpt = _sc._extract_text_from_buffer(
+                        buffer_snapshot)
                     body_input = (body.get("input")
                                    if isinstance(body, dict) else None)
                     user_goal = _sc.extract_user_goal(body_input)
@@ -1895,29 +2072,32 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     # Synchronous classification — we're at stream
                     # end, no other bytes flowing. Bounded by
                     # self_classify_timeout_s (default 30s).
-                    diag = await _sc.classify_at_stream_end_diag(
-                        proj_sid,
-                        local_base_url=CFG.local.base_url,
-                        local_model=CFG.local.model,
-                        api_key=api_key,
-                        timeout_s=CFG.self_classify_timeout_s,
-                        threshold=CFG.self_classify_threshold,
-                        raw_buffer=buffer_snapshot,
-                        user_goal=user_goal,
-                        progress_tracker=tracker,
-                        tool_summary=tool_summary,
-                        force_frontier_threshold=(
-                            CFG.soft_completion_auto_force_frontier_threshold
-                            if CFG.soft_completion_auto_force_frontier_enabled
-                            else 1.01),
-                        short_text_threshold=CFG.soft_completion_short_text_threshold,
-                        stop_text_threshold=CFG.soft_completion_stop_text_threshold,
-                    )
-                    if (diag.result is not None
+                    diag = None
+                    if (text_excerpt.strip()
+                            and ('"delta"' in buffer_snapshot
+                                 or '"content"' in buffer_snapshot)):
+                        diag = await _sc.classify_at_stream_end_diag(
+                            proj_sid,
+                            local_base_url=CFG.local.base_url,
+                            local_model=CFG.local.model,
+                            api_key=api_key,
+                            timeout_s=CFG.self_classify_timeout_s,
+                            threshold=CFG.self_classify_threshold,
+                            raw_buffer=buffer_snapshot,
+                            user_goal=user_goal,
+                            progress_tracker=tracker,
+                            tool_summary=tool_summary,
+                            force_frontier_threshold=(
+                                CFG.soft_completion_auto_force_frontier_threshold
+                                if CFG.soft_completion_auto_force_frontier_enabled
+                                else 1.01),
+                            short_text_threshold=CFG.soft_completion_short_text_threshold,
+                            stop_text_threshold=CFG.soft_completion_stop_text_threshold,
+                        )
+                    if (diag is not None
+                            and diag.result is not None
                             and diag.result.soft_punt
                             and diag.result.p >= CFG.soft_completion_stream_rewrite_threshold):
-                        text_excerpt = _sc._extract_text_from_buffer(
-                            buffer_snapshot)
                         task_body = _sr.build_task_body(
                             text_excerpt,
                             diag.result.reason,
@@ -1999,11 +2179,13 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             except Exception:  # noqa: BLE001 — forensics dump is best-effort
                                 pass
                     else:
+                        skip_reason = "no_text" if diag is None else (
+                            "not_punt" if diag.result is None
+                            else f"p={diag.result.p:.2f}"
+                                 f"<{CFG.soft_completion_stream_rewrite_threshold}")
                         _log("soft_completion_stream_rewrite_skipped",
                              session=proj_sid,
-                             reason=("not_punt" if diag.result is None
-                                     else f"p={diag.result.p:.2f}"
-                                          f"<{CFG.soft_completion_stream_rewrite_threshold}"))
+                             reason=skip_reason)
                 except Exception as e:  # noqa: BLE001
                     _log("soft_completion_stream_rewrite_error",
                          session=proj_sid, error=str(e))
@@ -2018,6 +2200,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         "POST", url, headers=headers, json=body) as r:
                     status = r.status_code
                     if r.status_code >= 400:
+                        _record_adaptive_outcome(
+                            decision, ok=False, status=r.status_code)
                         _SESSION_ERROR_STREAK[proj_sid] += 1
                         text = (await r.aread()).decode("utf-8", "replace")
                         _log("upstream_error", session=proj_sid,
@@ -2061,6 +2245,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         if translator is not None:
                             for out in translator.flush():
                                 yield out
+                        _record_adaptive_outcome(
+                            decision, ok=True, status=r.status_code)
     except _stall.StallCancelledError as e:
         # Watchdog cancelled the in-flight relay; emit terminator and
         # set force-frontier flag for the follow-up turn.
@@ -2074,6 +2260,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             e, proj_sid=proj_sid, conv_sid=conv_sid,
             bytes_out=bytes_out, started=started, url=url)
         status = res.status
+        _record_adaptive_outcome(decision, ok=False, status=status)
         yield res.error_event
         upstream_failed = res.upstream_failed
         upstream_failure_msg = res.upstream_failure_msg
@@ -2086,6 +2273,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             bytes_out=bytes_out, started=started, url=url,
             erg_key=erg_key, request_id=request_id)
         status = res.status
+        _record_adaptive_outcome(decision, ok=False, status=status)
         yield res.error_event
         upstream_failed = res.upstream_failed
         upstream_failure_msg = res.upstream_failure_msg
@@ -2140,9 +2328,17 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         if trace is not None:
             trace.status = status
             trace.bytes_out = bytes_out
-            trace.translated = bool(translator)
+            trace.translated = bool(translate_tool_calls or chat_to_responses)
             trace.translated_calls = (translator._emitted_calls
                                        if translator is not None else 0)
+            hit, miss = _extract_prompt_cache_usage_from_buffer(
+                bytes(outgoing_capture).decode("utf-8", "replace")
+                if outgoing_capture else ""
+            )
+            trace.prompt_cache_hit_tokens = hit
+            trace.prompt_cache_miss_tokens = miss
+            total = hit + miss
+            trace.prompt_cache_hit_ratio = round(hit / total, 4) if total > 0 else 0.0
             trace.elapsed_s = elapsed
             trace.keepalives_emitted = keepalives_emitted
             trace.emit(CFG.log_dir)
@@ -2156,6 +2352,51 @@ def _safe_json(r: httpx.Response) -> Any:
         return r.json()
     except json.JSONDecodeError:
         return {"raw": r.text}
+
+
+def _extract_prompt_cache_usage(payload: Any) -> tuple[int, int]:
+    """Best-effort `(hit, miss)` from a response-ish payload."""
+    if not isinstance(payload, dict):
+        return 0, 0
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        response = payload.get("response")
+        if isinstance(response, dict):
+            usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0
+    hit = usage.get("prompt_cache_hit_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    try:
+        hit_i = int(hit) if hit is not None else 0
+    except (TypeError, ValueError):
+        hit_i = 0
+    try:
+        miss_i = int(miss) if miss is not None else 0
+    except (TypeError, ValueError):
+        miss_i = 0
+    return max(0, hit_i), max(0, miss_i)
+
+
+def _extract_prompt_cache_usage_from_buffer(raw_buffer: str) -> tuple[int, int]:
+    if not raw_buffer:
+        return 0, 0
+    tail = raw_buffer[-8000:] if len(raw_buffer) > 8000 else raw_buffer
+    hit = 0
+    miss = 0
+    m = re.search(r'"prompt_cache_hit_tokens"\s*:\s*(\d+)', tail)
+    if m:
+        try:
+            hit = int(m.group(1))
+        except (TypeError, ValueError):
+            hit = 0
+    m = re.search(r'"prompt_cache_miss_tokens"\s*:\s*(\d+)', tail)
+    if m:
+        try:
+            miss = int(m.group(1))
+        except (TypeError, ValueError):
+            miss = 0
+    return hit, miss
 
 
 # ─── small counters used to populate RequestTrace transformation diffs ──
@@ -2221,6 +2462,8 @@ async def _compactor_response(body: dict[str, Any], backend: BackendCfg,
                                               else "/chat/completions")
         forward_body = body if backend.wire_api == "responses" else normalize_for_chat(body, strip_tools=backend.strip_tools)
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=180.0, pool=10.0)
+        _phase_set(sid, RequestPhase.backend_streaming,
+                   trace.request_id if trace is not None else "")
         return await _forward(url, {"Content-Type": "application/json"},
                               forward_body, is_stream, sid,
                               Decision("local", "compactor_fallback"),
@@ -2250,6 +2493,7 @@ async def _compactor_response(body: dict[str, Any], backend: BackendCfg,
         trace.elapsed_s = round(time.time() - started, 3)
         trace.status = 200
         trace.emit(CFG.log_dir)
+        _phase_set(sid, RequestPhase.done, trace.request_id)
     if is_stream:
         sse = build_responses_api_sse(summary, model_id)
         async def _emit() -> AsyncIterator[bytes]:

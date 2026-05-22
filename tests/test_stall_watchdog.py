@@ -18,7 +18,7 @@ def _reset_state():
 
 def test_mark_then_short_threshold_is_stalled():
     sw.mark_event("sidA")
-    time.sleep(0.005)
+    time.sleep(0.05)
     assert sw.check_stalled("sidA", threshold_s=0.001) is True
 
 

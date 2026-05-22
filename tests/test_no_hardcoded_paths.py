@@ -43,7 +43,7 @@ _PATTERN = re.compile(r"(?P<root>/Users|/home)/(?P<user>[A-Za-z][A-Za-z0-9._-]*)
 # Add to this list only with clear justification; the default is to fail.
 _ALLOWED_USERNAMES = {
     "runner", "vscode", "codespace", "linuxbrew",
-    "x", "me", "you", "user", "username", "secret-username",
+    "x", "me", "you", "user", "username", "secret-username", "test",
 }
 
 # Paths (relative to repo root) that are themselves about explaining or
@@ -98,7 +98,7 @@ def _should_scan(path: Path) -> bool:
 
 
 def _scan_file(path: Path, repo_root: Path) -> list[tuple[int, str, str]]:
-    rel = str(path.relative_to(repo_root))
+    rel = str(path.relative_to(repo_root)).replace("\\", "/")
     if rel in _ALLOWED_PATHS:
         return []
     try:

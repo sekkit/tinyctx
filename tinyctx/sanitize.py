@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import time
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -50,6 +51,7 @@ _ORPHAN_PAIR_CALL_TYPES = (
 
 _DEDUP_PLACEHOLDER = "[tinyctx: identical call deduped — see later turn]"
 _FAILED_PURGE_PLACEHOLDER = "[tinyctx: failed input purged after N turns]"
+_RESULT_SHRINK_MARKER = "[tinyctx: tool result summarized]"
 
 
 def strip_encrypted_content(body: dict[str, Any]) -> dict[str, Any]:
@@ -92,6 +94,55 @@ def rewrite_model(body: dict[str, Any], target_model: str) -> dict[str, Any]:
 _DEFAULT_ROLE_REWRITE_MAP: dict[str, str] = {"developer": "system"}
 
 
+def hoist_input_messages_to_instructions(
+    body: dict[str, Any],
+    *,
+    roles: tuple[str, ...] = ("developer", "system"),
+) -> tuple[dict[str, Any], int]:
+    """Move `body.input[*]` message items with roles in `roles` into the
+    top-level `instructions` string.
+
+    Some OpenAI-compatible `/v1/responses` backends accept system guidance only
+    via `instructions` and reject `input` items whose role is `system`. Hoisting
+    developer/system guidance preserves semantics better than rewriting those
+    items to `user`.
+    """
+    items = body.get("input")
+    if not isinstance(items, list) or not items:
+        return body, 0
+
+    extracted: list[str] = []
+    keep: list[Any] = []
+    for it in items:
+        if not isinstance(it, dict):
+            keep.append(it)
+            continue
+        if it.get("role") not in roles:
+            keep.append(it)
+            continue
+        if it.get("type") not in (None, "message"):
+            keep.append(it)
+            continue
+        text = _input_message_text(it.get("content"))
+        if not text.strip():
+            keep.append(it)
+            continue
+        extracted.append(text.strip())
+
+    if not extracted:
+        return body, 0
+
+    out = deepcopy(body)
+    out["input"] = keep
+    inst = out.get("instructions")
+    hoisted = "\n\n".join(part for part in extracted if part).strip()
+    if isinstance(inst, str) and inst.strip():
+        out["instructions"] = hoisted + "\n\n" + inst
+    else:
+        out["instructions"] = hoisted
+    return out, len(extracted)
+
+
 def rewrite_input_roles(
     body: dict[str, Any],
     *,
@@ -124,6 +175,184 @@ def rewrite_input_roles(
             it["role"] = rewrite_map[r]
             n += 1
     return out, n
+
+
+def compact_input_messages_for_local_responses(body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+    """Reduce `input` message items to the most conservative shape for strict
+    local `/responses` backends.
+
+    Strategy:
+      - hoist all non-user message items into `instructions`
+      - merge user message items into a single trailing user message
+      - keep non-message structural items (function_call, function_call_output,
+        reasoning, etc.) unchanged and in order
+    """
+    items = body.get("input")
+    if not isinstance(items, list) or not items:
+        return body, {"hoisted": 0, "merged_user_messages": 0}
+
+    instructions_parts: list[str] = []
+    user_parts: list[str] = []
+    kept: list[Any] = []
+    hoisted = 0
+    merged_user_messages = 0
+
+    for it in items:
+        if not isinstance(it, dict):
+            kept.append(it)
+            continue
+        if it.get("type") not in (None, "message"):
+            kept.append(it)
+            continue
+        role = it.get("role")
+        text = _input_message_text(it.get("content")).strip()
+        if not text:
+            continue
+        if role == "user":
+            user_parts.append(text)
+            merged_user_messages += 1
+            continue
+        instructions_parts.append(text)
+        hoisted += 1
+
+    if hoisted == 0 and merged_user_messages <= 1:
+        return body, {"hoisted": 0, "merged_user_messages": merged_user_messages}
+
+    out = deepcopy(body)
+    new_input = [it for it in kept]
+    if user_parts:
+        new_input.append({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "\n\n".join(part for part in user_parts if part),
+            }],
+        })
+    out["input"] = new_input
+
+    inst = out.get("instructions")
+    hoisted_text = "\n\n".join(part for part in instructions_parts if part).strip()
+    if hoisted_text:
+        if isinstance(inst, str) and inst.strip():
+            out["instructions"] = hoisted_text + "\n\n" + inst
+        else:
+            out["instructions"] = hoisted_text
+    return out, {"hoisted": hoisted, "merged_user_messages": merged_user_messages}
+
+
+def embed_instructions_into_user_message(body: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Move top-level `instructions` into the first user message and remove
+    the top-level field.
+
+    Useful for strict local `/responses` backends that reject any system-style
+    instruction channel but still accept plain user text.
+    """
+    instructions = body.get("instructions")
+    if not isinstance(instructions, str) or not instructions.strip():
+        return body, False
+    items = body.get("input")
+    if not isinstance(items, list):
+        return body, False
+
+    out = deepcopy(body)
+    out.pop("instructions", None)
+    first_user_idx: int | None = None
+    for idx, it in enumerate(out["input"]):
+        if isinstance(it, dict) and it.get("type") in (None, "message") and it.get("role") == "user":
+            first_user_idx = idx
+            break
+
+    if first_user_idx is None:
+        out["input"].insert(0, {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": instructions.strip(),
+            }],
+        })
+        return out, True
+
+    msg = out["input"][first_user_idx]
+    text = _input_message_text(msg.get("content")).strip()
+    merged = instructions.strip() if not text else instructions.strip() + "\n\n" + text
+    msg["content"] = [{
+        "type": "input_text",
+        "text": merged,
+    }]
+    return out, True
+
+
+def condense_instructions_for_local_responses(
+    body: dict[str, Any],
+    *,
+    max_chars: int = 1200,
+) -> tuple[dict[str, Any], bool]:
+    """Replace a very large `instructions` block with a compact local-safe
+    summary while preserving the most important guardrails.
+
+    This is specifically for strict local `/responses` backends that require
+    `instructions` to exist but degrade or reject overly complex prompt
+    structure.
+    """
+    instructions = body.get("instructions")
+    if not isinstance(instructions, str) or not instructions.strip():
+        return body, False
+    if len(instructions) <= max_chars:
+        return body, False
+
+    parts: list[str] = []
+    lowered = instructions.lower()
+    if "danger-full-access" in lowered:
+        parts.append("Execution environment: danger-full-access filesystem; network enabled.")
+    if "approval policy is currently never" in lowered:
+        parts.append("Approval mode: never ask for approval; do not request escalations.")
+    if "default mode" in lowered or "collaboration mode: default" in lowered:
+        parts.append("Collaboration mode: default; make reasonable assumptions and execute directly.")
+    if "update_plan" in instructions:
+        parts.append("Use update_plan to track multi-step work and mark steps complete.")
+    if "context-mode" in lowered:
+        parts.append("If context-mode tools are available, prefer them for large searches and processing.")
+    parts.append("Respect higher-priority system/developer/project instructions. Keep outputs concise and actionable.")
+    condensed = "\n".join(parts)
+    budget = max(0, max_chars - len(condensed) - 120)
+    if budget:
+        head_budget = max(0, budget // 2)
+        tail_budget = max(0, budget - head_budget)
+        head = instructions[:head_budget].strip()
+        tail = instructions[-tail_budget:].strip() if tail_budget else ""
+        snippets = []
+        if head:
+            snippets.append("[trimmed original instructions: head]\n" + head)
+        if tail and tail != head:
+            snippets.append("[trimmed original instructions: tail]\n" + tail)
+        if snippets:
+            condensed = condensed + "\n\n" + "\n\n".join(snippets)
+    out = deepcopy(body)
+    out["instructions"] = condensed[:max_chars]
+    return out, True
+
+
+def _input_message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif isinstance(item, str) and item:
+                parts.append(item)
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(content)
 
 
 # Codex's Responses-API requests carry tool entries with codex-specific
@@ -196,6 +425,22 @@ B → RemoteLoader 初始化修复
 
 # Marker the injector looks for to avoid double-injection.
 _ADVISOR_HINT_MARKER = 'spawn_agent(role="advisor"'
+_CTX_TOOL_UNAVAILABLE_MARKER = "<!-- tinyctx-context-mode-unavailable -->"
+_CTX_TOOL_UNAVAILABLE_NOTE = f"""
+
+{_CTX_TOOL_UNAVAILABLE_MARKER}
+## Session capability note
+
+This request does not expose `context-mode` MCP tools to the model.
+Do NOT call `ctx_batch_execute`, `ctx_search`, `ctx_execute`,
+`ctx_execute_file`, or any `mcp__context_*` / `mcp__context-mode__*`
+tool names unless they are explicitly present in the tool list for this
+request.
+
+If those tools are unavailable, continue with the tools that are
+actually available in the current session instead of retrying the same
+unsupported call.
+"""
 
 
 def inject_advisor_hint(body: dict[str, Any]) -> dict[str, Any]:
@@ -226,8 +471,42 @@ def inject_advisor_hint(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def inject_context_mode_unavailable_note(body: dict[str, Any]) -> dict[str, Any]:
+    """Append a capability note when `context-mode` tools are absent.
+
+    Repo-level instructions may strongly prefer `ctx_*` helpers. When the
+    active Codex client did not expose those MCP tools for this turn, the
+    model can otherwise loop on unsupported calls.
+    """
+    inst = body.get("instructions")
+    if not isinstance(inst, str) or not inst:
+        return body
+    if _CTX_TOOL_UNAVAILABLE_MARKER in inst:
+        return body
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+    names = [
+        str(tool.get("name") or "")
+        for tool in tools
+        if isinstance(tool, dict)
+    ]
+    has_context_mode_tool = any(
+        name.startswith("ctx_")
+        or "context_mode" in name
+        or "context-mode" in name
+        for name in names
+    )
+    if has_context_mode_tool:
+        return body
+    out = deepcopy(body)
+    out["instructions"] = _CTX_TOOL_UNAVAILABLE_NOTE.strip() + "\n\n" + inst
+    return out
+
+
 def expand_mcp_namespaces(body: dict[str, Any], *,
-                          prefix_inner: bool = True) -> dict[str, Any]:
+                          prefix_inner: bool = True,
+                          no_prefix_namespaces: set[str] | None = None) -> dict[str, Any]:
     """Codex 0.128+ wraps MCP-server tools in a `type: "namespace"` shell:
 
         {"type": "namespace", "name": "mcp__advisor__",
@@ -257,6 +536,7 @@ def expand_mcp_namespaces(body: dict[str, Any], *,
         return body
     out = deepcopy(body)
     new_tools: list[dict[str, Any]] = []
+    raw_no_prefix = {str(item) for item in (no_prefix_namespaces or set())}
     for t in out["tools"]:
         if not isinstance(t, dict):
             new_tools.append(t)
@@ -278,7 +558,8 @@ def expand_mcp_namespaces(body: dict[str, Any], *,
             # codex uses "mcp__<server>__<tool>"; namespace name already
             # ends with "__" so concatenation just works. If a future
             # codex version drops the trailing "__", we add it explicitly.
-            if prefix_inner:
+            if prefix_inner and _should_prefix_namespace_tool(
+                    ns_name, inner_name, raw_no_prefix):
                 if ns_name and not ns_name.endswith("__"):
                     ns_name = ns_name + "__"
                 qualified = (ns_name + inner_name) if ns_name else inner_name
@@ -293,6 +574,22 @@ def expand_mcp_namespaces(body: dict[str, Any], *,
             new_tools.append(rewritten)
     out["tools"] = new_tools
     return out
+
+
+def _should_prefix_namespace_tool(
+    namespace_name: str,
+    inner_name: str,
+    no_prefix_namespaces: set[str],
+) -> bool:
+    if namespace_name in no_prefix_namespaces:
+        return False
+    normalized = namespace_name.replace("-", "_").lower()
+    if normalized in {
+        "mcp__context_mode__",
+        "mcp__plugin_context_mode_context_mode__",
+    } and inner_name.startswith("ctx_"):
+        return False
+    return True
 
 
 def scrub_unsupported_tools(
@@ -694,6 +991,321 @@ def _tool_call_signature(item: dict[str, Any]) -> str | None:
     return sig
 
 
+def flatten_tool_schemas(
+    body: dict[str, Any],
+    *,
+    leaf_threshold: int = 10,
+    depth_threshold: int = 2,
+) -> tuple[dict[str, Any], dict[str, set[str]], dict[str, Any]]:
+    """Flatten complex nested tool parameter schemas into dot-notation.
+
+    Returns:
+      - rewritten body
+      - tool_name -> flattened dotted keys
+      - info dict for trace/logging
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return body, {}, {"applied": False, "flattened_tools": []}
+
+    out = deepcopy(body)
+    flattened: dict[str, set[str]] = {}
+    flattened_tools: list[str] = []
+
+    for entry in out.get("tools", []):
+        if not isinstance(entry, dict):
+            continue
+        tool_name, params = _tool_name_and_parameters(entry)
+        if not tool_name or not isinstance(params, dict):
+            continue
+        rewritten, flat_keys = _flatten_parameter_schema(
+            params,
+            leaf_threshold=leaf_threshold,
+            depth_threshold=depth_threshold,
+        )
+        if not flat_keys:
+            continue
+        _set_tool_parameters(entry, rewritten)
+        flattened[tool_name] = flat_keys
+        flattened_tools.append(tool_name)
+
+    return out, flattened, {
+        "applied": bool(flattened_tools),
+        "flattened_tools": flattened_tools,
+    }
+
+
+def renest_tool_arguments(
+    tool_name: str,
+    arguments: str | dict[str, Any],
+    flattened_tool_keys: dict[str, set[str]] | None,
+) -> str | dict[str, Any]:
+    """Reconstruct nested JSON args from dot-notation keys for one tool."""
+    if not flattened_tool_keys or tool_name not in flattened_tool_keys:
+        return arguments
+    flat_keys = flattened_tool_keys.get(tool_name) or set()
+    if not flat_keys:
+        return arguments
+
+    parsed: Any = arguments
+    as_string = isinstance(arguments, str)
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return arguments
+    if not isinstance(parsed, dict):
+        return arguments
+
+    nested: dict[str, Any] = {}
+    changed = False
+    for key, value in parsed.items():
+        if isinstance(key, str) and key in flat_keys and "." in key:
+            _set_dotted(nested, key, value)
+            changed = True
+        else:
+            nested[key] = value
+    if not changed:
+        return arguments
+    if as_string:
+        return json.dumps(nested, ensure_ascii=False)
+    return nested
+
+
+def _tool_name_and_parameters(entry: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    name = entry.get("name")
+    params = entry.get("parameters")
+    if isinstance(name, str) and isinstance(params, dict):
+        return name, params
+    fn = entry.get("function")
+    if isinstance(fn, dict):
+        fname = fn.get("name")
+        fparams = fn.get("parameters")
+        if isinstance(fname, str) and isinstance(fparams, dict):
+            return fname, fparams
+    return "", None
+
+
+def _set_tool_parameters(entry: dict[str, Any], rewritten: dict[str, Any]) -> None:
+    if isinstance(entry.get("parameters"), dict):
+        entry["parameters"] = rewritten
+        return
+    fn = entry.get("function")
+    if isinstance(fn, dict):
+        fn["parameters"] = rewritten
+
+
+def _flatten_parameter_schema(
+    schema: dict[str, Any],
+    *,
+    leaf_threshold: int,
+    depth_threshold: int,
+) -> tuple[dict[str, Any], set[str]]:
+    leaf_count, max_depth = _schema_complexity(schema)
+    if leaf_count <= leaf_threshold and max_depth <= depth_threshold:
+        return schema, set()
+    if str(schema.get("type") or "object") != "object":
+        return schema, set()
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return schema, set()
+
+    flat_props: dict[str, Any] = {}
+    flat_required: list[str] = []
+    flat_keys: set[str] = set()
+    top_required = set(schema.get("required") or [])
+    for key, sub in props.items():
+        _flatten_schema_node(
+            name=str(key),
+            schema=sub,
+            out_props=flat_props,
+            out_required=flat_required,
+            flat_keys=flat_keys,
+            parent_required=(key in top_required),
+        )
+    if not flat_keys:
+        return schema, set()
+    rewritten = dict(schema)
+    rewritten["type"] = "object"
+    rewritten["properties"] = flat_props
+    if flat_required:
+        rewritten["required"] = flat_required
+    else:
+        rewritten.pop("required", None)
+    return rewritten, flat_keys
+
+
+def _flatten_schema_node(
+    *,
+    name: str,
+    schema: Any,
+    out_props: dict[str, Any],
+    out_required: list[str],
+    flat_keys: set[str],
+    parent_required: bool,
+) -> None:
+    if not isinstance(schema, dict):
+        out_props[name] = {"type": "string"}
+        return
+    props = schema.get("properties")
+    is_object = str(schema.get("type") or "object") == "object"
+    if is_object and isinstance(props, dict) and props:
+        required = set(schema.get("required") or [])
+        for child_name, child_schema in props.items():
+            dotted = f"{name}.{child_name}"
+            _flatten_schema_node(
+                name=dotted,
+                schema=child_schema,
+                out_props=out_props,
+                out_required=out_required,
+                flat_keys=flat_keys,
+                parent_required=(parent_required and child_name in required),
+            )
+        return
+    leaf = dict(schema)
+    if "description" in leaf and isinstance(leaf["description"], str):
+        leaf["description"] = f"[flattened from {name}] {leaf['description']}"
+    else:
+        leaf["description"] = f"[flattened from {name}]"
+    out_props[name] = leaf
+    if "." in name:
+        flat_keys.add(name)
+    if parent_required:
+        out_required.append(name)
+
+
+def _schema_complexity(schema: Any, *, depth: int = 0) -> tuple[int, int]:
+    if not isinstance(schema, dict):
+        return 1, depth
+    props = schema.get("properties")
+    is_object = str(schema.get("type") or "object") == "object"
+    if is_object and isinstance(props, dict) and props:
+        leaves = 0
+        max_depth = depth
+        for child in props.values():
+            child_leaves, child_depth = _schema_complexity(child, depth=depth + 1)
+            leaves += child_leaves
+            max_depth = max(max_depth, child_depth)
+        return leaves, max_depth
+    return 1, depth
+
+
+def _set_dotted(target: dict[str, Any], dotted_key: str, value: Any) -> None:
+    parts = dotted_key.split(".")
+    cur = target
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def detect_tool_call_storm(
+    body: dict[str, Any],
+    *,
+    recent_window: int = 8,
+    repeat_threshold: int = 3,
+) -> dict[str, Any]:
+    """Detect repeated identical tool calls in the recent transcript.
+
+    This is a proxy-side signal that the current model may be stuck in a
+    low-value loop repeatedly attempting the same tool with the same args.
+    """
+    items = body.get("input") or body.get("messages")
+    if not isinstance(items, list):
+        return {"triggered": False, "count": 0, "tool_name": "", "signature": ""}
+    recent_calls: list[tuple[int, str, str]] = []
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        sig = _tool_call_signature(it)
+        if sig is None:
+            continue
+        name = str(it.get("name") or it.get("tool_name") or "")
+        recent_calls.append((idx, name, sig))
+    if not recent_calls:
+        return {"triggered": False, "count": 0, "tool_name": "", "signature": ""}
+    recent_calls = recent_calls[-max(1, recent_window):]
+    counts = Counter(sig for _, _, sig in recent_calls)
+    signature, count = counts.most_common(1)[0]
+    if count < max(2, repeat_threshold):
+        return {"triggered": False, "count": count, "tool_name": "", "signature": signature}
+    tool_name = next(
+        (name for _, name, sig in reversed(recent_calls) if sig == signature),
+        "",
+    )
+    indices = [idx for idx, _, sig in recent_calls if sig == signature]
+    return {
+        "triggered": True,
+        "count": count,
+        "tool_name": tool_name,
+        "signature": signature,
+        "indices": indices,
+        "recent_window": recent_window,
+    }
+
+
+def collect_failure_signals(
+    body: dict[str, Any],
+    *,
+    recent_window: int = 8,
+    storm_repeat_threshold: int = 3,
+) -> dict[str, Any]:
+    """Collect conservative preflight failure signals from visible history.
+
+    Score meanings:
+      - tool_call_storm: 2 points (strong signal)
+      - multiple recent tool errors: 1 point
+      - repeated dedup placeholders in recent history: 1 point
+    """
+    items = body.get("input") or body.get("messages")
+    if not isinstance(items, list):
+        return {"score": 0, "signals": []}
+
+    score = 0
+    signals: list[dict[str, Any]] = []
+
+    storm = detect_tool_call_storm(
+        body,
+        recent_window=recent_window,
+        repeat_threshold=storm_repeat_threshold,
+    )
+    if storm.get("triggered"):
+        score += 2
+        signals.append({
+            "kind": "tool_call_storm",
+            "tool_name": storm.get("tool_name", ""),
+            "count": storm.get("count", 0),
+        })
+
+    recent_errors = _extract_errors(items, last_n=recent_window)
+    if len(recent_errors) >= 2:
+        score += 1
+        signals.append({
+            "kind": "recent_tool_errors",
+            "count": len(recent_errors),
+        })
+
+    recent_tail = items[-max(1, recent_window):]
+    placeholder_hits = 0
+    for it in recent_tail:
+        if not isinstance(it, dict):
+            continue
+        blob = json.dumps(it, ensure_ascii=False, default=str)
+        if _DEDUP_PLACEHOLDER in blob:
+            placeholder_hits += 1
+    if placeholder_hits >= 2:
+        score += 1
+        signals.append({
+            "kind": "dedup_placeholder_history",
+            "count": placeholder_hits,
+        })
+
+    return {"score": score, "signals": signals}
+
+
 def dedup_tool_calls(body: dict[str, Any]) -> dict[str, Any]:
     """Replace earlier identical tool-call+result pairs with a placeholder.
     Keeps the *last* occurrence intact so the agent's most recent attempt is
@@ -821,6 +1433,125 @@ def purge_failed_tool_inputs(body: dict[str, Any],
             else:
                 it["arguments"] = _FAILED_PURGE_PLACEHOLDER
     return out
+
+
+def shrink_large_tool_results(
+    body: dict[str, Any],
+    *,
+    after_turns: int = 1,
+    min_bytes: int = 12_000,
+    signal_lines: int = 8,
+    head_chars: int = 400,
+    tail_chars: int = 800,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Replace old oversized tool results with a deterministic summary.
+
+    Applies only to prior tool-result items that are:
+      - at least `min_bytes` once flattened to text, and
+      - followed by `after_turns` or more assistant turns.
+    """
+    out = deepcopy(body)
+    items = out.get("input") or out.get("messages")
+    if not isinstance(items, list) or len(items) < 2:
+        return out, {"applied": False, "shrunk": 0, "call_ids": []}
+
+    call_name_by_id: dict[str, str] = {}
+    for it in items:
+        if not isinstance(it, dict) or it.get("type") not in _TOOL_CALL_TYPES:
+            continue
+        cid = it.get("call_id") or it.get("id") or ""
+        if not cid:
+            continue
+        call_name_by_id[cid] = str(it.get("name") or it.get("tool_name") or "")
+
+    assistant_turns_after: dict[int, int] = {}
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict) or it.get("type") not in _TOOL_RESULT_TYPES:
+            continue
+        n = 0
+        for j in range(idx + 1, len(items)):
+            nxt = items[j]
+            if not isinstance(nxt, dict):
+                continue
+            role = nxt.get("role")
+            t = nxt.get("type")
+            if role == "assistant" or t == "message" or t in _TOOL_CALL_TYPES:
+                n += 1
+        assistant_turns_after[idx] = n
+
+    shrunk = 0
+    call_ids: list[str] = []
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict) or it.get("type") not in _TOOL_RESULT_TYPES:
+            continue
+        if assistant_turns_after.get(idx, 0) < after_turns:
+            continue
+        text = _flatten_tool_output(it.get("output") if "output" in it else it.get("content"))
+        if len(text.encode("utf-8")) < min_bytes:
+            continue
+        cid = str(it.get("call_id") or it.get("id") or "")
+        summary = _summarize_tool_result(
+            text,
+            tool_name=call_name_by_id.get(cid, ""),
+            signal_lines=signal_lines,
+            head_chars=head_chars,
+            tail_chars=tail_chars,
+        )
+        if "output" in it:
+            it["output"] = summary
+        elif "content" in it:
+            it["content"] = summary
+        else:
+            it["output"] = summary
+        shrunk += 1
+        if cid:
+            call_ids.append(cid)
+
+    return out, {
+        "applied": shrunk > 0,
+        "shrunk": shrunk,
+        "call_ids": call_ids,
+    }
+
+
+def _summarize_tool_result(
+    text: str,
+    *,
+    tool_name: str,
+    signal_lines: int,
+    head_chars: int,
+    tail_chars: int,
+) -> str:
+    original_chars = len(text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    signal_markers = (
+        "error", "exception", "traceback", "failed", "failure",
+        "warning", "warn", "pass", "passed", "diff", "+++",
+        "---", "@@", "build", "test", "pytest",
+    )
+    picked_signals: list[str] = []
+    for line in lines:
+        low = line.lower()
+        if any(marker in low for marker in signal_markers):
+            picked_signals.append(line)
+        if len(picked_signals) >= signal_lines:
+            break
+
+    head = text[:head_chars].strip()
+    tail = text[-tail_chars:].strip() if original_chars > tail_chars else ""
+    parts = [
+        f"{_RESULT_SHRINK_MARKER} tool={tool_name or 'unknown'} chars={original_chars} lines={len(lines)}",
+    ]
+    if picked_signals:
+        parts.append("signals:")
+        parts.extend(f"- {line[:240]}" for line in picked_signals)
+    if head:
+        parts.append("head:")
+        parts.append(head)
+    if tail and tail != head:
+        parts.append("tail:")
+        parts.append(tail)
+    return "\n".join(parts)
 
 
 # ----------------------------------------------------- cache-aware deferral

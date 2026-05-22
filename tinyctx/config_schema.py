@@ -18,10 +18,16 @@ def config_schema() -> dict[str, Any]:
             "routing": [
                 _field("force_route", "Route override", "enum", options=["auto", "local", "frontier"]),
                 _field("redirect_compaction_to_local", "Route compaction to local", "boolean"),
+                _field("goal_control_frontier_enabled", "Route goal control turns to frontier", "boolean"),
                 _field("sanitize_encrypted_content", "Strip encrypted reasoning payloads", "boolean"),
                 _field("escalate_input_tokens", "Escalate token threshold", "integer", minimum=0),
                 _field("escalate_turn_count", "Escalate turn threshold", "integer", minimum=0),
                 _field("escalate_on_error_streak", "Escalate after tool error streak", "integer", minimum=0),
+                _field("adaptive_model_enabled", "Adaptive local failure routing", "boolean"),
+                _field("adaptive_model_min_calls", "Adaptive min calls", "integer", minimum=0),
+                _field("adaptive_model_failure_rate_threshold", "Adaptive failure-rate threshold", "number", minimum=0, maximum=1),
+                _field("adaptive_model_sample_size", "Adaptive sample size", "integer", minimum=1),
+                _field("self_classify_escalates_to_frontier", "Self-classify routes whole turn to frontier", "boolean"),
             ],
             "local": _backend_fields(local=True),
             "frontier": _backend_fields(local=False),
@@ -39,6 +45,7 @@ def config_presets() -> dict[str, Any]:
                     "base_url": "http://127.0.0.1:1234/v1",
                     "wire_api": "chat",
                     "model": "local-model",
+                    "forward_authorization": False,
                     "strip_tools": True,
                     "headers": {"Authorization": "Bearer lm-studio"},
                 },
@@ -122,12 +129,19 @@ def _validate_field(
     elif key == "force_route":
         if value not in ("auto", "local", "frontier"):
             errors.append(_err(section, key, "force_route must be auto, local, or frontier"))
-    elif key in {"port", "context_window", "timeout_s", "escalate_input_tokens", "escalate_turn_count", "escalate_on_error_streak"}:
+    elif key in {"port", "context_window", "timeout_s", "escalate_input_tokens", "escalate_turn_count", "escalate_on_error_streak", "adaptive_model_min_calls", "adaptive_model_sample_size"}:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             errors.append(_err(section, key, f"{key} must be a non-negative integer"))
         elif key == "port" and value > 65535:
             errors.append(_err(section, key, "port must be between 1 and 65535"))
-    elif key in {"verbose", "redirect_compaction_to_local", "sanitize_encrypted_content", "strip_tools", "lmcache_passthrough"}:
+        elif key == "adaptive_model_sample_size" and value < 1:
+            errors.append(_err(section, key, "adaptive_model_sample_size must be at least 1"))
+    elif key == "adaptive_model_failure_rate_threshold":
+        if (not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not 0 <= float(value) <= 1):
+            errors.append(_err(section, key, "adaptive_model_failure_rate_threshold must be between 0 and 1"))
+    elif key in {"verbose", "redirect_compaction_to_local", "goal_control_frontier_enabled", "sanitize_encrypted_content", "strip_tools", "lmcache_passthrough", "forward_authorization", "self_classify_escalates_to_frontier", "adaptive_model_enabled"}:
         if not isinstance(value, bool):
             errors.append(_err(section, key, f"{key} must be true or false"))
     elif key == "headers":
@@ -146,6 +160,7 @@ def _backend_fields(*, local: bool) -> list[dict[str, Any]]:
         _field("wire_api", "Wire API", "enum", options=["chat", "responses"]),
         _field("model", "Model", "string"),
         _field("api_key_env", "API key env var", "string"),
+        _field("forward_authorization", "Forward Codex auth fallback", "boolean"),
         _field("context_window", "Context window", "integer", minimum=0),
         _field("timeout_s", "Timeout seconds", "integer", minimum=0),
         _field("headers", "Extra headers", "object"),
