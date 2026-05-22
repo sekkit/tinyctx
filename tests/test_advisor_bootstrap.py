@@ -54,7 +54,12 @@ def test_resolve_python_does_not_follow_venv_symlink(tmp_path, monkeypatch):
 
     venv_python = tmp_path / "venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
-    venv_python.symlink_to(real_python)
+    try:
+        venv_python.symlink_to(real_python)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
 
     monkeypatch.setenv("TINYCTX_ADVISOR_PYTHON", str(venv_python))
     resolved = ab._resolve_python()
@@ -95,7 +100,7 @@ def test_bootstrap_writes_block_with_absolute_python(isolated_home):
     report = ab.bootstrap(codex_config=codex)
     assert report.success
     assert codex.is_file()
-    content = codex.read_text()
+    content = codex.read_text(encoding="utf-8")
     assert "[mcp_servers.advisor]" in content
     assert 'args = ["-m", "tinyctx.advisor"]' in content
     # The registered command must be the actual interpreter currently
@@ -105,8 +110,15 @@ def test_bootstrap_writes_block_with_absolute_python(isolated_home):
     assert f'command = "{expected}"' in content
 
 
+def test_example_agent_config_has_codex_agent_name():
+    root = Path(__file__).resolve().parents[1]
+    agent_text = (root / "examples" / "agent-advisor.toml").read_text(encoding="utf-8")
+    assert 'name = "advisor"' in agent_text
+    assert "100-200 words" in agent_text
+
+
 def test_bootstrap_command_uses_per_machine_path(isolated_home, tmp_path,
-                                                   monkeypatch):
+                                                    monkeypatch):
     """Override TINYCTX_ADVISOR_PYTHON to a foreign path and confirm the
     written block contains *that* path verbatim — proves the value is
     runtime-resolved, not baked into the source."""
@@ -117,20 +129,20 @@ def test_bootstrap_command_uses_per_machine_path(isolated_home, tmp_path,
     foreign.chmod(0o755)
     monkeypatch.setenv("TINYCTX_ADVISOR_PYTHON", str(foreign))
     ab.bootstrap(codex_config=codex)
-    content = codex.read_text()
+    content = codex.read_text(encoding="utf-8")
     assert f'command = "{foreign}"' in content
 
 
 def test_bootstrap_idempotent(isolated_home):
     _, codex = isolated_home
     ab.bootstrap(codex_config=codex)
-    first = codex.read_text()
+    first = codex.read_text(encoding="utf-8")
     report2 = ab.bootstrap(codex_config=codex)
     assert report2.success
-    assert codex.read_text() == first, \
+    assert codex.read_text(encoding="utf-8") == first, \
         "second bootstrap must not duplicate the block"
     # exactly one [mcp_servers.advisor] header
-    assert codex.read_text().count("[mcp_servers.advisor]") == 1
+    assert codex.read_text(encoding="utf-8").count("[mcp_servers.advisor]") == 1
 
 
 def test_bootstrap_dry_run_writes_nothing(isolated_home):
@@ -162,7 +174,7 @@ def test_bootstrap_preserves_existing_blocks(isolated_home):
     codex.write_text(existing)
     report = ab.bootstrap(codex_config=codex)
     assert report.success
-    new = codex.read_text()
+    new = codex.read_text(encoding="utf-8")
     assert "[profiles.tinyctx]" in new
     assert "[mcp_servers.gitnexus]" in new
     assert "[mcp_servers.advisor]" in new
@@ -171,10 +183,10 @@ def test_bootstrap_preserves_existing_blocks(isolated_home):
 def test_uninstall_strips_block(isolated_home):
     _, codex = isolated_home
     ab.bootstrap(codex_config=codex)
-    assert "[mcp_servers.advisor]" in codex.read_text()
+    assert "[mcp_servers.advisor]" in codex.read_text(encoding="utf-8")
     rc = ab._cmd_uninstall(codex, dry_run=False, quiet=True)
     assert rc == 0
-    assert "[mcp_servers.advisor]" not in codex.read_text()
+    assert "[mcp_servers.advisor]" not in codex.read_text(encoding="utf-8")
 
 
 def test_uninstall_when_block_absent_is_noop(isolated_home):
@@ -183,7 +195,7 @@ def test_uninstall_when_block_absent_is_noop(isolated_home):
     codex.write_text("[profiles.tinyctx]\nmodel = \"x\"\n")
     rc = ab._cmd_uninstall(codex, dry_run=False, quiet=True)
     assert rc == 0
-    assert codex.read_text() == "[profiles.tinyctx]\nmodel = \"x\"\n"
+    assert codex.read_text(encoding="utf-8") == "[profiles.tinyctx]\nmodel = \"x\"\n"
 
 
 def test_status_reports_no_advisor_initially(isolated_home, capsys):

@@ -217,10 +217,17 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
                                      is_compaction=compact)
             vec = feats.to_vector()
             prob = model.predict_proba(vec)
-            if prob >= 0.7:  # high-confidence escalate
+            if (prob >= 0.7
+                    and getattr(cfg, "self_classify_escalates_to_frontier", False)):
                 return Decision(
                     "frontier",
                     f"classifier p(escalate)={prob:.2f}",
+                    est_input_tokens=est, turn_count=turns,
+                )
+            if prob >= 0.7:
+                return Decision(
+                    "local",
+                    f"classifier p(escalate)={prob:.2f} advisor-only",
                     est_input_tokens=est, turn_count=turns,
                 )
         except Exception:  # noqa: BLE001 — classifier is advisory, not load-bearing
@@ -456,15 +463,19 @@ class Router:
         return None
 
     def _classify_rule(self, ctx: RouteContext) -> Decision | None:
-        """6. Self-classify p(escalate) ≥ threshold → frontier.
+        """6. Self-classify advisor recommendation.
 
         The local model itself classified this turn as needing the
-        advisor. Threshold defaults to 0.7 and is configurable. The
-        classifier result was already computed (async) before decide()
-        ran; we just consume the score."""
+        advisor. Threshold defaults to 0.7 and is configurable. By
+        default this records advisor need while leaving the executor on
+        local; legacy full-turn frontier routing is opt-in."""
         thr = getattr(self.cfg, "self_classify_threshold", 1.1) or 1.1
         if ctx.classify_p >= thr:
             tail = (f": {ctx.classify_reason}" if ctx.classify_reason else "")
+            if not getattr(self.cfg, "self_classify_escalates_to_frontier", False):
+                return self._make_local_decision(
+                    ctx,
+                    f"self-classify p={ctx.classify_p:.2f} advisor-only{tail}")
             return self._make_frontier_decision(
                 ctx, f"self-classify p={ctx.classify_p:.2f}{tail}")
         return None

@@ -860,9 +860,16 @@ async def responses(request: Request) -> Any:
                 if sc.escalate and sc.p >= CFG.self_classify_threshold:
                     classify_p = sc.p
                     classify_reason = sc.reason
-                    trace.self_classify_overrode = True
-                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
-                               trace.request_id)
+                    if CFG.self_classify_escalates_to_frontier:
+                        trace.self_classify_overrode = True
+                        _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
+                                   trace.request_id)
+                    else:
+                        _log("self_classify_advisor_recommended",
+                             session=sid,
+                             proj_sid=proj_sid,
+                             p=sc.p,
+                             reason=sc.reason)
         except Exception as e:  # noqa: BLE001 — classifier must never fail forward
             _log("self_classify_error", session=sid, error=str(e))
 

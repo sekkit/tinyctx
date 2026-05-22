@@ -811,7 +811,7 @@ pre { white-space:pre-wrap; overflow:auto; max-height:340px; background:#020617;
 <script>
 const core = {
   server: ["host", "port", "verbose"],
-  routing: ["force_route", "redirect_compaction_to_local", "sanitize_encrypted_content", "escalate_input_tokens", "escalate_turn_count", "escalate_on_error_streak"],
+  routing: ["force_route", "redirect_compaction_to_local", "sanitize_encrypted_content", "self_classify_escalates_to_frontier", "escalate_input_tokens", "escalate_turn_count", "escalate_on_error_streak"],
   local: ["base_url", "wire_api", "model", "context_window", "timeout_s", "strip_tools", "api_key_env", "headers"],
   frontier: ["base_url", "wire_api", "model", "timeout_s", "api_key_env"]
 };
