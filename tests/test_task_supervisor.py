@@ -24,6 +24,11 @@ def test_create_or_update_task_copies_plan_fields():
         recommended_skills = ["cc-tdd", "cc-work"]
         recommended_mcp = ["context-mode"]
         dynamic_skill = {"content_hash": "abc123"}
+        execution_mode = "parallel_subagents"
+        execution_reason = "independent checks"
+        parallel_subtasks = [
+            {"title": "tests", "agent": "reviewer", "prompt": "check tests"},
+        ]
 
     record = create_or_update_task(
         {"input": "Fix the failing dashboard test"},
@@ -37,6 +42,11 @@ def test_create_or_update_task_copies_plan_fields():
     assert record.recommended_skills == ["cc-tdd", "cc-work"]
     assert record.recommended_mcp == ["context-mode"]
     assert record.dynamic_skill_hash == "abc123"
+    assert record.execution_mode == "parallel_subagents"
+    assert record.execution_reason == "independent checks"
+    assert record.parallel_subtasks == [
+        {"title": "tests", "agent": "reviewer", "prompt": "check tests"},
+    ]
     assert "dashboard test" in record.title
 
 
@@ -75,3 +85,4 @@ def test_snapshot_summarizes_records_for_dashboard():
     assert data["by_state"] == {"running": 1, "done": 1}
     assert data["tasks"][0]["task_id"].startswith("tsk_")
     assert "title" in data["tasks"][0]
+    assert data["tasks"][0]["execution_mode"] == "serial"

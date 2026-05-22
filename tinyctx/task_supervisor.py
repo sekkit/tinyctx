@@ -19,6 +19,9 @@ class TaskRecord:
     recommended_skills: list[str] = field(default_factory=list)
     recommended_mcp: list[str] = field(default_factory=list)
     dynamic_skill_hash: str | None = None
+    execution_mode: str = "serial"
+    execution_reason: str = ""
+    parallel_subtasks: list[dict[str, str]] = field(default_factory=list)
     proof: dict[str, list[str]] = field(default_factory=lambda: {
         "tests": [],
         "changed_files": [],
@@ -58,6 +61,9 @@ def create_or_update_task(
         recommended_skills=list(getattr(plan, "recommended_skills", []) or []),
         recommended_mcp=list(getattr(plan, "recommended_mcp", []) or []),
         dynamic_skill_hash=_dynamic_skill_hash(getattr(plan, "dynamic_skill", None)),
+        execution_mode=str(getattr(plan, "execution_mode", "serial") or "serial"),
+        execution_reason=str(getattr(plan, "execution_reason", "") or ""),
+        parallel_subtasks=_parallel_subtasks(getattr(plan, "parallel_subtasks", [])),
     )
 
 
@@ -102,6 +108,9 @@ def snapshot(records: list[TaskRecord]) -> dict[str, Any]:
             "recommended_skills": record.recommended_skills,
             "recommended_mcp": record.recommended_mcp,
             "dynamic_skill_hash": record.dynamic_skill_hash,
+            "execution_mode": record.execution_mode,
+            "execution_reason": record.execution_reason,
+            "parallel_subtasks": record.parallel_subtasks,
             "proof": record.proof,
             "blockers": record.blockers,
         })
@@ -159,3 +168,18 @@ def _dynamic_skill_hash(dynamic_skill: Any) -> str | None:
         return str(value) if value else None
     value = getattr(dynamic_skill, "content_hash", None)
     return str(value) if value else None
+
+
+def _parallel_subtasks(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        prompt = str(item.get("prompt") or "").strip()
+        agent = str(item.get("agent") or "worker").strip()
+        if title and prompt:
+            out.append({"title": title, "agent": agent or "worker", "prompt": prompt})
+    return out

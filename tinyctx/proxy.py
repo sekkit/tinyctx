@@ -891,9 +891,16 @@ async def responses(request: Request) -> Any:
                 if sc.escalate and sc.p >= CFG.self_classify_threshold:
                     classify_p = sc.p
                     classify_reason = sc.reason
-                    trace.self_classify_overrode = True
-                    _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
-                               trace.request_id)
+                    if CFG.self_classify_escalates_to_frontier:
+                        trace.self_classify_overrode = True
+                        _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
+                                   trace.request_id)
+                    else:
+                        _log("self_classify_advisor_recommended",
+                             session=sid,
+                             proj_sid=proj_sid,
+                             p=sc.p,
+                             reason=sc.reason)
         except Exception as e:  # noqa: BLE001 — classifier must never fail forward
             _log("self_classify_error", session=sid, error=str(e))
 
@@ -1159,6 +1166,8 @@ async def responses(request: Request) -> Any:
                     session=sid,
                     task_id=task_record.task_id,
                     task_type=task_record.task_type,
+                    execution_mode=task_record.execution_mode,
+                    parallel_subtasks=len(task_record.parallel_subtasks),
                     injected=trace.orchestrator_injected,
                     dynamic_skill_hash=trace.orchestrator_dynamic_skill_hash,
                 )

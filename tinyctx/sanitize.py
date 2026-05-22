@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import time
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -1179,6 +1180,104 @@ def _extract_errors(items: list, *, last_n: int = 8) -> list[str]:
         seen.add(key)
         found.append(snippet)
     return found[-last_n:]
+
+
+def detect_tool_call_storm(
+    body: dict[str, Any],
+    *,
+    recent_window: int = 8,
+    repeat_threshold: int = 3,
+) -> dict[str, Any]:
+    """Detect repeated identical tool calls in the recent transcript."""
+    items = body.get("input") or body.get("messages")
+    if not isinstance(items, list):
+        return {"triggered": False, "count": 0, "tool_name": "", "signature": ""}
+    recent_calls: list[tuple[int, str, str]] = []
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        sig = _tool_call_signature(it)
+        if sig is None:
+            continue
+        name = str(it.get("name") or it.get("tool_name") or "")
+        recent_calls.append((idx, name, sig))
+    if not recent_calls:
+        return {"triggered": False, "count": 0, "tool_name": "", "signature": ""}
+    recent_calls = recent_calls[-max(1, recent_window):]
+    signature, count = Counter(sig for _, _, sig in recent_calls).most_common(1)[0]
+    if count < max(2, repeat_threshold):
+        return {
+            "triggered": False,
+            "count": count,
+            "tool_name": "",
+            "signature": signature,
+        }
+    tool_name = next(
+        (name for _, name, sig in reversed(recent_calls) if sig == signature),
+        "",
+    )
+    indices = [idx for idx, _, sig in recent_calls if sig == signature]
+    return {
+        "triggered": True,
+        "count": count,
+        "tool_name": tool_name,
+        "signature": signature,
+        "indices": indices,
+        "recent_window": recent_window,
+    }
+
+
+def collect_failure_signals(
+    body: dict[str, Any],
+    *,
+    recent_window: int = 8,
+    storm_repeat_threshold: int = 3,
+) -> dict[str, Any]:
+    """Collect conservative preflight failure signals from visible history."""
+    items = body.get("input") or body.get("messages")
+    if not isinstance(items, list):
+        return {"score": 0, "signals": []}
+
+    score = 0
+    signals: list[dict[str, Any]] = []
+
+    storm = detect_tool_call_storm(
+        body,
+        recent_window=recent_window,
+        repeat_threshold=storm_repeat_threshold,
+    )
+    if storm.get("triggered"):
+        score += 2
+        signals.append({
+            "kind": "tool_call_storm",
+            "tool_name": storm.get("tool_name", ""),
+            "count": storm.get("count", 0),
+        })
+
+    recent_errors = _extract_errors(items, last_n=recent_window)
+    if len(recent_errors) >= 2:
+        score += 1
+        signals.append({
+            "kind": "recent_tool_errors",
+            "count": len(recent_errors),
+        })
+
+    recent_tail = items[-max(1, recent_window):]
+    placeholder_hits = 0
+    for it in recent_tail:
+        if not isinstance(it, dict):
+            continue
+        blob = json.dumps(it, ensure_ascii=False, default=str)
+        if _DEDUP_PLACEHOLDER in blob:
+            placeholder_hits += 1
+    if placeholder_hits >= 2:
+        score += 1
+        signals.append({
+            "kind": "dedup_placeholder_history",
+            "count": placeholder_hits,
+        })
+
+    return {"score": score, "signals": signals}
 
 
 def _build_signals_section(items: list) -> str:

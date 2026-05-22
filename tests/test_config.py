@@ -202,6 +202,7 @@ def test_config_self_classify_defaults() -> None:
     cfg = Config()
     assert cfg.self_classify_enabled is True
     assert cfg.self_classify_threshold == 0.7
+    assert cfg.self_classify_escalates_to_frontier is False
     assert cfg.self_classify_timeout_s == 30.0
 
 
@@ -707,6 +708,7 @@ def test_routing_namespace_reads_top_level_defaults() -> None:
     assert cfg.routing.escalate_input_tokens == cfg.escalate_input_tokens
     assert cfg.routing.redirect_compaction_to_local is cfg.redirect_compaction_to_local
     assert cfg.routing.self_classify_threshold == cfg.self_classify_threshold
+    assert cfg.routing.self_classify_escalates_to_frontier is cfg.self_classify_escalates_to_frontier
 
 
 def test_routing_namespace_write_propagates_to_top_level() -> None:
@@ -717,6 +719,8 @@ def test_routing_namespace_write_propagates_to_top_level() -> None:
     assert cfg.force_route == "frontier"
     cfg.routing.escalate_input_tokens = 12345
     assert cfg.escalate_input_tokens == 12345
+    cfg.routing.self_classify_escalates_to_frontier = True
+    assert cfg.self_classify_escalates_to_frontier is True
 
 
 def test_routing_top_level_write_visible_via_namespace() -> None:
@@ -728,6 +732,8 @@ def test_routing_top_level_write_visible_via_namespace() -> None:
     assert cfg.routing.force_route == "local"
     cfg.redirect_compaction_to_local = False
     assert cfg.routing.redirect_compaction_to_local is False
+    cfg.self_classify_escalates_to_frontier = True
+    assert cfg.routing.self_classify_escalates_to_frontier is True
 
 
 def test_stall_namespace_reads_and_writes() -> None:

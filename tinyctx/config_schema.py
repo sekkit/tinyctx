@@ -19,6 +19,7 @@ def config_schema() -> dict[str, Any]:
                 _field("force_route", "Route override", "enum", options=["auto", "local", "frontier"]),
                 _field("redirect_compaction_to_local", "Route compaction to local", "boolean"),
                 _field("sanitize_encrypted_content", "Strip encrypted reasoning payloads", "boolean"),
+                _field("self_classify_escalates_to_frontier", "Self-classify routes whole turn to frontier", "boolean"),
                 _field("escalate_input_tokens", "Escalate token threshold", "integer", minimum=0),
                 _field("escalate_turn_count", "Escalate turn threshold", "integer", minimum=0),
                 _field("escalate_on_error_streak", "Escalate after tool error streak", "integer", minimum=0),
@@ -127,7 +128,7 @@ def _validate_field(
             errors.append(_err(section, key, f"{key} must be a non-negative integer"))
         elif key == "port" and value > 65535:
             errors.append(_err(section, key, "port must be between 1 and 65535"))
-    elif key in {"verbose", "redirect_compaction_to_local", "sanitize_encrypted_content", "strip_tools", "lmcache_passthrough"}:
+    elif key in {"verbose", "redirect_compaction_to_local", "sanitize_encrypted_content", "self_classify_escalates_to_frontier", "strip_tools", "lmcache_passthrough"}:
         if not isinstance(value, bool):
             errors.append(_err(section, key, f"{key} must be true or false"))
     elif key == "headers":

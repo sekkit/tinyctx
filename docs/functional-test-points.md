@@ -7,7 +7,7 @@ file is added.
 
 ## Routing and Proxy
 
-- **Route decision engine** — local/frontier decisions, compaction routing, token/turn thresholds, classifier fallback, self-classify escalation, and model capability defaults. Covered by `tests/test_router.py`, `tests/test_dynamic_thresholds.py`, `tests/test_classifier.py`, `tests/test_self_classify.py`.
+- **Route decision engine** — local/frontier decisions, compaction routing, token/turn thresholds, classifier fallback, advisor-only self-classify recommendations, and model capability defaults. Covered by `tests/test_router.py`, `tests/test_dynamic_thresholds.py`, `tests/test_classifier.py`, `tests/test_self_classify.py`.
 - **Proxy forwarding contract** — `/v1/responses`, `/v1/chat/completions`, forced route model IDs, encrypted reasoning scrub, local/frontier fake-backend routing, retry policy, and compactor fallback behavior. Covered by `tests/test_proxy_integration.py`, `tests/test_proxy_retry.py`, `tests/test_proxy_compactor_integration.py`.
 - **Frontier optimization path** — frontier-only tool trimming, advisor-hint suppression, and proactive compaction discipline for expensive models. Covered by `tests/test_frontier_optimizations.py`, `tests/test_proactive_compact.py`.
 - **LMCache passthrough path** — opt-in preservation of `prompt_cache_key` for external vLLM/SGLang+LMCache stacks while default strict-backend stripping remains unchanged. Covered by `tests/test_lmcache_passthrough.py`.
@@ -37,6 +37,7 @@ file is added.
 - **Tool-call translation** — XML function-call parsing, chat-to-responses rebuilds, stream translator state, unknown-tool protection, advisor auto-answer, text-choice interception, and deterministic Responses fixture replay. Covered by `tests/test_tool_call_translator.py`, `tests/test_responses_fixture_replay.py`.
 - **Orchestration and task guidance** — dynamic skill validation/rendering, orchestration injection/runtime, orchestrator config, task planning, and task supervision. Covered by `tests/test_dynamic_skill.py`, `tests/test_orchestration_injector.py`, `tests/test_orchestration_runtime.py`, `tests/test_orchestrator_config.py`, `tests/test_task_orchestrator.py`, `tests/test_task_supervisor.py`.
 - **Tool metrics and integration workflow** — tool-call frequency snapshots, call-id deduping, path coverage, and end-to-end integration workflow shape. Covered by `tests/test_tool_metrics.py`, `tests/test_path_coverage_e2e.py`, `tests/test_integration_workflow.py`.
+- **Task orchestration and dynamic skills** — orchestrator config, task supervision, orchestration runtime/injection, dynamic skill loading, and skill catalog discovery. Covered by `tests/test_orchestrator_config.py`, `tests/test_task_orchestrator.py`, `tests/test_task_supervisor.py`, `tests/test_orchestration_runtime.py`, `tests/test_orchestration_injector.py`, `tests/test_dynamic_skill.py`, `tests/test_skill_catalog.py`.
 - **Lingua compression** — optional token compression policy, input filtering, and frontier compression hooks. Covered by `tests/test_lingua.py`.
 - **Registry helpers** — project registration and lookup for recurring maintenance flows. Covered by `tests/test_registry.py`.
 

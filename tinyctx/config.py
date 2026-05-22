@@ -122,6 +122,9 @@ class RoutingView(_NSView):
       redirect_compaction_to_local: Route codex's compaction handoff
         prompt to local. The highest-leverage cost win.
       self_classify_threshold: Local model's P(escalate) cutoff.
+      self_classify_escalates_to_frontier: Legacy mode: convert that
+        cutoff into a full-turn frontier route instead of advisor-only
+        telemetry. Default false to keep frontier as short consultation.
     """
 
     _FIELD_MAP = {
@@ -130,6 +133,7 @@ class RoutingView(_NSView):
         "escalate_input_tokens": "escalate_input_tokens",
         "redirect_compaction_to_local": "redirect_compaction_to_local",
         "self_classify_threshold": "self_classify_threshold",
+        "self_classify_escalates_to_frontier": "self_classify_escalates_to_frontier",
     }
 
 
@@ -620,19 +624,24 @@ class Config:
     # per frontier request.
     frontier_skip_advisor_hint: bool = True
 
-    # Model-driven escalation: ask the LOCAL model itself whether to
-    # escalate this turn to frontier. Aligned with Anthropic Advisor
-    # Strategy (claude.com/blog/the-advisor-strategy) — the executor
-    # decides, not infrastructure-by-bytes. See tinyctx/self_classify.py
-    # for the prompt and contract.
+    # Advisor recommendation classifier: ask the LOCAL model itself
+    # whether this turn deserves stronger strategic guidance. Aligned
+    # with Anthropic Advisor Strategy (claude.com/blog/the-advisor-strategy):
+    # frontier should be a short advisor consultation, not the default
+    # executor for an entire agent loop. See tinyctx/self_classify.py.
     #
-    # Default ON. Cost depends on local backend speed; cached 60s by
-    # per-project key so codex retries don't re-classify. Tool-result
-    # roundtrips are skipped, so this only fires on fresh user queries.
+    # Default ON. This is a local-backend classifier only; by default it
+    # records advisor telemetry and route reasons while keeping execution
+    # local. Tool-result roundtrips are skipped, so this only fires on
+    # fresh user queries.
     self_classify_enabled: bool = True
-    # P(escalate) >= this → frontier. 0.7 matches the existing trained-
-    # classifier threshold. Lower = more aggressive escalation.
+    # P(advisor-needed) >= this → advisor recommendation. Lower = more
+    # aggressive recommendation.
     self_classify_threshold: float = 0.7
+    # Legacy / emergency switch: when true, a self-classify hit routes
+    # the whole turn to frontier. Default false keeps frontier usage near
+    # advisor-strategy levels instead of making frontier the executor.
+    self_classify_escalates_to_frontier: bool = False
     # Time budget for the classifier call. Reasoning-class local models
     # (qwen3.x-think, DeepSeek-R1 family) burn 200-1500 tokens on hidden
     # chain-of-thought before emitting the JSON verdict; at 50 tok/s that
@@ -1152,6 +1161,9 @@ def load_config() -> Config:
     fr = _env("TINYCTX_FORCE_ROUTE")
     if fr is not None:
         cfg.force_route = fr
+    sce = _env_bool("TINYCTX_SELF_CLASSIFY_ESCALATES_TO_FRONTIER")
+    if sce is not None:
+        cfg.self_classify_escalates_to_frontier = sce
     vb = _env("TINYCTX_VERBOSE")
     if vb is not None:
         cfg.verbose = vb == "1"

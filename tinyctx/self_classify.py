@@ -1,18 +1,19 @@
-"""Model-driven escalation classifier (Anthropic Advisor Strategy aligned).
+"""Model-driven advisor recommendation classifier.
 
 Anthropic's Advisor Strategy puts the routing decision in the model's
 hands: the executor invokes `advisor()` when IT decides strategic input
 is needed. tinyctx's pure proxy can't observe a tool call before
 forwarding, so we approximate that contract with a lightweight
-PRE-FLIGHT classifier: the proxy asks the LOCAL model itself "should
-this turn escalate?" and uses the answer to override its routing.
+PRE-FLIGHT classifier: the proxy asks the LOCAL model itself whether
+this turn deserves advisor guidance. By default the answer becomes
+telemetry and a local route reason; legacy full-turn escalation is opt-in.
 
 Why this is the most-general and Anthropic-aligned approach:
   - The classifier IS the executor model (or a peer of the same class).
     No external trained scorer to maintain. No labeled training data.
   - Quality automatically tracks the local model's quality — when you
     upgrade local, the classifier upgrades for free.
-  - The reason field is interpretable: every escalation decision lands
+  - The reason field is interpretable: every advisor recommendation lands
     in trace JSONL with the model's own justification.
 
 Cost / latency:
@@ -44,14 +45,14 @@ from typing import Any
 import httpx
 
 
-_SYSTEM_PROMPT = """You are a routing classifier inside an LLM gateway. Decide whether the next turn should escalate to a stronger advisor model OR be handled by the cheaper local executor. The work could be coding, debugging, research, writing, planning, analysis, code review, refactoring, data work, system design, or any other reasoning task.
+_SYSTEM_PROMPT = """You are an advisor-need classifier inside an LLM gateway. Decide whether the local executor should ask a stronger advisor for a SHORT PLAN/CORRECTION, or continue locally. The work could be coding, debugging, research, writing, planning, analysis, code review, refactoring, data work, system design, or any other reasoning task.
 
 Output EXACTLY one JSON object on a single line. No prose, no markdown fence, no commentary:
 {"escalate": true|false, "p": 0.0-1.0, "reason": "<≤10 words>"}
 
 CRITICAL: keep "reason" ≤10 words. Long reasons get truncated by the token cap and break parsing.
 
-═══ Escalate (true, p ≥ 0.7) when ANY apply ═══
+═══ Recommend advisor (true, p ≥ 0.7) when ANY apply ═══
 
 Decision quality matters
   - Multiple valid approaches with real trade-offs (architecture, API contract, model/library/framework choice, data shape, study design, naming that propagates, build pipeline)
@@ -65,9 +66,7 @@ Stuck or failure signals
   - "I don't know how to proceed" / asking for direction
 
 Reasoning depth required
-  - Cross-file or cross-document synthesis (>3 files / sources)
-  - Multi-step plans where early missteps compound (3+ dependent steps)
-  - Subtle technical judgment: edge cases, off-by-one, FP precision, locale, timezone, encoding, threat model, ambiguous spec
+  - Subtle technical judgment where a short second opinion would materially change the plan: edge cases, off-by-one, FP precision, locale, timezone, encoding, threat model, ambiguous spec
   - Adversarial reasoning: what could go wrong, what's an attacker doing, what edge case breaks this
 
 Ambiguous intent
@@ -98,7 +97,7 @@ Continuation
 
 If genuinely unsure → escalate=false with p in 0.3-0.5. The advisor is expensive; only call when a stronger reasoner would GENUINELY change the answer (not just say it more eloquently).
 
-Don't escalate just because the input is long or the topic is technical. Length and jargon are not difficulty.
+Don't recommend advisor just because the task has multiple steps, the input is long, or the topic is technical. Length, workflow breadth, and jargon are not difficulty.
 
 Don't escalate to "be safe". Confidence and brevity in the local model is fine when the work is routine.
 

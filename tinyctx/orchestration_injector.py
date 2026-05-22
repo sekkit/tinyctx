@@ -51,7 +51,13 @@ def _render_block(plan: TaskPlan, *, dynamic_skill_text: str | None) -> str:
         "Recommended skills: " + _join(plan.recommended_skills),
         "Recommended MCP: " + _join(plan.recommended_mcp),
         "Routing hint: " + (plan.routing_hint or "auto"),
+        "Execution mode: " + getattr(plan, "execution_mode", "serial"),
+        "Execution reason: " + getattr(plan, "execution_reason", ""),
     ]
+    parallel_subtasks = list(getattr(plan, "parallel_subtasks", []) or [])
+    if parallel_subtasks:
+        lines.append("Parallel subtasks:")
+        lines.extend(_format_parallel_subtask(item) for item in parallel_subtasks)
     if plan.constraints:
         lines.append("Constraints:")
         lines.extend(f"- {item}" for item in plan.constraints)
@@ -66,6 +72,13 @@ def _render_block(plan: TaskPlan, *, dynamic_skill_text: str | None) -> str:
 
 def _join(values: list[str]) -> str:
     return ", ".join(values) if values else "(none)"
+
+
+def _format_parallel_subtask(item: dict[str, str]) -> str:
+    title = str(item.get("title") or "Subtask").strip()
+    agent = str(item.get("agent") or "worker").strip()
+    prompt = str(item.get("prompt") or title).strip()
+    return f"- {title} -> {agent}: {prompt}"
 
 
 def _dynamic_skill_hash(value: Any) -> str | None:
