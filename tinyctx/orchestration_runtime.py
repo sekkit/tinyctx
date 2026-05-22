@@ -82,6 +82,9 @@ def apply_orchestration(
             str(inject_info.get("dynamic_skill_hash") or "")
         )
         trace.orchestrator_rationale = str(plan.rationale or "")
+        trace.orchestrator_execution_mode = str(plan.execution_mode or "serial")
+        trace.orchestrator_execution_reason = str(plan.execution_reason or "")
+        trace.orchestrator_parallel_subtasks = list(plan.parallel_subtasks or [])
         trace.task_id = record.task_id
         trace.task_title = record.title
         trace.task_state = record.state

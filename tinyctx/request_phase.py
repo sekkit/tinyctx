@@ -49,6 +49,7 @@ class RequestPhase(str, Enum):
     retrying = "retrying"
     escalated_to_frontier = "escalated_to_frontier"
     empty_guarded = "empty_guarded"
+    compacting = "compacting"
 
 
 # ─── SessionState namespace + compaction reset policy ─────────────────────

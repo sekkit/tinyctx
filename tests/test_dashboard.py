@@ -137,6 +137,34 @@ def test_recent_endpoint_returns_formatted_events(tmp_path: Path):
     assert "mutation_gate" not in kinds
 
 
+def test_recent_request_trace_includes_execution_mode(tmp_path: Path):
+    now = time.time()
+    events = [
+        {"t": now - 30, "event": "request_trace",
+         "forced_by_client_model": False,
+         "route": "local", "status": 200, "elapsed_s": 5.0,
+         "forwarded_bytes": 1000, "bytes_out": 100, "turn_count": 10,
+         "keepalives_emitted": 0, "error_streak": 0,
+         "orchestrator_injected": True,
+         "orchestrator_task_type": "review",
+         "orchestrator_confidence": 0.93,
+         "orchestrator_execution_mode": "parallel_subagents",
+         "orchestrator_execution_reason": "independent review lanes",
+         "orchestrator_parallel_subtasks": [
+             {"title": "API pass", "agent": "reviewer", "prompt": "review API"},
+         ]},
+    ]
+    _write_jsonl(_today_path(tmp_path), events)
+
+    app = _make_app(tmp_path)
+    client = TestClient(app)
+    body = client.get("/dashboard/recent?limit=10").json()
+
+    item = body[0]
+    assert item["orchestrator_execution_mode"] == "parallel_subagents"
+    assert item["orchestrator_parallel_subtasks"][0]["title"] == "API pass"
+
+
 def test_recent_filters_out_pytest_traffic(tmp_path: Path):
     now = time.time()
     events = [

@@ -15,8 +15,10 @@
 # configured frontier backend (gpt-5.5 by default). Every advisor call
 # shows up in tinyctx-trace with `forced_by_client_model=true`.
 #
-# Cost shape: each spawn costs ~5-10K frontier tokens. Budget ~3 calls/task.
+# Cost shape: each short consultation costs ~5-10K frontier tokens.
+# Budget ~3 calls/task.
 
+name = "advisor"
 model = "tinyctx-frontier"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
@@ -25,7 +27,7 @@ web_search = "disabled"
 developer_instructions = """
 You are an expert advisor for a coding agent. The agent has hit a decision it can't reasonably make on its own and is consulting you. Your job:
 
-1. Give CONCISE, ACTIONABLE guidance — 200-500 words is the target.
+1. Give CONCISE, ACTIONABLE guidance — 100-200 words is the target.
 2. If the question is well-posed: answer directly with the best approach + 1-2 sentences on WHY.
 3. If the question is ambiguous or under-specified: state your assumption clearly, then advise based on it.
 4. If you'd need information the agent didn't provide: name what specific information you'd need (don't ask follow-ups, just enumerate).

@@ -377,7 +377,7 @@ The Advisor Strategy ([Anthropic blog](https://claude.com/blog/the-advisor-strat
 when stuck on a decision         ──→ ask_advisor(question, context)
                                        ↓
                                    consult frontier (gpt-5.5)
-                                   return 200-500 word guidance
+                                   return 100-200 word guidance
                                        ↓
 executor resumes with advice     ←──
 ```
@@ -397,6 +397,7 @@ config_file = "agents/advisor.toml"
 
 ```toml
 # ~/.codex/agents/advisor.toml
+name = "advisor"
 model = "tinyctx-frontier"            # forced-route alias → tinyctx ships the call to gpt-5.5
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
@@ -408,7 +409,7 @@ You are an expert advisor for a coding agent...
 """
 ```
 
-The executor then calls `spawn_agent(role="advisor", task="<question>")` and awaits with `wait_agent`. codex starts a sub-thread, the sub-thread's `model="tinyctx-frontier"` makes tinyctx force-route to the frontier (every call shows up in `tinyctx-trace --watch` with `forced_by_client_model=true`), gpt-5.5 returns its 200-500 word guidance, the executor reads it, life continues.
+The executor then calls `spawn_agent(role="advisor", task="<question>")` and awaits with `wait_agent`. codex starts a sub-thread, the sub-thread's `model="tinyctx-frontier"` makes tinyctx force-route to the frontier (every call shows up in `tinyctx-trace --watch` with `forced_by_client_model=true`), gpt-5.5 returns its 100-200 word guidance, the executor reads it, life continues.
 
 End-to-end verified on Codex.app 0.128.0-alpha.1: PING → advisor sub-thread → gpt-5.5 → PONG response in ~7s with `forced_by_client_model=true` confirmed in trace.
 

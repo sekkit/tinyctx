@@ -20,6 +20,7 @@ def config_schema() -> dict[str, Any]:
                 _field("redirect_compaction_to_local", "Route compaction to local", "boolean"),
                 _field("goal_control_frontier_enabled", "Route goal control turns to frontier", "boolean"),
                 _field("sanitize_encrypted_content", "Strip encrypted reasoning payloads", "boolean"),
+                _field("self_classify_escalates_to_frontier", "Self-classify routes whole turn to frontier", "boolean"),
                 _field("escalate_input_tokens", "Escalate token threshold", "integer", minimum=0),
                 _field("escalate_turn_count", "Escalate turn threshold", "integer", minimum=0),
                 _field("escalate_on_error_streak", "Escalate after tool error streak", "integer", minimum=0),

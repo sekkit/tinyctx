@@ -52,6 +52,7 @@ def effective_config() -> dict[str, Any]:
             "force_route": cfg.force_route,
             "redirect_compaction_to_local": cfg.redirect_compaction_to_local,
             "sanitize_encrypted_content": cfg.sanitize_encrypted_content,
+            "self_classify_escalates_to_frontier": cfg.self_classify_escalates_to_frontier,
             "escalate_input_tokens": cfg.escalate_input_tokens,
             "escalate_turn_count": cfg.escalate_turn_count,
             "escalate_on_error_streak": cfg.escalate_on_error_streak,
@@ -70,6 +71,7 @@ def env_overrides() -> dict[str, Any]:
         "frontier.model": "TINYCTX_FRONTIER_MODEL",
         "frontier.wire_api": "TINYCTX_FRONTIER_WIRE_API",
         "routing.force_route": "TINYCTX_FORCE_ROUTE",
+        "routing.self_classify_escalates_to_frontier": "TINYCTX_SELF_CLASSIFY_ESCALATES_TO_FRONTIER",
         "server.verbose": "TINYCTX_VERBOSE",
     }
     return {

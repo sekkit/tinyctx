@@ -50,8 +50,8 @@ from typing import Iterable
 # strings stable forever — changing them turns the block into orphan
 # user-edited config from tinyctx's POV and we'll silently leave it
 # alone (idempotent-by-content).
-MANAGED_BEGIN = "# ─── tinyctx-managed MCP servers (auto, do not hand-edit) ───"
-MANAGED_END = "# ─── end tinyctx-managed MCP servers ───"
+MANAGED_BEGIN = "# --- tinyctx-managed MCP servers (auto, do not hand-edit) ---"
+MANAGED_END = "# --- end tinyctx-managed MCP servers ---"
 
 DEFAULT_CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 

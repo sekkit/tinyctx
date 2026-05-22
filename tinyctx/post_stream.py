@@ -4,14 +4,14 @@ P7 of the proxy refactor consolidates the ~300 LOC of post-stream logic
 that used to live in `proxy._stream_proxy`'s finally / except blocks
 into three focused classes:
 
-  - `PostStreamAnalyzer.analyze(ctx)` — spawns the soft-completion
+  - `PostStreamAnalyzer.analyze(ctx)` - spawns the soft-completion
     classifier as a fire-and-forget background task (preserving the
     pre-refactor non-blocking timing) and runs the empty-response guard.
-  - `RelayErrorTerminator` — handles `StallCancelledError` and
+  - `RelayErrorTerminator` - handles `StallCancelledError` and
     `httpx.HTTPError` raised from the relay: builds the SSE error event,
     sets the force-frontier flag (when streak warrants escalation),
     writes forensics.
-  - `ForensicsPolicy` — single chokepoint for all forensics dumps. Maps
+  - `ForensicsPolicy` - single chokepoint for all forensics dumps. Maps
     a trigger name to the correct gating flag, computes the dump
     directory from `cfg.log_dir`, and forwards to `forensics.write_*`.
     The list of supported triggers is documented in
@@ -44,7 +44,7 @@ from . import stall_watchdog as _stall
 from .request_phase import RequestPhase, set_phase as _phase_set
 
 
-# ─── ForensicsPolicy ──────────────────────────────────────────────────────
+# --- ForensicsPolicy ------------------------------------------------------
 
 
 class ForensicsPolicy:
@@ -75,7 +75,7 @@ class ForensicsPolicy:
         "empty_response",             # empty_response_guard tripped
         "stream_error",               # httpx.HTTPError mid-stream
         "stall_cancelled_relay",      # watchdog cancelled producer
-        # "upstream_<NNN>"            # any 4xx/5xx status — see is_supported_trigger
+        # "upstream_<NNN>"            # any 4xx/5xx status - see is_supported_trigger
     )
 
     # Error-class triggers gated by forensics_capture_errors
@@ -96,7 +96,7 @@ class ForensicsPolicy:
             return True
         if trigger.startswith("upstream_"):
             return True
-        # punt_p{NN} family — written by soft_completion.write_punt_forensics
+        # punt_p{NN} family - written by soft_completion.write_punt_forensics
         if trigger.startswith("punt_p"):
             return True
         return False
@@ -151,7 +151,7 @@ class ForensicsPolicy:
             return None
 
 
-# ─── PostStreamAnalyzer ───────────────────────────────────────────────────
+# --- PostStreamAnalyzer ---------------------------------------------------
 
 
 @dataclass
@@ -175,7 +175,7 @@ class PostStreamContext:
 
 class PostStreamAnalyzer:
     """Coordinates the post-stream analysis pipeline. Spawned by the
-    proxy's `_stream_proxy` finally block — see `analyze(ctx)`.
+    proxy's `_stream_proxy` finally block - see `analyze(ctx)`.
 
     Responsibilities:
       1. Spawn the soft-completion classifier as a background task
@@ -200,7 +200,7 @@ class PostStreamAnalyzer:
         self._maybe_spawn_classifier(ctx)
         self._maybe_run_empty_response_guard(ctx)
 
-    # ── soft-completion classifier (background) ─────────────────────
+    # -- soft-completion classifier (background) ---------------------
 
     def _maybe_spawn_classifier(self, ctx: PostStreamContext) -> None:
         cfg = self._cfg
@@ -348,7 +348,7 @@ class PostStreamAnalyzer:
             self._log("soft_completion_classify_error",
                       session=ctx.proj_sid, error=str(e))
 
-    # ── empty-response guard ───────────────────────────────────────
+    # -- empty-response guard ---------------------------------------
 
     def _maybe_run_empty_response_guard(self, ctx: PostStreamContext) -> None:
         cfg = self._cfg
@@ -387,7 +387,7 @@ class PostStreamAnalyzer:
                       session=ctx.proj_sid, error=str(e))
 
 
-# ─── RelayErrorTerminator ─────────────────────────────────────────────────
+# --- RelayErrorTerminator -------------------------------------------------
 
 
 @dataclass
@@ -490,9 +490,9 @@ class RelayErrorTerminator:
                     self._log("stream_error_will_retry_same_backend",
                               session=proj_sid,
                               streak=self._streak[proj_sid])
-            except Exception:  # noqa: BLE001 — phase emission is telemetry, not load-bearing
+            except Exception:  # noqa: BLE001 - phase emission is telemetry, not load-bearing
                 # Why: phase tracking is observability. A telemetry
-                # failure must never crash the post-stream error path —
+                # failure must never crash the post-stream error path -
                 # the actual retry decision is already committed above.
                 pass
 

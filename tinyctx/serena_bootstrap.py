@@ -57,20 +57,20 @@ _SERENA_CONFIG_BLOCK_TEMPLATE = """
 #                            which has too-verbose tool descriptions for
 #                            codex's prompt budget)
 #   --project-from-cwd       auto-detect project from codex session's cwd
-#                            (Path-search: .serena/project.yml → .git → cwd
+#                            (Path-search: .serena/project.yml -> .git -> cwd
 #                            fallback). Without this, serena boots into
 #                            "no active project" state, the model would
 #                            need to call `activate_project` first, and
 #                            the dashboard at :24282 stays empty.
 #   --open-web-dashboard false
 #                            Suppress browser-popup-on-launch. The dashboard
-#                            stays running on :24282 — you can still open it
+#                            stays running on :24282 - you can still open it
 #                            manually if you want. Without this flag, every
 #                            codex session spawns a serena that pops a new
 #                            browser tab (codex spawns one MCP per session,
 #                            so this can flood with 3-5 tabs in a busy day).
 #
-# The bare `serena` CLI also has `--mode codex` — that's a DIFFERENT
+# The bare `serena` CLI also has `--mode codex` - that's a DIFFERENT
 # option than `--context codex` and the bootstrap MUST NOT use it
 # (verified: rejected as "No such option").
 {marker}

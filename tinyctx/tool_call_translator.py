@@ -52,6 +52,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from .sanitize import renest_tool_arguments
+
 
 # ───────────────────────────── format detection ───────────────────────────
 
@@ -180,6 +182,7 @@ def _strip_tool_call_blocks(text: str) -> str:
 def rebuild_response(
         response: dict[str, Any],
         valid_tool_names: set[str] | None = None,
+        flattened_tool_args: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     """Take a Responses-API completion JSON and return a copy in which any
     `output_text` content containing `<tool_call>` XML has been replaced by
@@ -250,6 +253,9 @@ def rebuild_response(
                     name, valid_tool_names)
                 name = replacement["name"]
                 arguments = replacement["arguments"]
+            else:
+                arguments = renest_tool_arguments(
+                    name, arguments, flattened_tool_args)
             new_items.append({
                 "id": cid,
                 "type": "function_call",
@@ -299,6 +305,7 @@ class StreamTranslator:
     # synthetic `shell echo` call so codex can dispatch it cleanly. None
     # (default) preserves legacy pass-through.
     valid_tool_names: set[str] | None = None
+    flattened_tool_args: dict[str, set[str]] | None = None
 
     # ────────── public API ──────────
 
@@ -592,6 +599,9 @@ class StreamTranslator:
                 name, self.valid_tool_names)
             name = replacement["name"]
             arguments = replacement["arguments"]
+        else:
+            arguments = renest_tool_arguments(
+                name, arguments, self.flattened_tool_args)
         yield self._build_event(
             "response.output_item.added",
             {"type": "response.output_item.added",
@@ -1062,6 +1072,7 @@ class ChatToResponsesTranslator:
     # validation (legacy pass-through). When set, function_calls naming a
     # tool not in the set are rewritten to a synthetic `shell echo` call.
     valid_tool_names: set[str] | None = None
+    flattened_tool_args: dict[str, set[str]] | None = None
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         self._partial += chunk.decode("utf-8", errors="replace")
@@ -1362,6 +1373,10 @@ class ChatToResponsesTranslator:
                 # Mutate the entry too so the response.completed final
                 # output items list (built below) reflects the rewrite.
                 entry["name"] = name
+                entry["arguments"] = arguments
+            else:
+                arguments = renest_tool_arguments(
+                    name, arguments, self.flattened_tool_args)
                 entry["arguments"] = arguments
             yield self._sse("response.output_item.added", {
                 "type": "response.output_item.added",

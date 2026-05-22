@@ -600,7 +600,8 @@ class Router:
             tail = (f": {ctx.classify_reason}" if ctx.classify_reason else "")
             if not getattr(self.cfg, "self_classify_escalates_to_frontier", False):
                 return self._make_local_decision(
-                    ctx, f"self-classify p={ctx.classify_p:.2f} advisor-only{tail}")
+                    ctx,
+                    f"self-classify p={ctx.classify_p:.2f} advisor-only{tail}")
             return self._make_frontier_decision(
                 ctx, f"self-classify p={ctx.classify_p:.2f}{tail}")
         return None

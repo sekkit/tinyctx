@@ -481,8 +481,8 @@ def test_proxy_passes_prompt_tiers_and_proj_sid_to_poke():
     from pathlib import Path
     pkg = Path(__file__).resolve().parent.parent / "tinyctx"
     srcs = [
-        (pkg / "post_stream.py").read_text(),
-        (pkg / "proxy.py").read_text(),
+        (pkg / "post_stream.py").read_text(encoding="utf-8"),
+        (pkg / "proxy.py").read_text(encoding="utf-8"),
     ]
     for src in srcs:
         idx = src.find("_xr.poke(")

@@ -87,6 +87,17 @@ def test_validate_sections_rejects_bad_url_and_wire_api():
     assert "auto, local, or frontier" in messages
 
 
+def test_validate_sections_accepts_self_classify_legacy_switch():
+    from tinyctx.config_schema import validate_sections
+
+    result = validate_sections({
+        "routing": {"self_classify_escalates_to_frontier": False},
+    })
+
+    assert result["ok"] is True
+    assert result["errors"] == []
+
+
 def test_presets_include_lmstudio_and_codex_official():
     from tinyctx.config_schema import config_presets
 
