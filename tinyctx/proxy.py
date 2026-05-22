@@ -1135,6 +1135,8 @@ async def responses(request: Request) -> Any:
                     session=sid,
                     task_id=task_record.task_id,
                     task_type=task_record.task_type,
+                    execution_mode=task_record.execution_mode,
+                    parallel_subtasks=len(task_record.parallel_subtasks),
                     injected=trace.orchestrator_injected,
                     dynamic_skill_hash=trace.orchestrator_dynamic_skill_hash,
                 )

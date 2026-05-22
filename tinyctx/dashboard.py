@@ -103,6 +103,9 @@ def _format_event_for_dashboard(e: dict[str, Any]) -> dict[str, Any] | None:
             "orchestrator_confidence": float(e.get("orchestrator_confidence", 0.0) or 0.0),
             "orchestrator_skills": list((e.get("orchestrator_skills") or []))[:3],
             "orchestrator_mcp": list((e.get("orchestrator_mcp") or []))[:3],
+            "orchestrator_execution_mode": (e.get("orchestrator_execution_mode", "serial") or "serial")[:40],
+            "orchestrator_execution_reason": (e.get("orchestrator_execution_reason", "") or "")[:120],
+            "orchestrator_parallel_subtasks": list((e.get("orchestrator_parallel_subtasks") or []))[:5],
             "task_state": (e.get("task_state", "") or "")[:20],
             "session_id": (e.get("session_id", "") or "")[:24],
         })
@@ -627,6 +630,8 @@ _DASHBOARD_HTML = """<!doctype html>
         ? ` · orch=${escapeHTML(e.orchestrator_task_type || "unknown")}(${Number(e.orchestrator_confidence || 0).toFixed(2)})`
           + (Array.isArray(e.orchestrator_skills) && e.orchestrator_skills.length
             ? ` skills=${escapeHTML(e.orchestrator_skills.join(","))}` : "")
+          + (e.orchestrator_execution_mode && e.orchestrator_execution_mode !== "serial"
+            ? ` exec=${escapeHTML(e.orchestrator_execution_mode)}` : "")
           + (e.task_state ? ` state=${escapeHTML(e.task_state)}` : "")
         : "";
       return badge + info + orch;

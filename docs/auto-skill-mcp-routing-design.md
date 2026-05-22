@@ -80,10 +80,17 @@ plan_task(body, cfg, catalog) -> TaskPlan
   "dynamic_skill_needed": false,
   "dynamic_skill": null,
   "routing_hint": "local|frontier|auto",
+  "execution_mode": "serial|parallel_subagents|advisor_only",
+  "execution_reason": "why this should run serially or fan out",
+  "parallel_subtasks": [
+    {"title": "API pass", "agent": "worker", "prompt": "review API contracts"}
+  ],
   "constraints": ["test-first", "use context-mode for large searches"],
   "rationale": "short human-readable reason"
 }
 ```
+
+`execution_mode` 是一等编排字段：默认 `serial`，只有当任务天然可拆成互不依赖的审查/调研/验证 lane，或用户明确要求并行/subagent/fan-out 时才使用 `parallel_subagents`。`parallel_subtasks` 只描述建议分工，不直接替 executor 调用 `spawn_agent`，避免 proxy 擅自改变 Codex 的执行语义。
 
 ### 3. `dynamic_skill.py`
 
@@ -114,6 +121,7 @@ Verification:
 
 - 使用明确 marker：`<!-- tinyctx-orchestrator:start -->`。
 - 不覆盖用户/AGENTS/system/developer 指令，只追加“建议使用”。
+- 明确写入 `Execution mode`、`Execution reason`，并在并行模式下列出 `Parallel subtasks`。
 - 注入内容控制在 1–2 KB。
 - 当 local route 发送给 chat backend 时，也经过 `normalize_for_chat` 保持 system 在开头。
 
@@ -166,6 +174,7 @@ stateDiagram-v2
 tinyctx 内的用途：
 
 - **任务状态**：把 route/self-classify/soft-completion/stall 事件归并到同一个 task。
+- **执行形态**：记录当前 task 应串行执行、只咨询 advisor，还是拆给多个 subagent 并行审查。
 - **恢复策略**：当 empty response、stall、失败测试、软结束发生时，按 task state 生成下一步。
 - **Proof-of-work**：完成时记录测试命令、trace、文件、截图或 dashboard 验证。
 - **Dashboard**：显示当前任务、状态、推荐 Skill/MCP、动态 Skill、阻塞原因。
@@ -233,7 +242,7 @@ trace_decisions = true
 
 - 开关：启用自动编排、启用动态 Skill、是否持久化。
 - Catalog 预览：已识别 Skill/MCP。
-- 最近决策：task_type、skills、mcp、dynamic_skill_hash、confidence。
+- 最近决策：task_type、skills、mcp、dynamic_skill_hash、confidence、execution_mode、parallel_subtasks。
 - Task Supervisor：当前 task state、acceptance、proof-of-work、blockers、recovery action。
 - 调试按钮：输入一段任务，预览 `TaskPlan`，不真正执行。
 
@@ -253,7 +262,7 @@ trace_decisions = true
 - 没有匹配 Skill 时生成 Dynamic Skill，并通过 validator 后注入。
 - 高风险任务不生成 Dynamic Skill。
 - 注入内容不会覆盖 AGENTS，且长度受限。
-- dashboard 能显示最近 orchestrator 决策。
+- dashboard 能显示最近 orchestrator 决策，包括串行/并行执行形态。
 - `TaskRecord` 能从请求中稳定生成 task id，并随 session 更新状态。
 - stall/empty response/soft completion 能写入 blocker 或 recovery action。
 - proof-of-work 能记录测试命令、trace id、变更文件摘要。

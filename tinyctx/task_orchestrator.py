@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from tinyctx.skill_catalog import default_catalog
@@ -18,6 +18,9 @@ class TaskPlan:
     routing_hint: str
     constraints: list[str]
     rationale: str
+    execution_mode: str = "serial"
+    execution_reason: str = "dependent task; execute in order"
+    parallel_subtasks: list[dict[str, str]] = field(default_factory=list)
 
 
 def plan_task(
@@ -56,6 +59,7 @@ def _coerce_plan(raw: Any) -> TaskPlan:
     if not isinstance(raw, dict):
         raise TypeError("planner output must be a dict or JSON object string")
 
+    execution_mode = _execution_mode(raw.get("execution_mode"))
     return TaskPlan(
         task_type=str(raw.get("task_type") or "unknown"),
         confidence=_float_or_zero(raw.get("confidence")),
@@ -66,6 +70,9 @@ def _coerce_plan(raw: Any) -> TaskPlan:
         routing_hint=str(raw.get("routing_hint") or "auto"),
         constraints=_string_list(raw.get("constraints")),
         rationale=str(raw.get("rationale") or "local planner"),
+        execution_mode=execution_mode,
+        execution_reason=str(raw.get("execution_reason") or _default_execution_reason(execution_mode)),
+        parallel_subtasks=_parallel_subtasks(raw.get("parallel_subtasks")),
     )
 
 
@@ -86,8 +93,44 @@ def _string_list(value: Any) -> list[str]:
     return [str(item) for item in value if item is not None]
 
 
+def _execution_mode(value: Any) -> str:
+    mode = str(value or "serial").strip().lower()
+    if mode in {"serial", "parallel_subagents", "advisor_only"}:
+        return mode
+    return "serial"
+
+
+def _default_execution_reason(mode: str) -> str:
+    if mode == "parallel_subagents":
+        return "independent subtasks can run in parallel"
+    if mode == "advisor_only":
+        return "single executor should consult advisor before proceeding"
+    return "dependent task; execute in order"
+
+
+def _parallel_subtasks(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value[:5]:
+        if isinstance(item, str):
+            title = item.strip()
+            if title:
+                out.append({"title": title, "agent": "worker", "prompt": title})
+            continue
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or "").strip()
+        prompt = str(item.get("prompt") or item.get("task") or title).strip()
+        agent = str(item.get("agent") or item.get("role") or "worker").strip()
+        if title and prompt:
+            out.append({"title": title, "agent": agent or "worker", "prompt": prompt})
+    return out
+
+
 def _fallback_plan(body: str, confidence: float) -> TaskPlan:
     task_type = _classify(body)
+    execution_mode, execution_reason, parallel_subtasks = _execution_decision(body, task_type)
     if task_type in {"coding", "debug"}:
         return TaskPlan(
             task_type=task_type,
@@ -99,6 +142,9 @@ def _fallback_plan(body: str, confidence: float) -> TaskPlan:
             routing_hint="auto",
             constraints=["test-first", "use context-mode for large searches"],
             rationale=f"fallback rules matched {task_type} task",
+            execution_mode=execution_mode,
+            execution_reason=execution_reason,
+            parallel_subtasks=parallel_subtasks,
         )
     if task_type == "design":
         return TaskPlan(
@@ -111,6 +157,9 @@ def _fallback_plan(body: str, confidence: float) -> TaskPlan:
             routing_hint="auto",
             constraints=["verify visual changes in browser"],
             rationale="fallback rules matched design task",
+            execution_mode=execution_mode,
+            execution_reason=execution_reason,
+            parallel_subtasks=parallel_subtasks,
         )
     if task_type == "research":
         return TaskPlan(
@@ -123,6 +172,9 @@ def _fallback_plan(body: str, confidence: float) -> TaskPlan:
             routing_hint="auto",
             constraints=["use context-mode for large searches"],
             rationale="fallback rules matched research task",
+            execution_mode=execution_mode,
+            execution_reason=execution_reason,
+            parallel_subtasks=parallel_subtasks,
         )
     return TaskPlan(
         task_type="unknown",
@@ -134,6 +186,9 @@ def _fallback_plan(body: str, confidence: float) -> TaskPlan:
         routing_hint="auto",
         constraints=["use context-mode for large searches"],
         rationale="fallback rules found no specific match",
+        execution_mode=execution_mode,
+        execution_reason=execution_reason,
+        parallel_subtasks=parallel_subtasks,
     )
 
 
@@ -152,3 +207,46 @@ def _classify(body: str) -> str:
 
 def _contains_any(text: str, terms: list[str]) -> bool:
     return any(term in text for term in terms)
+
+
+def _execution_decision(body: str, task_type: str) -> tuple[str, str, list[dict[str, str]]]:
+    text = (body or "").lower()
+    if task_type == "debug":
+        return "serial", "dependent debugging loop; fix and verify in order", []
+    explicit_parallel = _contains_any(
+        text,
+        [
+            "parallel", "concurrent", "fan out", "subagent", "sub-agent",
+            "并行", "同时", "分别",
+        ],
+    )
+    independent = explicit_parallel or _contains_any(
+        text,
+        ["independent", "separately", "独立", "互不依赖"],
+    )
+    subtasks = _infer_parallel_subtasks(text)
+    if independent and len(subtasks) >= 2:
+        return (
+            "parallel_subagents",
+            "independent subtasks can run in parallel",
+            subtasks,
+        )
+    return "serial", "dependent task; execute in order", []
+
+
+def _infer_parallel_subtasks(text: str) -> list[dict[str, str]]:
+    lanes = [
+        ("API pass", ["api", "接口"], "Review API contracts and integration risks."),
+        ("Test pass", ["test", "pytest", "测试"], "Review tests, gaps, and verification plan."),
+        ("Docs pass", ["docs", "documentation", "文档"], "Review documentation and user-facing guidance."),
+        ("Security pass", ["security", "auth", "安全", "权限"], "Review security, auth, and privacy risks."),
+        ("Performance pass", ["performance", "latency", "性能", "延迟"], "Review performance and latency risks."),
+        ("UI pass", ["ui", "ux", "visual", "界面"], "Review user experience and visual behavior."),
+    ]
+    out: list[dict[str, str]] = []
+    for title, needles, prompt in lanes:
+        if any(needle in text for needle in needles):
+            out.append({"title": title, "agent": "worker", "prompt": prompt})
+    if len(out) >= 2:
+        return out[:5]
+    return []

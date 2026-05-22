@@ -211,6 +211,9 @@ class RequestTrace:
     orchestrator_mcp: list[str] = field(default_factory=list)
     orchestrator_dynamic_skill_hash: str = ""
     orchestrator_rationale: str = ""
+    orchestrator_execution_mode: str = "serial"
+    orchestrator_execution_reason: str = ""
+    orchestrator_parallel_subtasks: list[dict[str, str]] = field(default_factory=list)
     task_id: str = ""
     task_title: str = ""
     task_state: str = ""

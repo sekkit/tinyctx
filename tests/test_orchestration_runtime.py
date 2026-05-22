@@ -21,6 +21,7 @@ def test_apply_orchestration_injects_plan_and_populates_trace():
     assert trace.orchestrator_injected is True
     assert trace.orchestrator_task_type in {"coding", "debug"}
     assert trace.orchestrator_skills
+    assert trace.orchestrator_execution_mode == "serial"
     assert trace.task_id == record.task_id
     assert record.state == "running"
 
@@ -68,3 +69,42 @@ def test_apply_orchestration_can_inject_valid_dynamic_skill_from_planner():
     assert "tinyctx Dynamic Skill" in out["instructions"]
     assert trace.orchestrator_dynamic_skill_hash
     assert record.dynamic_skill_hash == trace.orchestrator_dynamic_skill_hash
+
+
+def test_apply_orchestration_traces_parallel_execution_decision():
+    from tinyctx.orchestration_runtime import apply_orchestration
+
+    cfg = Config()
+    trace = RequestTrace()
+
+    def planner(_body, _catalog):
+        return {
+            "task_type": "review",
+            "confidence": 0.95,
+            "recommended_skills": ["cc-work"],
+            "recommended_mcp": ["serena"],
+            "dynamic_skill_needed": False,
+            "routing_hint": "auto",
+            "execution_mode": "parallel_subagents",
+            "execution_reason": "independent review lanes",
+            "parallel_subtasks": [
+                {"title": "API pass", "agent": "reviewer", "prompt": "review API"},
+                {"title": "Docs pass", "agent": "reviewer", "prompt": "review docs"},
+            ],
+            "constraints": [],
+            "rationale": "parallel review",
+        }
+
+    out, record = apply_orchestration(
+        {"instructions": "base", "input": "Review API and docs independently"},
+        cfg=cfg,
+        trace=trace,
+        local_planner=planner,
+    )
+
+    assert "Execution mode: parallel_subagents" in out["instructions"]
+    assert trace.orchestrator_execution_mode == "parallel_subagents"
+    assert trace.orchestrator_execution_reason == "independent review lanes"
+    assert trace.orchestrator_parallel_subtasks[0]["title"] == "API pass"
+    assert record.execution_mode == "parallel_subagents"
+    assert record.parallel_subtasks[1]["prompt"] == "review docs"
