@@ -1,0 +1,27 @@
+{
+  "kind": "sync_rebuild",
+  "description": "Plain Responses message remains a message and produces no function_call.",
+  "upstream": {
+    "id": "resp_text",
+    "object": "response",
+    "status": "completed",
+    "output": [
+      {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "hello from local"
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "function_call_names": [],
+    "message_text_contains": ["hello from local"]
+  }
+}

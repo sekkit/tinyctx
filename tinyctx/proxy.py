@@ -66,6 +66,7 @@ from .router import (
 from .sanitize import (
     CacheAwareMutator,
     cap_responses_fields,
+    collect_failure_signals,
     dedup_tool_calls,
     drop_orphan_tool_outputs,
     inject_responses_defaults,
@@ -710,6 +711,7 @@ async def responses(request: Request) -> Any:
             GuardContext,
             GuardPipeline,
             PlanPersistenceInjector,
+            trace_guard_results,
             SoftCompletionGate,
             StuckLoopGuard,
         )
@@ -744,6 +746,7 @@ async def responses(request: Request) -> Any:
         guard_results = GuardPipeline(active_guards).run(guard_ctx)
         body = guard_ctx.body
         guard_force_route = guard_ctx.force_route
+        trace.guard_results = trace_guard_results(guard_results)
 
         # Apply per-guard side effects (trace fields, phase, log emit).
         # The route override itself is consumed by Router.decide via
@@ -833,6 +836,34 @@ async def responses(request: Request) -> Any:
     # whose result would be discarded. Mirrors the original pre-refactor
     # gates plus the new guard_force_route path.
     _streak_thr = getattr(CFG, "escalate_on_error_streak", 0) or 0
+    _will_escalate_pre_classify = (
+        guard_force_route is not None
+        or (_streak_thr > 0 and streak >= _streak_thr)
+    )
+    if (not is_compaction
+            and not trace.forced_by_client_model
+            and guard_force_route is None):
+        try:
+            failure_signals = collect_failure_signals(body)
+            from .guards import decision_from_failure_scan
+            decision = decision_from_failure_scan(failure_signals)
+            trace.failure_signal_score = int(decision.trace.get("score", 0))
+            trace.failure_signals = [s.to_trace() for s in decision.signals]
+            if decision.signals or decision.action != "ok":
+                trace.guardrail_decisions.append(decision.to_trace())
+            if decision.should_escalate:
+                guard_force_route = "frontier"
+                _phase_set(proj_sid, RequestPhase.escalated_to_frontier,
+                           trace.request_id)
+                _log(
+                    "failure_signal_escalated_to_frontier",
+                    session=sid,
+                    proj_sid=proj_sid,
+                    score=decision.trace.get("score", 0),
+                    signals=[s.to_trace() for s in decision.signals],
+                )
+        except Exception as e:  # noqa: BLE001
+            _log("failure_signal_scan_error", session=sid, error=str(e))
     _will_escalate_pre_classify = (
         guard_force_route is not None
         or (_streak_thr > 0 and streak >= _streak_thr)

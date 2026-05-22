@@ -34,6 +34,9 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 
+GUARDRAIL_ACTIONS = {"ok", "repair", "retry", "escalate", "fatal"}
+
+
 @dataclass
 class GuardResult:
     """One guard's contribution to the request shape."""
@@ -43,6 +46,173 @@ class GuardResult:
     body_mutated: bool = False
     force_route: str | None = None  # "frontier" | "local" | None
     additional_log: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FailureSignal:
+    """A normalized guardrail failure signal.
+
+    This is intentionally protocol-neutral: callers may derive it from
+    Responses items, SSE chunks, sanitize preflight scans, or translator
+    repair attempts, but it never names Chat Completions wire shapes.
+    """
+    kind: str
+    source: str = ""
+    severity: int = 1
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any], *, source: str = "") -> "FailureSignal":
+        kind = str(value.get("kind") or value.get("type") or "unknown")
+        severity = value.get("severity", 1)
+        try:
+            sev = int(severity)
+        except (TypeError, ValueError):
+            sev = 1
+        detail = {k: v for k, v in value.items()
+                  if k not in {"kind", "type", "source", "severity"}}
+        return cls(
+            kind=kind,
+            source=str(value.get("source") or source or ""),
+            severity=max(0, sev),
+            detail=detail,
+        )
+
+    def to_trace(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "source": self.source,
+            "severity": self.severity,
+            **self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class GuardrailDecision:
+    """Protocol-neutral decision emitted by guardrail checks.
+
+    Final wire serialization still belongs to tinyctx's Responses/SSE
+    emitters; this shape only captures the policy decision.
+    """
+    action: str
+    reason: str = ""
+    source: str = ""
+    signals: tuple[FailureSignal, ...] = ()
+    trace: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.action not in GUARDRAIL_ACTIONS:
+            raise ValueError(f"unknown guardrail action: {self.action!r}")
+
+    @property
+    def should_escalate(self) -> bool:
+        return self.action == "escalate"
+
+    def to_trace(self) -> dict[str, Any]:
+        out = {
+            "action": self.action,
+            "reason": self.reason,
+            "source": self.source,
+            "signals": [s.to_trace() for s in self.signals],
+        }
+        out.update(self.trace)
+        return out
+
+
+class GuardrailErrorTracker:
+    """Small per-session consecutive failure counter.
+
+    Borrowed in spirit from forge's ErrorTracker, but scoped to tinyctx
+    guardrail signal kinds and intentionally free of retry execution.
+    """
+
+    def __init__(self, *, max_consecutive: int = 3):
+        self.max_consecutive = max(1, int(max_consecutive))
+        self._counts: dict[str, dict[str, int]] = {}
+
+    def record(self, session_id: str, signal_kind: str, *,
+               action: str = "retry") -> int:
+        sid = session_id or "global"
+        kind = signal_kind or "unknown"
+        if action == "ok":
+            self.reset(sid, kind)
+            return 0
+        bucket = self._counts.setdefault(sid, {})
+        bucket[kind] = bucket.get(kind, 0) + 1
+        return bucket[kind]
+
+    def exhausted(self, session_id: str, signal_kind: str) -> bool:
+        sid = session_id or "global"
+        kind = signal_kind or "unknown"
+        return self._counts.get(sid, {}).get(kind, 0) >= self.max_consecutive
+
+    def reset(self, session_id: str | None = None,
+              signal_kind: str | None = None) -> None:
+        if session_id is None:
+            self._counts.clear()
+            return
+        sid = session_id or "global"
+        if signal_kind is None:
+            self._counts.pop(sid, None)
+            return
+        bucket = self._counts.get(sid)
+        if bucket is None:
+            return
+        bucket.pop(signal_kind or "unknown", None)
+        if not bucket:
+            self._counts.pop(sid, None)
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        return {sid: dict(counts) for sid, counts in self._counts.items()}
+
+
+def trace_guard_results(results: list[GuardResult]) -> list[dict[str, Any]]:
+    """Return a compact trace-safe view of preflight guard results."""
+    return [
+        {
+            "guard": r.guard_name,
+            "fired": r.fired,
+            "reason": r.reason,
+            "body_mutated": r.body_mutated,
+            "force_route": r.force_route,
+            **({"log": r.additional_log} if r.additional_log else {}),
+        }
+        for r in results
+    ]
+
+
+def decision_from_failure_scan(
+    scan: dict[str, Any],
+    *,
+    source: str = "preflight_failure_scan",
+    escalate_threshold: int = 2,
+) -> GuardrailDecision:
+    """Convert sanitize.collect_failure_signals output into a decision."""
+    score_raw = scan.get("score", 0)
+    try:
+        score = int(score_raw)
+    except (TypeError, ValueError):
+        score = 0
+    signals = tuple(
+        FailureSignal.from_mapping(s, source=source)
+        for s in (scan.get("signals") or [])
+        if isinstance(s, dict)
+    )
+    if score >= escalate_threshold:
+        return GuardrailDecision(
+            action="escalate",
+            reason=f"failure_signal_score={score} >= {escalate_threshold}",
+            source=source,
+            signals=signals,
+            trace={"score": score, "threshold": escalate_threshold},
+        )
+    return GuardrailDecision(
+        action="ok",
+        reason=f"failure_signal_score={score}",
+        source=source,
+        signals=signals,
+        trace={"score": score, "threshold": escalate_threshold},
+    )
 
 
 @dataclass

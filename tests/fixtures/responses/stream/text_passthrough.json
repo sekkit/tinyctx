@@ -1,0 +1,10 @@
+{
+  "kind": "stream_feed",
+  "description": "Streaming text delta remains text and does not emit function_call.",
+  "deltas": ["hello stream"],
+  "expected": {
+    "event_subsequence": ["response.output_text.delta"],
+    "contains": ["hello stream"],
+    "not_contains": ["function_call"]
+  }
+}

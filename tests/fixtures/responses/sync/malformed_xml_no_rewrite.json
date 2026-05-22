@@ -1,0 +1,27 @@
+{
+  "kind": "sync_rebuild",
+  "description": "Malformed XML is not converted into a fake successful tool call.",
+  "upstream": {
+    "id": "resp_bad_xml",
+    "object": "response",
+    "status": "completed",
+    "output": [
+      {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "<tool_call><function=ls>"
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "function_call_names": [],
+    "message_text_contains": ["<tool_call><function=ls>"]
+  }
+}

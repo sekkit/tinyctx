@@ -202,6 +202,15 @@ class RequestTrace:
     lingua_chars_before: int = 0
     lingua_chars_after: int = 0
 
+    # Forge-inspired guardrail observability. `guard_results` records the
+    # existing preflight GuardPipeline wrappers. `guardrail_decisions`
+    # records protocol-neutral policy decisions such as failure-signal
+    # escalation; final Responses/SSE wire emission remains elsewhere.
+    guard_results: list = field(default_factory=list)
+    guardrail_decisions: list = field(default_factory=list)
+    failure_signal_score: int = 0
+    failure_signals: list = field(default_factory=list)
+
     # Task Orchestrator / Symphony-inspired supervisor. Records the
     # current-turn Skill/MCP guidance tinyctx injected before routing.
     orchestrator_injected: bool = False

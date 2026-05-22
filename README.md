@@ -31,6 +31,7 @@ codex CLI
 │  • Cache-discipline         (CacheAwareMutator gates)       │
 │  • read_delta               (repeat-Read → unified diff)    │
 │  • Tool-call XML translator (qwen-pythonic → structured)    │
+│  • Tool-call guardrails     (repair/validate/escalate trace)│
 │  • Chat→Responses SSE bridge (DeepSeek/Ollama/etc.)         │
 │  • Codex 0.128 wire-compat  (3 fixes for breaking changes)  │
 │  • LLMLingua-2 hook         (frontier compression, opt-in)  │
@@ -70,6 +71,7 @@ by scripts/install.sh):
 | Wire intercept | **tinyctx-proxy** | this repo | MIT |
 | Compression-biased ranker | **tinyctx.interest** | this repo, after [arxiv 2603.20396 §5.1](https://arxiv.org/abs/2603.20396) | MIT |
 | Repeat-Read delta | **tinyctx.read_delta** | this repo | MIT |
+| Tool-call guardrails + replay eval | **tinyctx.guards** + fixtures | this repo, after forge guardrail patterns | MIT |
 | Code knowledge graph (MCP) | gitnexus | upstream OSS | PolyForm-Noncommercial |
 | Code knowledge graph (skill) | graphify | upstream OSS | MIT |
 | Symbolic ops (LSP MCP) | serena | upstream OSS | MIT |
@@ -169,6 +171,20 @@ Inspect any one request via `tinyctx-trace --request <rid> -v`.
 
 All history-mutating transforms (dedup / purge / historian / read_delta / lingua) are gated by `CacheAwareMutator` so they only fire when the prompt-cache prefix is likely stale anyway (Anthropic 5-min TTL or context-usage threshold).
 
+### Tool-call guardrails and replay
+
+tinyctx borrows the useful part of [antoinezambelli/forge](https://github.com/antoinezambelli/forge): the guardrail pattern, not the Chat Completions proxy. The Responses/SSE wire shape stays owned by tinyctx.
+
+The current guardrail slice is deliberately thin:
+
+- `guards.FailureSignal` normalizes protocol-neutral failure evidence.
+- `guards.GuardrailDecision` records `ok | repair | retry | escalate | fatal` decisions without emitting wire events itself.
+- `guards.GuardrailErrorTracker` tracks repeated per-session failure kinds for future retry limiting.
+- `proxy.py` records pre-flight guard results and failure-signal escalation decisions into `RequestTrace`.
+- `tests/fixtures/responses/` replays deterministic Responses fixtures for text passthrough, XML tool-call repair, structured `function_call` passthrough, malformed XML no-rewrite, multi-call ordering, unknown-tool correction, and fragmented streaming tool calls.
+
+This keeps the forge-style reliability loop (`parse → validate → repair → retry/escalate → trace/eval`) while preserving Codex-specific invariants: `function_call` item semantics, SSE event order, `encrypted_content` scrub, and prompt-cache prefix stability.
+
 ## Compression-biased context ranking
 
 `tinyctx/interest.py` is a faithful adaptation of §5.1 of Aksenov, Bodnia, Freedman, Mulligan, *Compression Is All You Need: Modeling Mathematics* ([arxiv 2603.20396](https://arxiv.org/abs/2603.20396)) to a code corpus. The paper's central empirical finding is that human mathematics lives in the polynomial-growth (A_n, log-density) regime: a small number of hierarchically-nested macros buys exponential expansion. The proposed ranking is PageRank with **teleportation biased toward high-compression nodes** — formally, T_0(u) = unwrapped/wrapped (reductive compression) and I_0(u) = body/signature (deductive compression), combined as J_0 = β·T_0 + (1−β)·I_0.
@@ -188,6 +204,7 @@ tinyctx/                          ~10K LOC, 28 modules
   proxy.py                  FastAPI server + routing pipeline
   router.py                 Routing decision (heuristic + optional classifier)
   sanitize.py               13 transforms (above table)
+  guards.py                 Pre-flight guards + protocol-neutral guardrail decisions
   read_delta.py             Repeat-Read collapse to unified diff
   lingua.py                 LLMLingua-2 pre-escalation compression hook
   config.py                 Layered config: defaults < TOML file < TINYCTX_* env

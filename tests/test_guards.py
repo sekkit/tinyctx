@@ -143,6 +143,92 @@ def test_guard_result_default_shape():
     assert r.additional_log == {}
 
 
+def test_failure_signal_normalizes_mapping_for_trace():
+    from tinyctx.guards import FailureSignal
+
+    sig = FailureSignal.from_mapping(
+        {"kind": "tool_call_storm", "count": 4, "severity": "2"},
+        source="scan",
+    )
+
+    assert sig.kind == "tool_call_storm"
+    assert sig.source == "scan"
+    assert sig.severity == 2
+    assert sig.to_trace() == {
+        "kind": "tool_call_storm",
+        "source": "scan",
+        "severity": 2,
+        "count": 4,
+    }
+
+
+def test_decision_from_failure_scan_escalates_at_threshold():
+    from tinyctx.guards import decision_from_failure_scan
+
+    decision = decision_from_failure_scan({
+        "score": 2,
+        "signals": [{"kind": "tool_call_storm", "count": 3}],
+    })
+
+    assert decision.action == "escalate"
+    assert decision.should_escalate is True
+    assert decision.trace["score"] == 2
+    assert decision.signals[0].kind == "tool_call_storm"
+    assert decision.to_trace()["signals"][0]["count"] == 3
+
+
+def test_decision_from_failure_scan_ok_below_threshold():
+    from tinyctx.guards import decision_from_failure_scan
+
+    decision = decision_from_failure_scan({
+        "score": 1,
+        "signals": [{"kind": "recent_tool_errors", "count": 2}],
+    })
+
+    assert decision.action == "ok"
+    assert decision.should_escalate is False
+    assert decision.trace["threshold"] == 2
+
+
+def test_guardrail_error_tracker_counts_and_resets_per_session():
+    from tinyctx.guards import GuardrailErrorTracker
+
+    tracker = GuardrailErrorTracker(max_consecutive=2)
+
+    assert tracker.record("s1", "unknown_tool") == 1
+    assert tracker.exhausted("s1", "unknown_tool") is False
+    assert tracker.record("s1", "unknown_tool") == 2
+    assert tracker.exhausted("s1", "unknown_tool") is True
+    assert tracker.record("s2", "unknown_tool") == 1
+
+    tracker.record("s1", "unknown_tool", action="ok")
+    assert tracker.exhausted("s1", "unknown_tool") is False
+    assert tracker.snapshot() == {"s2": {"unknown_tool": 1}}
+
+
+def test_trace_guard_results_compacts_pipeline_results():
+    from tinyctx.guards import GuardResult, trace_guard_results
+
+    rows = trace_guard_results([
+        GuardResult(
+            guard_name="force_frontier",
+            fired=True,
+            reason="empty",
+            force_route="frontier",
+            additional_log={"finish_reason": "length"},
+        )
+    ])
+
+    assert rows == [{
+        "guard": "force_frontier",
+        "fired": True,
+        "reason": "empty",
+        "body_mutated": False,
+        "force_route": "frontier",
+        "log": {"finish_reason": "length"},
+    }]
+
+
 # ─── ForceFrontierGuard ──────────────────────────────────────────────────
 
 

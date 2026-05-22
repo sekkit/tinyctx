@@ -1,0 +1,36 @@
+{
+  "kind": "sync_rebuild",
+  "description": "Unknown tool names are converted to shell echo correction calls.",
+  "valid_tool_names": ["shell"],
+  "upstream": {
+    "id": "resp_unknown",
+    "object": "response",
+    "status": "completed",
+    "output": [
+      {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "<tool_call>\n<function=bad_tool>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "function_call_names": ["shell"],
+    "function_call_args": [
+      {
+        "command": [
+          "echo",
+          "tinyctx: dropped unsupported tool call 'bad_tool'; valid tools: shell"
+        ]
+      }
+    ],
+    "message_text_contains": []
+  }
+}

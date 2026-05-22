@@ -1,0 +1,26 @@
+{
+  "kind": "stream_feed",
+  "description": "Fragmented XML tool call emits Responses function_call events.",
+  "deltas": [
+    "Sure. ",
+    "<tool_call>\n<function=ls>\n",
+    "<parameter=path>\n/tmp\n</parameter>\n",
+    "</function>\n</tool_call>"
+  ],
+  "expected": {
+    "event_subsequence": [
+      "response.output_text.delta",
+      "response.output_item.added",
+      "response.function_call_arguments.delta",
+      "response.function_call_arguments.done"
+    ],
+    "contains": [
+      "Sure. ",
+      "response.output_item.added",
+      "response.function_call_arguments.delta",
+      "response.function_call_arguments.done",
+      "\"name\": \"ls\""
+    ],
+    "not_contains": ["<tool_call>"]
+  }
+}

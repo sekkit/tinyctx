@@ -1,0 +1,35 @@
+{
+  "kind": "sync_rebuild",
+  "description": "Multiple XML tool calls are repaired without reordering.",
+  "upstream": {
+    "id": "resp_multi",
+    "object": "response",
+    "status": "completed",
+    "output": [
+      {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "<tool_call>\n<function=ls>\n<parameter=path>\n/tmp\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>"
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "function_call_names": ["ls", "read_file"],
+    "function_call_args": [
+      {
+        "path": "/tmp"
+      },
+      {
+        "path": "README.md"
+      }
+    ],
+    "message_text_contains": []
+  }
+}
