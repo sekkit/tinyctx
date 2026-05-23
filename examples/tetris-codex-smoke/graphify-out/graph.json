@@ -1,0 +1,1084 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {
+      "label": "game.js",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L1",
+      "id": "game_js",
+      "community": 0,
+      "norm_label": "game.js"
+    },
+    {
+      "label": "TYPES",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L6",
+      "id": "tetris_codex_smoke_game_types",
+      "community": 0,
+      "norm_label": "types"
+    },
+    {
+      "label": "SHAPES",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L7",
+      "id": "tetris_codex_smoke_game_shapes",
+      "community": 0,
+      "norm_label": "shapes"
+    },
+    {
+      "label": "COLORS",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L16",
+      "id": "tetris_codex_smoke_game_colors",
+      "community": 0,
+      "norm_label": "colors"
+    },
+    {
+      "label": "POINTS",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L17",
+      "id": "tetris_codex_smoke_game_points",
+      "community": 0,
+      "norm_label": "points"
+    },
+    {
+      "label": "cloneMatrix()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L19",
+      "id": "tetris_codex_smoke_game_clonematrix",
+      "community": 4,
+      "norm_label": "clonematrix()"
+    },
+    {
+      "label": "createBoard()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L23",
+      "id": "tetris_codex_smoke_game_createboard",
+      "community": 4,
+      "norm_label": "createboard()"
+    },
+    {
+      "label": "rotateMatrix()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L27",
+      "id": "tetris_codex_smoke_game_rotatematrix",
+      "community": 0,
+      "norm_label": "rotatematrix()"
+    },
+    {
+      "label": "TetrisGame",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L39",
+      "id": "tetris_codex_smoke_game_tetrisgame",
+      "community": 3,
+      "norm_label": "tetrisgame"
+    },
+    {
+      "label": ".constructor()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L40",
+      "id": "tetris_codex_smoke_game_tetrisgame_constructor",
+      "community": 4,
+      "norm_label": ".constructor()"
+    },
+    {
+      "label": ".restart()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L48",
+      "id": "tetris_codex_smoke_game_tetrisgame_restart",
+      "community": 4,
+      "norm_label": ".restart()"
+    },
+    {
+      "label": ".makeBag()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L63",
+      "id": "tetris_codex_smoke_game_tetrisgame_makebag",
+      "community": 3,
+      "norm_label": ".makebag()"
+    },
+    {
+      "label": ".ensureQueue()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L72",
+      "id": "tetris_codex_smoke_game_tetrisgame_ensurequeue",
+      "community": 3,
+      "norm_label": ".ensurequeue()"
+    },
+    {
+      "label": ".nextType()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L76",
+      "id": "tetris_codex_smoke_game_tetrisgame_nexttype",
+      "community": 3,
+      "norm_label": ".nexttype()"
+    },
+    {
+      "label": ".peekNextType()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L81",
+      "id": "tetris_codex_smoke_game_tetrisgame_peeknexttype",
+      "community": 3,
+      "norm_label": ".peeknexttype()"
+    },
+    {
+      "label": ".spawnPiece()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L86",
+      "id": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "community": 4,
+      "norm_label": ".spawnpiece()"
+    },
+    {
+      "label": ".cells()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L94",
+      "id": "tetris_codex_smoke_game_tetrisgame_cells",
+      "community": 6,
+      "norm_label": ".cells()"
+    },
+    {
+      "label": ".collides()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L103",
+      "id": "tetris_codex_smoke_game_tetrisgame_collides",
+      "community": 6,
+      "norm_label": ".collides()"
+    },
+    {
+      "label": ".move()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L109",
+      "id": "tetris_codex_smoke_game_tetrisgame_move",
+      "community": 6,
+      "norm_label": ".move()"
+    },
+    {
+      "label": ".softDrop()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L115",
+      "id": "tetris_codex_smoke_game_tetrisgame_softdrop",
+      "community": 5,
+      "norm_label": ".softdrop()"
+    },
+    {
+      "label": ".hardDrop()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L125",
+      "id": "tetris_codex_smoke_game_tetrisgame_harddrop",
+      "community": 5,
+      "norm_label": ".harddrop()"
+    },
+    {
+      "label": ".rotate()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L137",
+      "id": "tetris_codex_smoke_game_tetrisgame_rotate",
+      "community": 0,
+      "norm_label": ".rotate()"
+    },
+    {
+      "label": ".lockPiece()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L151",
+      "id": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "community": 5,
+      "norm_label": ".lockpiece()"
+    },
+    {
+      "label": ".clearLines()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L164",
+      "id": "tetris_codex_smoke_game_tetrisgame_clearlines",
+      "community": 5,
+      "norm_label": ".clearlines()"
+    },
+    {
+      "label": ".applyScore()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L172",
+      "id": "tetris_codex_smoke_game_tetrisgame_applyscore",
+      "community": 5,
+      "norm_label": ".applyscore()"
+    },
+    {
+      "label": ".hold()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L181",
+      "id": "tetris_codex_smoke_game_tetrisgame_hold",
+      "community": 4,
+      "norm_label": ".hold()"
+    },
+    {
+      "label": ".togglePause()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L196",
+      "id": "tetris_codex_smoke_game_tetrisgame_togglepause",
+      "community": 3,
+      "norm_label": ".togglepause()"
+    },
+    {
+      "label": ".getCurrentCells()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L201",
+      "id": "tetris_codex_smoke_game_tetrisgame_getcurrentcells",
+      "community": 6,
+      "norm_label": ".getcurrentcells()"
+    },
+    {
+      "label": ".getGhostCells()",
+      "file_type": "code",
+      "source_file": "game.js",
+      "source_location": "L205",
+      "id": "tetris_codex_smoke_game_tetrisgame_getghostcells",
+      "community": 6,
+      "norm_label": ".getghostcells()"
+    },
+    {
+      "label": "game.test.mjs",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L1",
+      "id": "game_test_mjs",
+      "community": 1,
+      "norm_label": "game.test.mjs"
+    },
+    {
+      "label": "require",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L4",
+      "id": "tetris_codex_smoke_game_test_require",
+      "community": 1,
+      "norm_label": "require"
+    },
+    {
+      "label": "{ TetrisGame }",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L5",
+      "id": "tetris_codex_smoke_game_test_tetrisgame",
+      "community": 1,
+      "norm_label": "{ tetrisgame }"
+    },
+    {
+      "label": "makeGame()",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L7",
+      "id": "tetris_codex_smoke_game_test_makegame",
+      "community": 1,
+      "norm_label": "makegame()"
+    },
+    {
+      "label": "fillRow()",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L11",
+      "id": "tetris_codex_smoke_game_test_fillrow",
+      "community": 1,
+      "norm_label": "fillrow()"
+    },
+    {
+      "label": "game",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L16",
+      "id": "tetris_codex_smoke_game_test_game",
+      "community": 1,
+      "norm_label": "game"
+    },
+    {
+      "label": "distance",
+      "file_type": "code",
+      "source_file": "game.test.mjs",
+      "source_location": "L42",
+      "id": "tetris_codex_smoke_game_test_distance",
+      "community": 1,
+      "norm_label": "distance"
+    },
+    {
+      "label": "README.md",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L1",
+      "id": "readme_md",
+      "community": 2,
+      "norm_label": "readme.md"
+    },
+    {
+      "label": "Tetris Smoke",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L1",
+      "id": "tetris_codex_smoke_readme_tetris_smoke",
+      "community": 2,
+      "norm_label": "tetris smoke"
+    },
+    {
+      "label": "Run",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L5",
+      "id": "tetris_codex_smoke_readme_run",
+      "community": 2,
+      "norm_label": "run"
+    },
+    {
+      "label": "Controls",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L9",
+      "id": "tetris_codex_smoke_readme_controls",
+      "community": 2,
+      "norm_label": "controls"
+    },
+    {
+      "label": "Features",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L20",
+      "id": "tetris_codex_smoke_readme_features",
+      "community": 2,
+      "norm_label": "features"
+    },
+    {
+      "label": "Test",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L27",
+      "id": "tetris_codex_smoke_readme_test",
+      "community": 2,
+      "norm_label": "test"
+    },
+    {
+      "label": "code:sh (node game.test.mjs)",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": "L29",
+      "id": "tetris_codex_smoke_readme_codeblock_1",
+      "community": 2,
+      "norm_label": "code:sh (node game.test.mjs)"
+    }
+  ],
+  "links": [
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L6",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_types",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L7",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_shapes",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L16",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_colors",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L17",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_points",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L19",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_clonematrix",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L23",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_createboard",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L27",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_rotatematrix",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L39",
+      "weight": 1.0,
+      "source": "game_js",
+      "target": "tetris_codex_smoke_game_tetrisgame",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "game_js",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L87",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "target": "tetris_codex_smoke_game_clonematrix",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L49",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_restart",
+      "target": "tetris_codex_smoke_game_createboard",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L139",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_rotate",
+      "target": "tetris_codex_smoke_game_rotatematrix",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L40",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_constructor",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L48",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_restart",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L63",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_makebag",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L72",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_ensurequeue",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L76",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_nexttype",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L81",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_peeknexttype",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L86",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L94",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_cells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L103",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L109",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_move",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L115",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_softdrop",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L125",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_harddrop",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L137",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_rotate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L151",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L164",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_clearlines",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L172",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_applyscore",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L181",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_hold",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L196",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_togglepause",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L201",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_getcurrentcells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L205",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame",
+      "target": "tetris_codex_smoke_game_tetrisgame_getghostcells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_tetrisgame",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L45",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_constructor",
+      "target": "tetris_codex_smoke_game_tetrisgame_restart",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L60",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_restart",
+      "target": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L73",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_ensurequeue",
+      "target": "tetris_codex_smoke_game_tetrisgame_makebag",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L77",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_nexttype",
+      "target": "tetris_codex_smoke_game_tetrisgame_ensurequeue",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L82",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_peeknexttype",
+      "target": "tetris_codex_smoke_game_tetrisgame_ensurequeue",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L90",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L161",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "target": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L186",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_hold",
+      "target": "tetris_codex_smoke_game_tetrisgame_spawnpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L104",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_collides",
+      "target": "tetris_codex_smoke_game_tetrisgame_cells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L152",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "target": "tetris_codex_smoke_game_tetrisgame_cells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L202",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_getcurrentcells",
+      "target": "tetris_codex_smoke_game_tetrisgame_cells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L209",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_getghostcells",
+      "target": "tetris_codex_smoke_game_tetrisgame_cells",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L110",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_move",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L117",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_softdrop",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L128",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_harddrop",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L142",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_rotate",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L208",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_getghostcells",
+      "target": "tetris_codex_smoke_game_tetrisgame_collides",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L121",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_softdrop",
+      "target": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L133",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_harddrop",
+      "target": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L159",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "target": "tetris_codex_smoke_game_tetrisgame_clearlines",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "game.js",
+      "source_location": "L160",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_game_tetrisgame_lockpiece",
+      "target": "tetris_codex_smoke_game_tetrisgame_applyscore",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L4",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_test_require",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_test_tetrisgame",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L7",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_test_makegame",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L11",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_test_fillrow",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L71",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_test_game",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "game.test.mjs",
+      "source_location": "L42",
+      "weight": 1.0,
+      "source": "game_test_mjs",
+      "target": "tetris_codex_smoke_game_test_distance",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "README.md",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "readme_md",
+      "target": "tetris_codex_smoke_readme_tetris_smoke",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "README.md",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_readme_tetris_smoke",
+      "target": "tetris_codex_smoke_readme_run",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "README.md",
+      "source_location": "L9",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_readme_tetris_smoke",
+      "target": "tetris_codex_smoke_readme_controls",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "README.md",
+      "source_location": "L20",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_readme_tetris_smoke",
+      "target": "tetris_codex_smoke_readme_features",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "README.md",
+      "source_location": "L27",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_readme_tetris_smoke",
+      "target": "tetris_codex_smoke_readme_test",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "README.md",
+      "source_location": "L29",
+      "weight": 1.0,
+      "source": "tetris_codex_smoke_readme_test",
+      "target": "tetris_codex_smoke_readme_codeblock_1",
+      "confidence_score": 1.0
+    }
+  ],
+  "hyperedges": [],
+  "built_at_commit": "7e85c96efab79263388fa4a6470e6f2a69d531b5"
+}

@@ -410,7 +410,8 @@ def test_soft_completion_gate_fires_when_flag_set():
     r = g.apply(ctx)
     assert r.fired is True
     assert r.body_mutated is True
-    assert len(ctx.body["input"]) == 2
+    assert len(ctx.body["input"]) == 1
+    assert "<system-reminder>" in ctx.body["instructions"]
     assert r.additional_log.get("pattern")
 
 

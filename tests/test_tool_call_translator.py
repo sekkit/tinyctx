@@ -155,6 +155,23 @@ def test_rebuild_response_handles_already_structured():
     assert out["output"][0]["type"] == "function_call"
 
 
+def test_rebuild_response_renests_existing_structured_function_call_args():
+    response = {
+        "output": [
+            {"id": "fc_1", "type": "function_call", "name": "write_file",
+             "arguments": '{"path":"a.txt","meta.owner":"me","meta.mode":"644"}',
+             "call_id": "fc_1"}
+        ]
+    }
+    out = rebuild_response(
+        response,
+        flattened_tool_args={"write_file": {"meta.owner", "meta.mode"}},
+    )
+    assert out is not response
+    args = json.loads(out["output"][0]["arguments"])
+    assert args == {"path": "a.txt", "meta": {"owner": "me", "mode": "644"}}
+
+
 # ──────────────────────────────────────────────── StreamTranslator
 
 
@@ -207,6 +224,61 @@ def test_stream_translator_emits_function_call_when_block_completes():
     assert "response.output_item.done" in out
     # The args show up in the synthesized event
     assert "/tmp" in out
+
+
+def test_stream_translator_renests_structured_function_call_arguments():
+    t = StreamTranslator(
+        flattened_tool_args={"write_file": {"meta.owner", "meta.mode"}},
+    )
+    events = [
+        (
+            "event: response.output_item.added\n"
+            "data: " + json.dumps({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"id": "fc_1", "type": "function_call",
+                         "status": "in_progress", "name": "write_file",
+                         "arguments": "", "call_id": "fc_1"},
+                "sequence_number": 1,
+            }) + "\n\n"
+        ).encode("utf-8"),
+        (
+            "event: response.function_call_arguments.delta\n"
+            "data: " + json.dumps({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "delta": '{"path":"a.txt","meta.owner":"me","meta.mode":"644"}',
+                "sequence_number": 2,
+            }) + "\n\n"
+        ).encode("utf-8"),
+        (
+            "event: response.function_call_arguments.done\n"
+            "data: " + json.dumps({
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "arguments": '{"path":"a.txt","meta.owner":"me","meta.mode":"644"}',
+                "sequence_number": 3,
+            }) + "\n\n"
+        ).encode("utf-8"),
+        (
+            "event: response.output_item.done\n"
+            "data: " + json.dumps({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"id": "fc_1", "type": "function_call",
+                         "status": "completed", "name": "write_file",
+                         "arguments": "", "call_id": "fc_1"},
+                "sequence_number": 4,
+            }) + "\n\n"
+        ).encode("utf-8"),
+    ]
+    out = b"".join(chunk for ev in events for chunk in t.feed(ev)).decode("utf-8")
+    assert "meta.owner" not in out
+    assert "meta" in out
+    assert "owner" in out
+    assert "mode" in out
 
 
 def test_stream_translator_passes_through_unknown_events():

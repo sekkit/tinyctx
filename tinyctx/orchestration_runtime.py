@@ -93,11 +93,47 @@ def apply_orchestration(
 
 
 def _should_inject_dynamic_skill(cfg: Config, plan: TaskPlan) -> bool:
-    return (
-        cfg.orchestrator_dynamic_skill_enabled
-        and bool(plan.dynamic_skill_needed)
-        and float(plan.confidence) >= float(cfg.orchestrator_dynamic_skill_min_confidence)
+    if not cfg.orchestrator_dynamic_skill_enabled:
+        return False
+    if not bool(plan.dynamic_skill_needed):
+        return False
+    if float(plan.confidence) < float(cfg.orchestrator_dynamic_skill_min_confidence):
+        return False
+    return _dynamic_skill_is_necessary(plan)
+
+
+def _dynamic_skill_is_necessary(plan: TaskPlan) -> bool:
+    """Inject only when there is a strong signal that built-in local skills
+    are insufficient for the current task.
+
+    This avoids adding a dynamic playbook when ordinary recommended skills
+    already cover the job and the extra prompt would only add noise.
+    """
+    rationale = (plan.rationale or "").strip().lower()
+    has_explicit_skill = isinstance(plan.dynamic_skill, (DynamicSkill, dict))
+    has_existing_local_skills = bool(plan.recommended_skills)
+    strong_gap_signal = any(
+        phrase in rationale
+        for phrase in (
+            "no matching local skill",
+            "skill gap",
+            "custom skill",
+            "specialized workflow",
+            "stricter execution guardrails",
+            "requires extra guardrails",
+        )
     )
+    high_constraint_load = len(plan.constraints) >= 2
+
+    if has_existing_local_skills and not has_explicit_skill and not strong_gap_signal:
+        return False
+    if strong_gap_signal:
+        return True
+    if has_explicit_skill and not has_existing_local_skills:
+        return True
+    if plan.task_type == "unknown" and not has_existing_local_skills and high_constraint_load:
+        return True
+    return False
 
 
 def _resolve_dynamic_skill(
@@ -127,14 +163,14 @@ def _skill_gap(plan: TaskPlan) -> str:
 
 
 def _task_text_from_body(body: dict[str, Any]) -> str:
-    parts: list[str] = []
+    user_text = _flatten_user_text(body.get("input"))
+    if user_text:
+        return user_text.strip()
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
-        parts.append(instructions.strip())
-    parts.append(_flatten_text(body.get("input")))
-    if not parts:
-        return ""
-    return "\n".join(part for part in parts if part).strip()
+        return instructions.strip()
+    fallback = _flatten_text(body.get("input"))
+    return fallback.strip() if fallback else ""
 
 
 def _flatten_text(value: Any) -> str:
@@ -166,4 +202,33 @@ def _flatten_text(value: Any) -> str:
     if isinstance(value, dict):
         text = value.get("text") or value.get("content")
         return text if isinstance(text, str) else ""
+    return ""
+
+
+def _flatten_user_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        chunks: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                chunks.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            if role not in {None, "user"}:
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                chunks.append(content)
+                continue
+            if isinstance(content, list):
+                for fragment in content:
+                    if not isinstance(fragment, dict):
+                        continue
+                    text = fragment.get("text") or fragment.get("content")
+                    if isinstance(text, str):
+                        chunks.append(text)
+        return "\n".join(chunk for chunk in chunks if chunk)
     return ""

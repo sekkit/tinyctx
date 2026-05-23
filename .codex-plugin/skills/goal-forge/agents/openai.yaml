@@ -1,0 +1,6 @@
+interface:
+  display_name: "Goal Forge"
+  short_description: "Forge specs into Codex /goal runs"
+  default_prompt: "Use $goal-forge to turn this rough coding idea into a SPEC.md and executable /goal contract."
+policy:
+  allow_implicit_invocation: true

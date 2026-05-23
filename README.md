@@ -2,7 +2,7 @@
 
 A thin context-routing proxy for the OpenAI Codex CLI that lets you run **mostly on a local-class model** (DeepSeek-v4-flash, LMStudio + Qwen3.6-27B, vLLM, Ollama, …) and **only escalate to a frontier model** (GPT-5.5) when truly needed.
 
-> **Compose-first.** tinyctx itself is ~10K LOC of glue across 28 modules. The hard parts — code knowledge graph, LSP-backed symbolic ops, sandboxed tool execution, persistent memory, prompt compression — are delegated to mature OSS projects, all auto-installed and auto-wired by `scripts/install.sh`.
+> **Compose-first.** tinyctx itself is ~10K LOC of glue across 66 modules. The hard parts — code knowledge graph, LSP-backed symbolic ops, sandboxed tool execution, persistent memory, prompt compression — are delegated to mature OSS projects, all auto-installed and auto-wired by `scripts/install.sh`.
 
 ## Why this exists
 
@@ -72,6 +72,7 @@ by scripts/install.sh):
 | Compression-biased ranker | **tinyctx.interest** | this repo, after [arxiv 2603.20396 §5.1](https://arxiv.org/abs/2603.20396) | MIT |
 | Repeat-Read delta | **tinyctx.read_delta** | this repo | MIT |
 | Tool-call guardrails + replay eval | **tinyctx.guards** + fixtures | this repo, after forge guardrail patterns | MIT |
+| Governed self-improvement loop | **tinyctx.workspace / trajectory / eval_harness / frontier / guardrail_registry / self_improvement** | this repo, after A-Evolve / EvoSkill / OpenEvolve / Agent0 patterns | MIT |
 | Code knowledge graph (MCP) | gitnexus | upstream OSS | PolyForm-Noncommercial |
 | Code knowledge graph (skill) | graphify | upstream OSS | MIT |
 | Symbolic ops (LSP MCP) | serena | upstream OSS | MIT |
@@ -93,6 +94,23 @@ cd ~/dev/tinyctx
 ./scripts/start.sh        # starts the proxy on 127.0.0.1:4141
 codex --profile tinyctx   # uses the proxy as model_provider
 ```
+
+For long-running Codex goal mode, use the dedicated profile after install:
+
+```bash
+codex --profile tinyctx-goal
+```
+
+That profile enables `features.goals`, raises the context/auto-compact budget,
+and uses unattended execution settings. Use it only in trusted project
+directories.
+
+When a goal session goes through `tinyctx-auto`, tinyctx keeps normal
+execution turns on the cheap local model and only routes goal control turns to
+frontier: `/goal` contract creation, `done_when` validation, completion audits,
+and blocker/pivot judgments. Disable with
+`goal_control_frontier_enabled = false` under `[routing]` in
+`~/.tinyctx/config.toml`.
 
 `install.sh` is fully idempotent and auto-installs every external dep. It will, in order:
 
@@ -185,6 +203,18 @@ The current guardrail slice is deliberately thin:
 
 This keeps the forge-style reliability loop (`parse → validate → repair → retry/escalate → trace/eval`) while preserving Codex-specific invariants: `function_call` item semantics, SSE event order, `encrypted_content` scrub, and prompt-cache prefix stability.
 
+## Governed self-improvement loop
+
+tinyctx treats self-improvement as a measured release loop, not live recursive mutation:
+
+- `workspace.py` creates the `.tinyctx/sessions/<id>/` filesystem contract and `context_profile.json` substrate.
+- `trajectory.py` stores replayable route/sanitize/compact/tool/error events from proxy logging, even when legacy verbose JSONL logging is off.
+- `eval_harness.py` runs deterministic replay suites and aggregates pass rate / score.
+- `frontier.py` archives scored policy candidates with lineage, metrics, artifacts, and weighted best-candidate selection.
+- `guardrail_registry.py` provides a plugin-style staged guardrail runner for candidate checks.
+- `self_improvement.py` ties the loop together: evaluate a candidate, record start/end trajectory events, archive metrics, and report whether it is the current weighted winner.
+- `/dashboard/self-improvement` exposes the context profile, known sessions, trajectory summary, candidate frontier, and best candidate in both JSON and the live dashboard panel.
+
 ## Compression-biased context ranking
 
 `tinyctx/interest.py` is a faithful adaptation of §5.1 of Aksenov, Bodnia, Freedman, Mulligan, *Compression Is All You Need: Modeling Mathematics* ([arxiv 2603.20396](https://arxiv.org/abs/2603.20396)) to a code corpus. The paper's central empirical finding is that human mathematics lives in the polynomial-growth (A_n, log-density) regime: a small number of hierarchically-nested macros buys exponential expansion. The proposed ranking is PageRank with **teleportation biased toward high-compression nodes** — formally, T_0(u) = unwrapped/wrapped (reductive compression) and I_0(u) = body/signature (deductive compression), combined as J_0 = β·T_0 + (1−β)·I_0.
@@ -200,7 +230,7 @@ graphify .
 ## Modules
 
 ```
-tinyctx/                          ~10K LOC, 28 modules
+tinyctx/                          ~10K LOC, 66 modules
   proxy.py                  FastAPI server + routing pipeline
   router.py                 Routing decision (heuristic + optional classifier)
   sanitize.py               13 transforms (above table)
@@ -222,6 +252,12 @@ tinyctx/                          ~10K LOC, 28 modules
   registry.py               Per-machine list of projects tinyctx has touched
   dreamer.py                Periodic maintenance CLI: scout + keypin + graphify + mem ingest + GC
   trace.py                  RequestTrace dataclass + CLI viewer (compact / verbose / watch)
+  workspace.py              .tinyctx session workspace + context_profile.json contract
+  trajectory.py             Append-only replayable route/sanitize/compact/tool event ledger
+  eval_harness.py           Deterministic replay suite runner + aggregate metrics
+  frontier.py               Versioned candidate archive + weighted best-policy selection
+  guardrail_registry.py     Plugin-style staged guardrail runner for candidate checks
+  self_improvement.py       Governed eval -> trajectory -> frontier candidate loop
   advisor.py                Anthropic Advisor Strategy MCP server (built-in)
   tool_call_translator.py   XML→struct + chat→responses SSE + 3-layer auto-answer for request_user_input
   _codex_toml.py            Shared helper: idempotent ~/.codex/config.toml MCP block injection

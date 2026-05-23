@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tetris Smoke</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="game-card">
+      <header>
+        <p class="eyebrow">Plain JavaScript</p>
+        <h1>Tetris</h1>
+      </header>
+      <canvas id="board" width="300" height="600" aria-label="Tetris board"></canvas>
+      <p id="status" class="status">Ready</p>
+    </section>
+
+    <aside class="panel">
+      <div class="stats">
+        <div><span>Score</span><strong id="score">0</strong></div>
+        <div><span>Lines</span><strong id="lines">0</strong></div>
+        <div><span>Level</span><strong id="level">1</strong></div>
+      </div>
+
+      <div class="preview-grid">
+        <section>
+          <h2>Next</h2>
+          <canvas id="next" width="120" height="120"></canvas>
+        </section>
+        <section>
+          <h2>Hold</h2>
+          <canvas id="hold" width="120" height="120"></canvas>
+        </section>
+      </div>
+
+      <button id="restart" type="button">Restart</button>
+      <button id="pause" type="button">Pause</button>
+
+      <section class="controls">
+        <h2>Controls</h2>
+        <p><kbd>←</kbd>/<kbd>→</kbd> move · <kbd>↓</kbd> soft drop</p>
+        <p><kbd>↑</kbd>/<kbd>X</kbd> rotate · <kbd>Z</kbd> counter rotate</p>
+        <p><kbd>Space</kbd> hard drop · <kbd>C</kbd> hold</p>
+        <p><kbd>P</kbd> pause · <kbd>R</kbd> restart</p>
+      </section>
+    </aside>
+  </main>
+
+  <script src="game.js"></script>
+  <script>
+    const game = new TetrisGame();
+    const boardCanvas = document.getElementById('board');
+    const nextCanvas = document.getElementById('next');
+    const holdCanvas = document.getElementById('hold');
+    const scoreEl = document.getElementById('score');
+    const linesEl = document.getElementById('lines');
+    const levelEl = document.getElementById('level');
+    const statusEl = document.getElementById('status');
+    const pauseBtn = document.getElementById('pause');
+    const colors = TetrisGame.COLORS;
+    const cell = 30;
+
+    function drawCell(ctx, x, y, size, color) {
+      ctx.fillStyle = color;
+      ctx.fillRect(x * size, y * size, size, size);
+      ctx.strokeStyle = 'rgba(255,255,255,.22)';
+      ctx.strokeRect(x * size + 0.5, y * size + 0.5, size - 1, size - 1);
+    }
+
+    function drawBoard() {
+      const ctx = boardCanvas.getContext('2d');
+      ctx.clearRect(0, 0, boardCanvas.width, boardCanvas.height);
+      ctx.fillStyle = '#101425';
+      ctx.fillRect(0, 0, boardCanvas.width, boardCanvas.height);
+      for (let y = 0; y < game.rows; y += 1) {
+        for (let x = 0; x < game.cols; x += 1) {
+          const type = game.board[y][x];
+          if (type) drawCell(ctx, x, y, cell, colors[type]);
+        }
+      }
+      for (const block of game.getGhostCells()) drawCell(ctx, block.x, block.y, cell, 'rgba(255,255,255,.14)');
+      for (const block of game.getCurrentCells()) drawCell(ctx, block.x, block.y, cell, colors[game.current.type]);
+      ctx.strokeStyle = '#5eead4';
+      ctx.strokeRect(0.5, 0.5, boardCanvas.width - 1, boardCanvas.height - 1);
+    }
+
+    function drawMini(canvas, type) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#101425';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (!type) return;
+      const matrix = TetrisGame.SHAPES[type];
+      const size = 24;
+      const offsetX = Math.floor((5 - matrix[0].length) / 2);
+      const offsetY = Math.floor((5 - matrix.length) / 2);
+      matrix.forEach((row, y) => row.forEach((value, x) => {
+        if (value) drawCell(ctx, x + offsetX, y + offsetY, size, colors[type]);
+      }));
+    }
+
+    function render() {
+      drawBoard();
+      drawMini(nextCanvas, game.peekNextType());
+      drawMini(holdCanvas, game.holdType);
+      scoreEl.textContent = game.score;
+      linesEl.textContent = game.lines;
+      levelEl.textContent = game.level;
+      pauseBtn.textContent = game.paused ? 'Resume' : 'Pause';
+      statusEl.textContent = game.gameOver ? 'Game over — press R to restart' : game.paused ? 'Paused' : 'Playing';
+    }
+
+    let last = 0;
+    let dropTimer = 0;
+    function frame(time = 0) {
+      const delta = time - last;
+      last = time;
+      if (!game.paused && !game.gameOver) {
+        dropTimer += delta;
+        if (dropTimer >= game.dropInterval) {
+          game.softDrop();
+          dropTimer = 0;
+        }
+      }
+      render();
+      requestAnimationFrame(frame);
+    }
+
+    document.addEventListener('keydown', (event) => {
+      const action = {
+        ArrowLeft: () => game.move(-1),
+        ArrowRight: () => game.move(1),
+        ArrowDown: () => game.softDrop(),
+        ArrowUp: () => game.rotate(1),
+        KeyX: () => game.rotate(1),
+        KeyZ: () => game.rotate(-1),
+        Space: () => game.hardDrop(),
+        KeyC: () => game.hold(),
+        KeyP: () => game.togglePause(),
+        KeyR: () => game.restart(),
+      }[event.code];
+      if (action) {
+        event.preventDefault();
+        action();
+        render();
+      }
+    });
+
+    document.getElementById('restart').addEventListener('click', () => { game.restart(); render(); });
+    pauseBtn.addEventListener('click', () => { game.togglePause(); render(); });
+    frame();
+  </script>
+</body>
+</html>

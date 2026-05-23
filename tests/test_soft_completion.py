@@ -876,15 +876,14 @@ def test_gate_injects_when_flag_set():
     soft_completion.reset_state()
     soft_completion._set_flag_for_test("p1", reason="asks user what next", p=0.9)
 
-    body = {"input": [{"role": "user", "content": "thanks"}]}
+    body = {"instructions": "base", "input": [{"role": "user", "content": "thanks"}]}
     out, gated, pat = soft_completion.maybe_inject_soft_completion_gate(
         body, "p1")
     assert gated is True
     assert "asks user what next" in pat
-    assert len(out["input"]) == 2
-    last = out["input"][-1]
-    assert last["role"] == "user"
-    text = last["content"][0]["text"]
+    assert out["input"] == body["input"]
+    text = out["instructions"]
+    assert text.startswith("base")
     assert "<system-reminder>" in text
     assert "soft-completion gate" in text
     # Three-path gate: A=plan-execute, B=question-via-advisor, C=premature-done
@@ -918,17 +917,19 @@ def test_gate_does_not_mutate_original_body():
     assert gated is True
     assert len(original["input"]) == 1
     assert id(original["input"]) == items_id
-    assert len(out["input"]) == 2
+    assert out["input"] == original["input"]
+    assert "instructions" in out
 
 
-def test_gate_skips_malformed_body():
+def test_gate_creates_instructions_when_missing():
     from tinyctx import soft_completion
     soft_completion.reset_state()
     soft_completion._set_flag_for_test("p1", reason="x", p=1.0)
-    body = {"messages": [{"role": "user", "content": "hi"}]}  # chat-style
+    body = {"messages": [{"role": "user", "content": "hi"}]}  # non-responses shape still okay
     out, gated, _ = soft_completion.maybe_inject_soft_completion_gate(
         body, "p1")
-    assert gated is False
+    assert gated is True
+    assert "<system-reminder>" in out["instructions"]
 
 
 # ─── default config + trace fields ────────────────────────────────────────

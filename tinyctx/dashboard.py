@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import statistics
 import time
 from collections import defaultdict
@@ -56,8 +57,10 @@ _INTERESTING_EVENTS = {
     "stuck_reminder_injected",
     "soft_completion_classified",
     "soft_completion_gate_injected",
+    "tool_result_shrink",
     "soft_completion_classify_skipped",
     "soft_completion_classify_backend_error",
+    "failure_signal_escalated_to_frontier",
     "soft_completion_classify_parse_failed",
     "stream_error",
     "upstream_error",
@@ -80,6 +83,9 @@ def _format_event_for_dashboard(e: dict[str, Any]) -> dict[str, Any] | None:
     if ev == "request_trace":
         if e.get("forced_by_client_model") and e.get("requested_model") == "tinyctx-local":
             return None  # pytest traffic
+        hit = int(e.get("prompt_cache_hit_tokens", 0) or 0)
+        miss = int(e.get("prompt_cache_miss_tokens", 0) or 0)
+        total_cache = hit + miss
         base.update({
             "kind": ("advisor" if (e.get("forced_by_client_model")
                                     and e.get("requested_model") == "tinyctx-frontier")
@@ -108,6 +114,13 @@ def _format_event_for_dashboard(e: dict[str, Any]) -> dict[str, Any] | None:
             "orchestrator_parallel_subtasks": list((e.get("orchestrator_parallel_subtasks") or []))[:5],
             "task_state": (e.get("task_state", "") or "")[:20],
             "session_id": (e.get("session_id", "") or "")[:24],
+            "prompt_cache_hit_tokens": hit,
+            "prompt_cache_miss_tokens": miss,
+            "prompt_cache_hit_ratio": (
+                float(e.get("prompt_cache_hit_ratio", 0.0) or 0.0)
+                if e.get("prompt_cache_hit_ratio") not in (None, "")
+                else (round(hit / total_cache, 4) if total_cache > 0 else 0.0)
+            ),
         })
     elif ev == "soft_completion_classified":
         base.update({
@@ -124,6 +137,16 @@ def _format_event_for_dashboard(e: dict[str, Any]) -> dict[str, Any] | None:
         })
     elif ev == "soft_completion_gate_injected":
         base.update({"pattern": (e.get("pattern", "") or "")[:80]})
+    elif ev == "failure_signal_escalated_to_frontier":
+        base.update({
+            "score": e.get("score", 0),
+            "signals": list(e.get("signals") or []),
+        })
+    elif ev == "tool_result_shrink":
+        base.update({
+            "shrunk": int(e.get("shrunk", 0) or 0),
+            "call_ids": list(e.get("call_ids") or [])[:3],
+        })
     elif ev == "stuck_reminder_injected":
         base.update({"turn_count": e.get("turn_count", 0),
                      "proj_sid": (e.get("proj_sid", "") or "")[:24]})
@@ -319,7 +342,203 @@ def state_snapshot() -> dict[str, Any]:
         }
     except Exception as e:  # noqa: BLE001
         out["tool_metrics"] = {"error": str(e)}
+    try:
+        out["integrations"] = _integration_snapshot()
+    except Exception as e:  # noqa: BLE001
+        out["integrations"] = {"error": str(e)}
     return out
+
+
+def _self_improvement_root(log_dir: Path) -> Path:
+    # Production defaults to ~/.tinyctx/logs; tests often pass a tmp root
+    # directly. Keep both layouts natural.
+    return log_dir.parent if log_dir.name == "logs" else log_dir
+
+
+def self_improvement_snapshot(
+    log_dir: Path,
+    *,
+    session: str = "",
+    kind: str = "context",
+    limit: int = 50,
+) -> dict[str, Any]:
+    root = _self_improvement_root(log_dir)
+    try:
+        from . import frontier as _frontier
+        from . import trajectory as _trajectory
+        from . import workspace as _workspace
+
+        sessions = _workspace.list_session_ids(root=root)
+        profile = _workspace.load_context_profile(root=root)
+        out: dict[str, Any] = {
+            "root": str(root),
+            "profile": profile,
+            "sessions": sessions,
+            "session_count": len(sessions),
+        }
+        if session:
+            events = _trajectory.read_events(session, root=root, limit=limit)
+            candidates = _frontier.read_candidates(session, root=root, kind=kind)
+            out["selected_session"] = _workspace.safe_id(session)
+            out["trajectory"] = {
+                "events": events,
+                "summary": _trajectory.summarize_events(events),
+            }
+            out["frontier"] = {
+                "kind": kind,
+                "candidates": candidates,
+                "best": _frontier.best_candidate(
+                    candidates,
+                    {"quality": 1.0, "pass_rate": 1.0, "tokens_saved": 0.25},
+                ),
+            }
+        return out
+    except Exception as e:  # noqa: BLE001
+        return {"root": str(root), "error": str(e)}
+
+
+def _integration_snapshot() -> dict[str, Any]:
+    """Unified status view for bootstrap-managed integrations.
+
+    Combines machine-level install state and project-level wiring so the
+    dashboard can show a single readiness table.
+    """
+    codex_config = Path.home() / ".codex" / "config.toml"
+    codex_hooks = Path.home() / ".codex" / "hooks.json"
+    project_root = Path.cwd().resolve()
+    project_agents = project_root / "AGENTS.md"
+    project_hooks = project_root / ".codex" / "hooks.json"
+    codex_text = _read_text(codex_config)
+    project_agents_text = _read_text(project_agents)
+    project_hooks_text = _read_text(project_hooks)
+
+    def _entry(
+        *,
+        label: str,
+        installed: bool,
+        registered: bool,
+        ready: bool,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "label": label,
+            "installed": installed,
+            "registered": registered,
+            "ready": ready,
+            "details": details,
+        }
+
+    from . import advisor_bootstrap as _ab
+    from . import caveman_bootstrap as _cb
+    from . import gitnexus_bootstrap as _gbx
+    from . import graphify_bootstrap as _gfb
+    from . import scout_hook_bootstrap as _shb
+    from . import serena_bootstrap as _sb
+
+    advisor = _ab.detect_state(codex_config)
+    caveman = _cb.detect_state(codex_config=codex_config)
+    gitnexus = _gbx.detect_state(codex_config)
+    graphify = _gfb.detect_state()
+    scout = _shb.detect_state(codex_hooks)
+    serena = _sb.detect_state(codex_config)
+
+    graphify_project_agents = _gfb.AGENTS_MARKER in project_agents_text
+    graphify_project_hook = "graphify" in project_hooks_text
+    caveman_wrapping_gitnexus = (
+        "caveman-shrink" in codex_text and "gitnexus.CMD" in codex_text
+    )
+    context_mode_cmd = shutil.which("context-mode") or ""
+    context_mode_registered = "[mcp_servers.context-mode]" in codex_text
+
+    return {
+        "context_mode": _entry(
+            label="context-mode",
+            installed=bool(context_mode_cmd),
+            registered=context_mode_registered,
+            ready=bool(context_mode_cmd) and context_mode_registered,
+            details={
+                "command": context_mode_cmd or "missing",
+            },
+        ),
+        "gitnexus": _entry(
+            label="gitnexus",
+            installed=gitnexus.gitnexus_present,
+            registered=gitnexus.codex_config_has_gitnexus,
+            ready=gitnexus.gitnexus_present and gitnexus.codex_config_has_gitnexus,
+            details={
+                "command": gitnexus.gitnexus_path or "missing",
+                "license_acked": gitnexus.license_acked,
+            },
+        ),
+        "graphify": _entry(
+            label="graphify",
+            installed=graphify.graphify_present,
+            registered=graphify_project_agents or graphify_project_hook,
+            ready=(graphify.graphify_present
+                   and graphify_project_agents
+                   and graphify_project_hook),
+            details={
+                "command": graphify.graphify_path or "missing",
+                "project_agents": graphify_project_agents,
+                "project_hook": graphify_project_hook,
+                "project_root": str(project_root),
+            },
+        ),
+        "serena": _entry(
+            label="serena",
+            installed=serena.serena_present,
+            registered=serena.codex_config_has_serena,
+            ready=serena.serena_present and serena.codex_config_has_serena,
+            details={
+                "command": serena.serena_path or "missing",
+            },
+        ),
+        "advisor": _entry(
+            label="advisor",
+            installed=advisor.python_exists,
+            registered=advisor.codex_config_has_advisor_agent,
+            ready=(advisor.python_exists
+                   and advisor.codex_config_has_advisor_agent
+                   and advisor.advisor_agent_file_exists),
+            details={
+                "python": advisor.python_path,
+                "mcp_registered": advisor.codex_config_has_advisor,
+                "agent_registered": advisor.codex_config_has_advisor_agent,
+                "agent_config_file": advisor.advisor_agent_path,
+                "agent_config_exists": advisor.advisor_agent_file_exists,
+            },
+        ),
+        "scout_hook": _entry(
+            label="scout hook",
+            installed=scout.script_exists,
+            registered=scout.hook_already_registered,
+            ready=scout.script_exists and scout.hook_already_registered,
+            details={
+                "script": scout.script_path,
+            },
+        ),
+        "caveman": _entry(
+            label="caveman-shrink",
+            installed=caveman.vendor_present and caveman.entry_present,
+            registered=caveman_wrapping_gitnexus,
+            ready=(caveman.vendor_present
+                   and caveman.entry_present
+                   and caveman_wrapping_gitnexus),
+            details={
+                "entry": caveman.entry_path,
+                "wrapping_gitnexus": caveman_wrapping_gitnexus,
+            },
+        ),
+    }
+
+
+def _read_text(path: Path) -> str:
+    try:
+        if path.is_file():
+            return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return ""
 
 
 # ─── rolling aggregates ────────────────────────────────────────────────────
@@ -327,6 +546,12 @@ def state_snapshot() -> dict[str, Any]:
 
 _AGG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _AGG_TTL_S = 5.0
+
+_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 def reset_aggregates_cache() -> None:
@@ -366,8 +591,10 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
         result = {"since_s": since_s, "turns_real": 0, "advisor_calls": 0,
                   "by_route": {}, "by_status": {},
                   "stuck_reminders": 0, "soft_punt_classified": 0,
-                  "soft_punt_gates": 0, "anomalies": 0,
+                  "soft_punt_gates": 0, "tool_result_shrinks": 0, "anomalies": 0,
                   "keepalive_saves": 0,
+                  "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0,
+                  "prompt_cache_hit_ratio": 0.0,
                   "p50_elapsed_s": 0, "p99_elapsed_s": 0,
                   "median_bytes_in": 0, "median_bytes_out": 0}
         _AGG_CACHE[cache_key] = (now, result)
@@ -383,8 +610,11 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
     stuck_n = 0
     sc_classified = 0
     sc_gates = 0
+    tool_result_shrinks = 0
     anomalies = 0
     keepalive_saves = 0
+    prompt_cache_hit_tokens = 0
+    prompt_cache_miss_tokens = 0
 
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -408,6 +638,8 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
                     sc_classified += 1
                 elif ev == "soft_completion_gate_injected":
                     sc_gates += 1
+                elif ev == "tool_result_shrink":
+                    tool_result_shrinks += int(e.get("shrunk", 0) or 0)
                 elif ev == "request_trace":
                     if e.get("forced_by_client_model"):
                         if e.get("requested_model") == "tinyctx-frontier":
@@ -421,6 +653,8 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
                         elapsed.append(float(e.get("elapsed_s", 0) or 0))
                         bytes_in.append(int(e.get("forwarded_bytes", 0) or 0))
                         bytes_out.append(int(e.get("bytes_out", 0) or 0))
+                        prompt_cache_hit_tokens += int(e.get("prompt_cache_hit_tokens", 0) or 0)
+                        prompt_cache_miss_tokens += int(e.get("prompt_cache_miss_tokens", 0) or 0)
                         if (e.get("status", 0) not in (200,)
                                 or e.get("error_streak", 0) > 0):
                             anomalies += 1
@@ -441,8 +675,14 @@ def aggregates(log_dir: Path, since_s: int = 900) -> dict[str, Any]:
         "stuck_reminders": stuck_n,
         "soft_punt_classified": sc_classified,
         "soft_punt_gates": sc_gates,
+        "tool_result_shrinks": tool_result_shrinks,
         "anomalies": anomalies,
         "keepalive_saves": keepalive_saves,
+        "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+        "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
+        "prompt_cache_hit_ratio": round(
+            prompt_cache_hit_tokens / (prompt_cache_hit_tokens + prompt_cache_miss_tokens), 4
+        ) if (prompt_cache_hit_tokens + prompt_cache_miss_tokens) > 0 else 0.0,
         "p50_elapsed_s": round(_percentile(elapsed, 50), 2),
         "p99_elapsed_s": round(_percentile(elapsed, 99), 2),
         "median_bytes_in": int(statistics.median(bytes_in)) if bytes_in else 0,
@@ -523,6 +763,8 @@ _DASHBOARD_HTML = """<!doctype html>
   .b-route   { background: #e0f2fe; color: #075985; }
   .b-skip    { background: #f3f4f6; color: #6b7280; }
   .b-error   { background: #fef2f2; color: #b91c1c; }
+  .b-ok      { background: #dcfce7; color: #166534; }
+  .b-warn    { background: #fef3c7; color: #92400e; }
   table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
   th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #f3f4f6; font-variant-numeric: tabular-nums; }
   th { color: #6b7280; font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -554,10 +796,29 @@ _DASHBOARD_HTML = """<!doctype html>
     <div class="card">
       <h2>per-session state</h2>
       <table id="state-table">
-        <thead><tr><th>session</th><th class="num">last reminder turn</th><th class="num">advisor age</th><th>soft-punt flag</th><th class="num">err streak</th></tr></thead>
+        <thead><tr><th>session</th><th>request phase</th><th class="num">last reminder turn</th><th class="num">advisor age</th><th>soft-punt flag</th><th class="num">err streak</th></tr></thead>
         <tbody></tbody>
       </table>
       <details><summary>raw state JSON</summary><pre id="state-raw">…</pre></details>
+    </div>
+
+    <div class="card full">
+      <h2>integrations</h2>
+      <table id="integration-table">
+        <thead><tr><th>integration</th><th>status</th><th>installed</th><th>registered</th><th>details</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <details><summary>raw integration JSON</summary><pre id="integrations-raw">…</pre></details>
+    </div>
+
+    <div class="card full">
+      <h2>self-improvement</h2>
+      <div class="stat-row" id="self-improvement-stats">…</div>
+      <table id="self-improvement-table">
+        <thead><tr><th>candidate</th><th>kind</th><th class="num">score</th><th class="num">pass rate</th><th>status</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <details><summary>raw self-improvement JSON</summary><pre id="self-improvement-raw">…</pre></details>
     </div>
   </div>
 
@@ -570,6 +831,7 @@ _DASHBOARD_HTML = """<!doctype html>
   const feed = document.getElementById("feed");
   const connIndicator = document.getElementById("conn-indicator");
   const FEED_MAX_ROWS = 80;
+  const FETCH_OPTS = { cache: "no-store" };
 
   function addFeed(evt) {
     const row = document.createElement("div");
@@ -626,6 +888,9 @@ _DASHBOARD_HTML = """<!doctype html>
         badge = `<span class="badge b-skip">turn</span>`;
         info = `t=${e.turn_count} ${e.elapsed_s.toFixed(1)}s ${kb(e.bytes_in)}→${kb(e.bytes_out)} ${e.route}`;
       }
+      const cache = (e.prompt_cache_hit_tokens || e.prompt_cache_miss_tokens)
+        ? ` cache=${(Number(e.prompt_cache_hit_ratio || 0) * 100).toFixed(0)}%`
+        : "";
       const orch = e.orchestrator_injected
         ? ` · orch=${escapeHTML(e.orchestrator_task_type || "unknown")}(${Number(e.orchestrator_confidence || 0).toFixed(2)})`
           + (Array.isArray(e.orchestrator_skills) && e.orchestrator_skills.length
@@ -634,7 +899,7 @@ _DASHBOARD_HTML = """<!doctype html>
             ? ` exec=${escapeHTML(e.orchestrator_execution_mode)}` : "")
           + (e.task_state ? ` state=${escapeHTML(e.task_state)}` : "")
         : "";
-      return badge + info + orch;
+      return badge + info + cache + orch;
     }
     if (ev === "soft_completion_classified") {
       const cls = e.soft_punt && e.p >= 0.7 ? "b-punt" : "b-okp";
@@ -643,6 +908,16 @@ _DASHBOARD_HTML = """<!doctype html>
     }
     if (ev === "soft_completion_gate_injected") {
       return `<span class="badge b-gate">GATE FIRED</span>${escapeHTML(e.pattern || "")}`;
+    }
+    if (ev === "failure_signal_escalated_to_frontier") {
+      const parts = Array.isArray(e.signals)
+        ? e.signals.map(s => `${s.kind}${s.tool_name ? `:${s.tool_name}` : ""}${s.count ? ` x${s.count}` : ""}`).join(" · ")
+        : "";
+      return `<span class="badge b-anomaly">FAILURE ESCALATE score=${escapeHTML(String(e.score || 0))}</span>${escapeHTML(parts)}`;
+    }
+    if (ev === "tool_result_shrink") {
+      const ids = Array.isArray(e.call_ids) && e.call_ids.length ? ` ids=${escapeHTML(e.call_ids.join(","))}` : "";
+      return `<span class="badge b-route">RESULT SHRINK x${escapeHTML(String(e.shrunk || 0))}</span>${ids}`;
     }
     if (ev === "soft_completion_classify_skipped") {
       return `<span class="badge b-skip">skip ${escapeHTML(e.reason || "?")}</span>finish=${escapeHTML(e.finish_reason || "?")} text=${e.extracted_text_chars} raw=${e.raw_buffer_chars}`;
@@ -665,7 +940,7 @@ _DASHBOARD_HTML = """<!doctype html>
   }
 
   // initial fetch of recent events
-  fetch("/dashboard/recent").then(r => r.json()).then(events => {
+  fetch("/dashboard/recent", FETCH_OPTS).then(r => r.json()).then(events => {
     events.forEach(addFeed);
   }).catch(() => {});
 
@@ -688,7 +963,7 @@ _DASHBOARD_HTML = """<!doctype html>
 
   // poll state + aggregates
   function pollState() {
-    fetch("/dashboard/state").then(r => r.json()).then(s => {
+    fetch("/dashboard/state", FETCH_OPTS).then(r => r.json()).then(s => {
       document.getElementById("uptime").textContent = formatUptime(s.uptime_s);
       document.getElementById("pid").textContent = s.proxy_pid;
       document.getElementById("cache").textContent = s.self_classify_cache_entries ?? "?";
@@ -696,7 +971,9 @@ _DASHBOARD_HTML = """<!doctype html>
 
       const tbody = document.querySelector("#state-table tbody");
       tbody.innerHTML = "";
+      const phaseMap = s.request_phase || {};
       const sids = new Set([
+        ...Object.keys(phaseMap).filter(sid => phaseMap?.[sid]?.phase),
         ...Object.keys(s.stuck_loop?.last_reminder_turn || {}),
         ...Object.keys(s.stuck_loop?.last_advisor_ts || {}),
         ...Object.keys(s.soft_completion?.active_flags || {}),
@@ -709,24 +986,51 @@ _DASHBOARD_HTML = """<!doctype html>
         const advisorAge = advisorTs ? formatAge(s.now_ts - advisorTs) : "—";
         const flag = s.soft_completion?.active_flags?.[sid];
         const errStreak = s.session_error_streaks?.[sid] || 0;
-        rows.push({sid, lastReminder, advisorAge, flag, errStreak});
+        const phase = phaseMap?.[sid]?.phase || "—";
+        const phaseAge = Number.isFinite(phaseMap?.[sid]?.age_s) ? `${phaseMap[sid].age_s.toFixed(1)}s` : "";
+        rows.push({sid, phase, phaseAge, lastReminder, advisorAge, flag, errStreak});
       });
       rows.sort((a, b) => b.lastReminder - a.lastReminder);
       rows.slice(0, 12).forEach(r => {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${escapeHTML(r.sid)}</td><td class="num">${r.lastReminder}</td><td class="num">${r.advisorAge}</td><td>${r.flag ? `<span class="badge b-punt">flag</span> ${escapeHTML(r.flag.matched_pattern || "")}` : "—"}</td><td class="num">${r.errStreak}</td>`;
+        tr.innerHTML = `<td>${escapeHTML(r.sid)}</td><td>${escapeHTML(r.phase)}${r.phaseAge ? ` <span class="age">${escapeHTML(r.phaseAge)}</span>` : ""}</td><td class="num">${r.lastReminder}</td><td class="num">${r.advisorAge}</td><td>${r.flag ? `<span class="badge b-punt">flag</span> ${escapeHTML(r.flag.matched_pattern || "")}` : "—"}</td><td class="num">${r.errStreak}</td>`;
         tbody.appendChild(tr);
+      });
+
+      const itBody = document.querySelector("#integration-table tbody");
+      itBody.innerHTML = "";
+      const integrations = s.integrations || {};
+      document.getElementById("integrations-raw").textContent = JSON.stringify(integrations, null, 2);
+      Object.entries(integrations).forEach(([key, info]) => {
+        const tr = document.createElement("tr");
+        const ready = !!info.ready;
+        const registered = !!info.registered;
+        const installed = !!info.installed;
+        const badge = ready
+          ? '<span class="badge b-ok">ready</span>'
+          : (installed || registered)
+            ? '<span class="badge b-warn">partial</span>'
+            : '<span class="badge b-error">missing</span>';
+        const details = Object.entries(info.details || {})
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(" · ");
+        tr.innerHTML = `<td>${escapeHTML(info.label || key)}</td><td>${badge}</td><td>${installed ? "yes" : "no"}</td><td>${registered ? "yes" : "no"}</td><td>${escapeHTML(details || "—")}</td>`;
+        itBody.appendChild(tr);
       });
     }).catch(() => {});
   }
 
   function pollAgg() {
-    fetch("/dashboard/aggregates?since_s=900").then(r => r.json()).then(a => {
+    fetch("/dashboard/aggregates?since_s=900", FETCH_OPTS).then(r => r.json()).then(a => {
       const html = [
         ["turns",        a.turns_real],
         ["advisor",      a.advisor_calls],
         ["stuck",        a.stuck_reminders],
         ["soft-punt",    `${a.soft_punt_classified} (${a.soft_punt_gates} gates)`],
+        ["result shrink", a.tool_result_shrinks],
+        ["cache hit%",   `${(Number(a.prompt_cache_hit_ratio || 0) * 100).toFixed(0)}%`],
+        ["cache hit tok", a.prompt_cache_hit_tokens],
+        ["cache miss tok", a.prompt_cache_miss_tokens],
         ["anomalies",    a.anomalies],
         ["keepalive saves", a.keepalive_saves],
         ["p50 elapsed",  `${a.p50_elapsed_s}s`],
@@ -740,15 +1044,46 @@ _DASHBOARD_HTML = """<!doctype html>
     }).catch(() => {});
   }
 
+  function pollSelfImprovement() {
+    fetch("/dashboard/self-improvement", FETCH_OPTS).then(r => r.json()).then(base => {
+      const session = (base.sessions || [])[0] || "";
+      if (!session) return base;
+      return fetch(`/dashboard/self-improvement?session=${encodeURIComponent(session)}`, FETCH_OPTS).then(r => r.json());
+    }).then(s => {
+      document.getElementById("self-improvement-raw").textContent = JSON.stringify(s, null, 2);
+      const summary = s.trajectory?.summary || {};
+      const bestId = s.frontier?.best?.candidate_id || "";
+      const stats = [
+        ["sessions", s.session_count || 0],
+        ["selected", s.selected_session || "—"],
+        ["events", summary.total || 0],
+        ["failures", summary.failures || 0],
+        ["best", bestId || "—"],
+      ].map(([k, v]) => `<div class="stat"><div class="stat-label">${k}</div><div class="stat-value">${escapeHTML(String(v))}</div></div>`).join("");
+      document.getElementById("self-improvement-stats").innerHTML = stats;
+      const tbody = document.querySelector("#self-improvement-table tbody");
+      tbody.innerHTML = "";
+      const best = s.frontier?.best || {};
+      (s.frontier?.candidates || []).slice(-12).reverse().forEach(c => {
+        const tr = document.createElement("tr");
+        const metrics = c.metrics || {};
+        const isBest = c.candidate_id && c.candidate_id === best.candidate_id;
+        tr.innerHTML = `<td>${escapeHTML(c.candidate_id || "—")}</td><td>${escapeHTML(c.kind || s.frontier?.kind || "—")}</td><td class="num">${Number(metrics.score || metrics.quality || 0).toFixed(2)}</td><td class="num">${Number(metrics.pass_rate || 0).toFixed(2)}</td><td>${isBest ? '<span class="badge b-ok">best</span>' : "—"}</td>`;
+        tbody.appendChild(tr);
+      });
+    }).catch(() => {});
+  }
+
   function formatUptime(s) {
     if (s < 60) return `${s.toFixed(0)}s`;
     if (s < 3600) return `${(s / 60).toFixed(0)}m`;
     return `${(s / 3600).toFixed(1)}h`;
   }
 
-  pollState(); pollAgg();
+  pollState(); pollAgg(); pollSelfImprovement();
   setInterval(pollState, 3000);
   setInterval(pollAgg, 5000);
+  setInterval(pollSelfImprovement, 7000);
 })();
 </script>
 </body>
@@ -817,8 +1152,8 @@ pre { white-space:pre-wrap; overflow:auto; max-height:340px; background:#020617;
 const core = {
   server: ["host", "port", "verbose"],
   routing: ["force_route", "redirect_compaction_to_local", "sanitize_encrypted_content", "self_classify_escalates_to_frontier", "escalate_input_tokens", "escalate_turn_count", "escalate_on_error_streak"],
-  local: ["base_url", "wire_api", "model", "context_window", "timeout_s", "strip_tools", "api_key_env", "headers"],
-  frontier: ["base_url", "wire_api", "model", "timeout_s", "api_key_env"]
+  local: ["base_url", "wire_api", "model", "context_window", "timeout_s", "strip_tools", "api_key_env", "forward_authorization", "headers"],
+  frontier: ["base_url", "wire_api", "model", "timeout_s", "api_key_env", "forward_authorization"]
 };
 let state = {};
 let schema = {};
@@ -1005,11 +1340,11 @@ def register(app: Any, log_dir: Path) -> None:
 
     @app.get("/dashboard")
     def _dashboard_html() -> HTMLResponse:
-        return HTMLResponse(_DASHBOARD_HTML)
+        return HTMLResponse(_DASHBOARD_HTML, headers=_NO_STORE_HEADERS)
 
     @app.get("/dashboard/config")
     def _dashboard_config_html() -> HTMLResponse:
-        return HTMLResponse(_CONFIG_HTML)
+        return HTMLResponse(_CONFIG_HTML, headers=_NO_STORE_HEADERS)
 
     @app.get("/api/v1/config")
     def _api_v1_config() -> JSONResponse:
@@ -1149,12 +1484,34 @@ def register(app: Any, log_dir: Path) -> None:
                     break
                 yield chunk
         return StreamingResponse(_gen(), media_type="text/event-stream",
-                                  headers={"Cache-Control": "no-cache",
+                                  headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                            "Pragma": "no-cache",
+                                            "Expires": "0",
                                             "X-Accel-Buffering": "no"})
 
     @app.get("/dashboard/state")
     def _dashboard_state() -> JSONResponse:
-        return JSONResponse(state_snapshot())
+        return JSONResponse(state_snapshot(), headers=_NO_STORE_HEADERS)
+
+    @app.get("/dashboard/self-improvement")
+    def _dashboard_self_improvement(
+        session: str = "",
+        kind: str = "context",
+        limit: int = 50,
+    ) -> JSONResponse:
+        if limit < 1:
+            limit = 1
+        if limit > 500:
+            limit = 500
+        return JSONResponse(
+            self_improvement_snapshot(
+                log_dir,
+                session=session,
+                kind=kind,
+                limit=limit,
+            ),
+            headers=_NO_STORE_HEADERS,
+        )
 
     @app.get("/dashboard/aggregates")
     def _dashboard_aggregates(since_s: int = 900) -> JSONResponse:
@@ -1162,7 +1519,8 @@ def register(app: Any, log_dir: Path) -> None:
             since_s = 60
         if since_s > 86400:
             since_s = 86400
-        return JSONResponse(aggregates(log_dir, since_s=since_s))
+        return JSONResponse(aggregates(log_dir, since_s=since_s),
+                            headers=_NO_STORE_HEADERS)
 
     @app.get("/dashboard/recent")
     def _dashboard_recent(limit: int = 30) -> JSONResponse:
@@ -1170,7 +1528,12 @@ def register(app: Any, log_dir: Path) -> None:
             limit = 1
         if limit > 200:
             limit = 200
-        return JSONResponse(recent_events(log_dir, limit=limit))
+        return JSONResponse(recent_events(log_dir, limit=limit),
+                            headers=_NO_STORE_HEADERS)
+
+    @app.get("/dashboard/integrations")
+    def _dashboard_integrations() -> JSONResponse:
+        return JSONResponse(_integration_snapshot(), headers=_NO_STORE_HEADERS)
 
     @app.get("/dashboard/plans")
     def _dashboard_plans() -> JSONResponse:
@@ -1349,6 +1712,7 @@ def register(app: Any, log_dir: Path) -> None:
             "exec_resume_history": exec_resume_history,
             "synthetic_continue_state": synthetic_continue_state,
             "exec_resume_state": exec_resume_state,
+            "integrations": _integration_snapshot(),
         })
 
     @app.post("/api/v1/escalate")

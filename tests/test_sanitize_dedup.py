@@ -7,8 +7,17 @@ from copy import deepcopy
 from tinyctx.sanitize import (
     _DEDUP_PLACEHOLDER,
     _FAILED_PURGE_PLACEHOLDER,
+    _RESULT_SHRINK_MARKER,
+    collect_failure_signals,
     dedup_tool_calls,
+    detect_tool_call_storm,
+    flatten_tool_schemas,
+    compact_input_messages_for_local_responses,
+    condense_instructions_for_local_responses,
     purge_failed_tool_inputs,
+    embed_instructions_into_user_message,
+    renest_tool_arguments,
+    shrink_large_tool_results,
     _tool_call_signature,
 )
 
@@ -84,6 +93,178 @@ def test_dedup_does_not_mutate_input():
     snapshot = deepcopy(body)
     _ = dedup_tool_calls(body)
     assert body == snapshot, "dedup_tool_calls must not mutate input"
+
+
+def test_detect_tool_call_storm_fires_on_repeated_identical_calls():
+    body = {
+        "input": [
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c1"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c2"},
+            {"type": "function_call_output", "call_id": "c2", "output": "ok"},
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c3"},
+        ]
+    }
+    info = detect_tool_call_storm(body, recent_window=6, repeat_threshold=3)
+    assert info["triggered"] is True
+    assert info["tool_name"] == "ls"
+    assert info["count"] == 3
+
+
+def test_detect_tool_call_storm_ignores_distinct_calls():
+    body = {
+        "input": [
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c1"},
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/etc"}', "call_id": "c2"},
+            {"type": "function_call", "name": "cat",
+             "arguments": '{"path": "/tmp/x"}', "call_id": "c3"},
+        ]
+    }
+    info = detect_tool_call_storm(body, recent_window=6, repeat_threshold=3)
+    assert info["triggered"] is False
+
+
+def test_collect_failure_signals_scores_storm_as_strong_signal():
+    body = {
+        "input": [
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c1"},
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c2"},
+            {"type": "function_call", "name": "ls",
+             "arguments": '{"path": "/tmp"}', "call_id": "c3"},
+        ]
+    }
+    info = collect_failure_signals(body, recent_window=6, storm_repeat_threshold=3)
+    assert info["score"] >= 2
+    assert any(sig["kind"] == "tool_call_storm" for sig in info["signals"])
+
+
+def test_flatten_tool_schemas_rewrites_nested_parameters():
+    body = {
+        "tools": [{
+            "type": "function",
+            "name": "write_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "meta": {
+                        "type": "object",
+                        "properties": {
+                            "owner": {"type": "string"},
+                            "mode": {"type": "string"},
+                        },
+                        "required": ["owner", "mode"],
+                    },
+                },
+                "required": ["path", "meta"],
+            },
+        }]
+    }
+    out, flat_map, info = flatten_tool_schemas(
+        body, leaf_threshold=2, depth_threshold=1)
+    params = out["tools"][0]["parameters"]
+    assert info["applied"] is True
+    assert flat_map["write_file"] == {"meta.owner", "meta.mode"}
+    assert "meta.owner" in params["properties"]
+    assert "meta.mode" in params["properties"]
+    assert params["required"] == ["path", "meta.owner", "meta.mode"]
+
+
+def test_renest_tool_arguments_reconstructs_nested_object():
+    renested = renest_tool_arguments(
+        "write_file",
+        '{"path":"a.txt","meta.owner":"me","meta.mode":"644"}',
+        {"write_file": {"meta.owner", "meta.mode"}},
+    )
+    assert json.loads(renested) == {
+        "path": "a.txt",
+        "meta": {"owner": "me", "mode": "644"},
+    }
+
+
+def test_shrink_large_tool_results_summarizes_old_large_output():
+    huge = "line\n" * 4000 + "ERROR: failed\n" + "tail\n" * 200
+    body = {
+        "input": [
+            {"type": "function_call", "name": "shell",
+             "arguments": '{"command":["pytest"]}', "call_id": "c1"},
+            {"type": "function_call_output", "call_id": "c1",
+             "output": huge},
+            {"role": "assistant", "content": "observed failure"},
+        ]
+    }
+    out, info = shrink_large_tool_results(
+        body,
+        after_turns=1,
+        min_bytes=2000,
+        signal_lines=3,
+        head_chars=60,
+        tail_chars=80,
+    )
+    assert info["applied"] is True
+    summary = out["input"][1]["output"]
+    assert _RESULT_SHRINK_MARKER in summary
+    assert "tool=shell" in summary
+    assert "ERROR: failed" in summary
+    assert body["input"][1]["output"] == huge
+
+
+def test_compact_input_messages_for_local_responses_merges_and_hoists():
+    body = {
+        "instructions": "base",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev rules"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+            {"type": "function_call", "name": "update_plan", "arguments": "{}", "call_id": "c1"},
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "system note"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "resume"}]},
+        ],
+    }
+    out, info = compact_input_messages_for_local_responses(body)
+    assert info["hoisted"] == 2
+    assert info["merged_user_messages"] == 2
+    assert out["instructions"].startswith("dev rules\n\nsystem note\n\nbase")
+    assert out["input"][0]["type"] == "function_call"
+    assert out["input"][-1]["role"] == "user"
+    assert "first\n\nresume" in out["input"][-1]["content"][0]["text"]
+
+
+def test_embed_instructions_into_user_message_moves_top_level_instructions():
+    body = {
+        "instructions": "system guidance",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "resume"}]},
+        ],
+    }
+    out, applied = embed_instructions_into_user_message(body)
+    assert applied is True
+    assert "instructions" not in out
+    assert out["input"][0]["content"][0]["text"] == "system guidance\n\nresume"
+    assert body["instructions"] == "system guidance"
+
+
+def test_condense_instructions_for_local_responses_keeps_required_channel():
+    huge = (
+        "Approval policy is currently never.\n"
+        "danger-full-access\n"
+        "context-mode tools available\n"
+        "update_plan usage\n"
+        + ("x" * 5000)
+    )
+    body = {"instructions": huge, "input": []}
+    out, applied = condense_instructions_for_local_responses(body, max_chars=500)
+    assert applied is True
+    assert len(out["instructions"]) <= 500
+    assert "Approval mode: never ask for approval" in out["instructions"]
+    assert "Execution environment: danger-full-access" in out["instructions"]
 
 
 def test_purge_failed_tool_inputs_after_threshold():
@@ -811,6 +992,40 @@ def test_expand_mcp_namespaces_no_op_without_namespace():
     assert expand_mcp_namespaces(body) is body
 
 
+def test_expand_mcp_namespaces_can_leave_context_mode_tools_unprefixed():
+    from tinyctx.sanitize import expand_mcp_namespaces
+
+    body = {
+        "tools": [
+            {"type": "namespace", "name": "mcp__context_mode__",
+             "tools": [
+                 {"type": "function", "name": "ctx_batch_execute",
+                  "description": "batch", "parameters": {"type": "object"}},
+                 {"type": "function", "name": "ctx_execute",
+                  "description": "exec", "parameters": {"type": "object"}},
+             ]},
+            {"type": "namespace", "name": "mcp__advisor__",
+             "tools": [
+                 {"type": "function", "name": "ask_advisor",
+                  "description": "advisor", "parameters": {"type": "object"}},
+             ]},
+        ],
+    }
+
+    out = expand_mcp_namespaces(
+        body,
+        no_prefix_namespaces={"mcp__context_mode__"},
+    )
+    fn_names = sorted(
+        t["name"] for t in out["tools"] if t.get("type") == "function"
+    )
+    assert fn_names == [
+        "ctx_batch_execute",
+        "ctx_execute",
+        "mcp__advisor__ask_advisor",
+    ]
+
+
 def test_expand_then_scrub_keeps_advisor_drops_codex_specials():
     """Composition test: the real proxy pipeline runs expand then scrub.
     After expand, scrub should keep the advisor tool (now type=function)
@@ -855,6 +1070,30 @@ def test_inject_responses_defaults_empty_map_is_noop():
     from tinyctx.sanitize import inject_responses_defaults
     body = {"input": []}
     assert inject_responses_defaults(body, {}) == body
+
+
+def test_inject_context_mode_unavailable_note_when_tools_absent():
+    from tinyctx.sanitize import inject_context_mode_unavailable_note
+
+    body = {"instructions": "Use ctx_batch_execute when available.", "input": []}
+    out = inject_context_mode_unavailable_note(body)
+
+    assert out["instructions"].startswith("<!-- tinyctx-context-mode-unavailable -->")
+    assert "Session capability note" in out["instructions"]
+    assert "ctx_batch_execute" in out["instructions"]
+    assert body["instructions"] == "Use ctx_batch_execute when available."
+
+
+def test_inject_context_mode_unavailable_note_skips_when_ctx_tools_present():
+    from tinyctx.sanitize import inject_context_mode_unavailable_note
+
+    body = {
+        "instructions": "Use ctx_batch_execute when available.",
+        "tools": [{"type": "function", "name": "ctx_batch_execute"}],
+    }
+    out = inject_context_mode_unavailable_note(body)
+
+    assert out is body
 
 
 def test_inject_responses_defaults_creates_intermediate_dicts():

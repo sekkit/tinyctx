@@ -41,6 +41,7 @@ class RequestPhase(str, Enum):
     received = "received"
     classifying = "classifying"
     routing = "routing"
+    compacting = "compacting"
     backend_streaming = "backend_streaming"
     post_stream_classifying = "post_stream_classifying"
     injecting = "injecting"
@@ -49,7 +50,6 @@ class RequestPhase(str, Enum):
     retrying = "retrying"
     escalated_to_frontier = "escalated_to_frontier"
     empty_guarded = "empty_guarded"
-    compacting = "compacting"
 
 
 # ─── SessionState namespace + compaction reset policy ─────────────────────

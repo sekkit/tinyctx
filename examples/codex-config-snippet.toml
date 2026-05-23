@@ -17,6 +17,27 @@ model = "tinyctx-auto"
 model_context_window = 400000
 model_auto_compact_token_limit = 64000
 
+# Long-running `/goal` profile. Use only for trusted projects because it
+# keeps working without approval prompts and has full filesystem access.
+[profiles.tinyctx-goal]
+model_provider = "tinyctx"
+model = "tinyctx-auto"
+model_context_window = 1050000
+model_auto_compact_token_limit = 997500
+model_reasoning_effort = "high"
+plan_mode_reasoning_effort = "xhigh"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+features = { goals = true }
+
+# tinyctx routing strategy for `/goal`: keep ordinary executor turns on the
+# cheap model, but route goal-contract creation, done_when validation,
+# completion audits, and blocker/pivot judgments to frontier.
+# Put this in ~/.tinyctx/config.toml, not ~/.codex/config.toml:
+#
+# [routing]
+# goal_control_frontier_enabled = true
+
 # --- Optional MCP servers (uncomment after `./scripts/install.sh`) ----------
 
 # [mcp_servers.graphify]

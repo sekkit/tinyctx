@@ -7,7 +7,7 @@
 #   2) Copy a starter config to ~/.tinyctx/config.toml if absent.
 #   3) Install the recommended MCP servers (graphify, serena, etc.) and
 #      register them in ~/.codex/config.toml via per-server bootstrap modules.
-#   4) Auto-write [model_providers.tinyctx] + [profiles.tinyctx] to
+#   4) Auto-write [model_providers.tinyctx] + tinyctx profiles to
 #      ~/.codex/config.toml so `codex --profile tinyctx` just works after
 #      install with no manual paste step. Each block is idempotent.
 set -euo pipefail
@@ -105,12 +105,12 @@ fi
 
 # (caveman handled by step 3c above via tinyctx.caveman_bootstrap)
 
-# --- 4. Auto-write [model_providers.tinyctx] + [profiles.tinyctx] -----------
+# --- 4. Auto-write [model_providers.tinyctx] + tinyctx profiles -------------
 # Without these two blocks `codex --profile tinyctx` errors with "profile
 # not found" — meaning the proxy is up but codex never reaches it. Each
 # bootstrap is idempotent (uses _codex_toml.append_mcp_block) so re-running
 # install.sh is safe.
-echo "  - registering [model_providers.tinyctx] + [profiles.tinyctx] in ~/.codex/config.toml"
+echo "  - registering [model_providers.tinyctx] + tinyctx profiles in ~/.codex/config.toml"
 "$ROOT/.venv/bin/python" -m tinyctx.codex_profile_bootstrap install --quiet \
   || echo "    (codex profile registration had warnings — run python -m tinyctx.codex_profile_bootstrap status)"
 
@@ -122,7 +122,7 @@ cat <<'EOF'
     codex --profile tinyctx      # everything routes through tinyctx now
 
 Disable any of the auto-wiring at install time:
-    TINYCTX_CODEX_PROFILE_DISABLE=1   # don't write [model_providers.tinyctx] / [profiles.tinyctx]
+    TINYCTX_CODEX_PROFILE_DISABLE=1   # don't write tinyctx provider/profile blocks
     TINYCTX_ADVISOR_DISABLE=1         # don't register [mcp_servers.advisor]
     TINYCTX_GITNEXUS_DISABLE=1        # don't install/register gitnexus
     TINYCTX_SCOUT_HOOK_DISABLE=1      # don't register scout SessionStart hook

@@ -909,30 +909,23 @@ def maybe_inject_soft_completion_gate(
         body: dict[str, Any], proj_sid: str
 ) -> tuple[dict[str, Any], bool, str]:
     """If the soft-completion flag is set for this session, append a
-    `<system-reminder>` to body.input requiring the agent to vet the
-    would-be user question through advisor first. Clears the flag on
-    injection (fire-once semantics).
+    `<system-reminder>` to top-level `instructions` requiring the agent
+    to vet the would-be user question through advisor first. Clears the
+    flag on injection (fire-once semantics).
 
     Returns `(body, was_injected, matched_pattern)`. The original body
     is not mutated."""
     flag = _SOFT_COMPLETION_FLAG.get(proj_sid)
     if not flag or not flag.get("active"):
         return body, False, ""
-    items = body.get("input")
-    if not isinstance(items, list):
-        return body, False, ""
     pattern = str(flag.get("matched_pattern", "unknown"))
-    new_items = list(items)
-    new_items.append({
-        "type": "message",
-        "role": "user",
-        "content": [{
-            "type": "input_text",
-            "text": _GATE_TEMPLATE.format(pattern=pattern),
-        }],
-    })
     out = dict(body)
-    out["input"] = new_items
+    gate_text = _GATE_TEMPLATE.format(pattern=pattern)
+    inst = out.get("instructions")
+    if isinstance(inst, str) and inst.strip():
+        out["instructions"] = inst.rstrip() + "\n\n" + gate_text
+    else:
+        out["instructions"] = gate_text
     # Consume the flag.
     _SOFT_COMPLETION_FLAG[proj_sid] = {"active": False}
     _OUTPUT_BUFFER.pop(proj_sid, None)

@@ -233,7 +233,7 @@ CLI tools, bootstraps, optional features.
 | `classifier.py`              | Pure-Python logistic regression for escalation scoring (opt-in)               | support     |
 | `advisor.py`                 | Stdio MCP server: `ask_advisor(question)` route to frontier                   | support     |
 | `advisor_bootstrap.py`       | Auto-wire advisor MCP into codex config                                       | support     |
-| `codex_profile_bootstrap.py` | Auto-write `[model_providers.tinyctx]` + `[profiles.tinyctx]`                 | support     |
+| `codex_profile_bootstrap.py` | Auto-write tinyctx provider + normal/goal Codex profiles                     | support     |
 | `gitnexus_bootstrap.py`      | Auto-install gitnexus + register MCP                                          | support     |
 | `graphify_bootstrap.py`      | Auto-install graphify + per-project codex skill wire                          | support     |
 | `serena_bootstrap.py`        | Auto-install serena-agent + register MCP                                      | support     |

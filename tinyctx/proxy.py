@@ -99,6 +99,7 @@ from . import stall_watchdog as _stall
 from . import stream_relay as _relay
 from .tool_call_translator import ChatToResponsesTranslator, StreamTranslator, rebuild_response
 from .trace import RequestTrace
+from .workspace import safe_id
 
 
 CFG: Config = load_config()
@@ -122,7 +123,58 @@ _MUTATOR = CacheAwareMutator(
 )
 
 
+def _trajectory_phase(event: str) -> str:
+    if event == "route" or "route" in event or "frontier" in event:
+        return "router"
+    if "sanitize" in event or "tool" in event or "input" in event or "role" in event:
+        return "sanitize"
+    if "compact" in event or "compactor" in event:
+        return "compact"
+    if "stream" in event:
+        return "stream"
+    if "error" in event or "failed" in event:
+        return "error"
+    return "proxy"
+
+
+def _trajectory_record_from_log(event: str, fields: dict[str, Any]) -> None:
+    if os.environ.get("TINYCTX_TRAJECTORY_ENABLED", "1") == "0":
+        return
+    session = fields.get("session") or fields.get("proj_sid") or fields.get("conv_sid")
+    if not session:
+        return
+    metrics: dict[str, Any] = {}
+    artifacts: dict[str, Any] = {}
+    redacted = {"body", "input", "messages", "instructions", "content"}
+    for key, value in fields.items():
+        if key in {"session", "proj_sid", "conv_sid"}:
+            continue
+        if isinstance(value, (bool, int, float)) and not isinstance(value, bool):
+            metrics[key] = value
+        elif isinstance(value, bool):
+            metrics[key] = value
+        elif key in redacted:
+            artifacts[key] = "<redacted>"
+        elif isinstance(value, str) and len(value) > 2000:
+            artifacts[key] = value[:2000] + "...<truncated>"
+        else:
+            artifacts[key] = value
+    from .trajectory import record_event
+    record_event(
+        safe_id(session),
+        event,
+        phase=_trajectory_phase(event),
+        metrics=metrics,
+        artifacts=artifacts,
+        tags=("proxy-log",),
+    )
+
+
 def _log(event: str, **fields: Any) -> None:
+    try:
+        _trajectory_record_from_log(event, fields)
+    except Exception:  # noqa: BLE001 — telemetry must never break proxy flow
+        pass
     if not CFG.verbose:
         return
     line = json.dumps({"t": time.time(), "event": event, **fields},

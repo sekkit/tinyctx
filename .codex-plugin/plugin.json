@@ -10,6 +10,7 @@
     "codex": ">=0.124.0"
   },
   "hooks": "hooks/hooks.json",
+  "skills": "./skills/",
   "model_providers": {
     "tinyctx": {
       "name": "tinyctx local-first router",
@@ -26,6 +27,19 @@
       "model": "tinyctx-auto",
       "model_context_window": 400000,
       "model_auto_compact_token_limit": 64000
+    },
+    "tinyctx-goal": {
+      "model_provider": "tinyctx",
+      "model": "tinyctx-auto",
+      "model_context_window": 1050000,
+      "model_auto_compact_token_limit": 997500,
+      "model_reasoning_effort": "high",
+      "plan_mode_reasoning_effort": "xhigh",
+      "approval_policy": "never",
+      "sandbox_mode": "danger-full-access",
+      "features": {
+        "goals": true
+      }
     }
   },
   "post_install": [

@@ -201,7 +201,23 @@ def rebuild_response(
     new_items: list[dict[str, Any]] = []
     mutated = False
     for item in out_items:
-        if not isinstance(item, dict) or item.get("type") != "message":
+        if not isinstance(item, dict):
+            new_items.append(item)
+            continue
+        if item.get("type") == "function_call":
+            name = str(item.get("name") or "")
+            arguments = item.get("arguments")
+            renested = renest_tool_arguments(
+                name, arguments, flattened_tool_args)
+            if renested != arguments:
+                mutated = True
+                new_item = dict(item)
+                new_item["arguments"] = renested
+                new_items.append(new_item)
+            else:
+                new_items.append(item)
+            continue
+        if item.get("type") != "message":
             new_items.append(item)
             continue
         # Walk the message's content parts looking for output_text with XML.
@@ -244,7 +260,8 @@ def rebuild_response(
         for call in extracted_calls:
             cid = "fc_" + uuid.uuid4().hex[:24]
             name = call["name"]
-            arguments = call["arguments"]
+            arguments = renest_tool_arguments(
+                name, call["arguments"], flattened_tool_args)
             if (valid_tool_names is not None
                     and name not in valid_tool_names):
                 _record_unknown_tool_drop(name, valid_tool_names,
@@ -305,7 +322,11 @@ class StreamTranslator:
     # synthetic `shell echo` call so codex can dispatch it cleanly. None
     # (default) preserves legacy pass-through.
     valid_tool_names: set[str] | None = None
+    # Tool-name -> flattened dotted argument keys. When present, any
+    # emitted or pass-through function_call for that tool is re-nested
+    # before codex sees it.
     flattened_tool_args: dict[str, set[str]] | None = None
+    _pending_structured_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # ────────── public API ──────────
 
@@ -371,6 +392,12 @@ class StreamTranslator:
                         "arguments": str(item.get("arguments") or ""),
                     }
                     return
+                if self.flattened_tool_args and name in self.flattened_tool_args and item_id:
+                    self._pending_structured_calls[item_id] = {
+                        "name": name,
+                        "arguments": str(item.get("arguments") or ""),
+                        "output_index": data_obj.get("output_index", 0),
+                    }
                 self._has_live_tool_calls = True
             yield raw_event.encode("utf-8")
             return
@@ -384,6 +411,13 @@ class StreamTranslator:
                 if isinstance(delta, str) and delta:
                     pending["arguments"] = str(pending.get("arguments") or "") + delta
                 return
+            structured = self._pending_structured_calls.get(item_id)
+            if structured is not None:
+                delta = data_obj.get("delta")
+                if isinstance(delta, str) and delta:
+                    structured["arguments"] = (
+                        str(structured.get("arguments") or "") + delta)
+                return
             yield raw_event.encode("utf-8")
             return
 
@@ -396,6 +430,33 @@ class StreamTranslator:
                 if isinstance(args, str):
                     pending["arguments"] = args
                 return
+            structured = self._pending_structured_calls.get(item_id)
+            if structured is not None:
+                args = data_obj.get("arguments")
+                if isinstance(args, str):
+                    structured["arguments"] = args
+                output_index = structured.get("output_index",
+                                              data_obj.get("output_index", 0))
+                renested = renest_tool_arguments(
+                    structured.get("name", ""),
+                    structured.get("arguments", ""),
+                    self.flattened_tool_args,
+                )
+                yield self._build_event(
+                    "response.function_call_arguments.delta",
+                    {"type": "response.function_call_arguments.delta",
+                     "item_id": item_id, "output_index": output_index,
+                     "delta": renested,
+                     "sequence_number": self._next_seq()},
+                )
+                yield self._build_event(
+                    "response.function_call_arguments.done",
+                    {"type": "response.function_call_arguments.done",
+                     "item_id": item_id, "output_index": output_index,
+                     "arguments": renested,
+                     "sequence_number": self._next_seq()},
+                )
+                return
             yield raw_event.encode("utf-8")
             return
 
@@ -403,6 +464,7 @@ class StreamTranslator:
             item = data_obj.get("item") if isinstance(data_obj, dict) else None
             if isinstance(item, dict) and item.get("type") == "function_call":
                 item_id = str(item.get("id") or "")
+                self._pending_structured_calls.pop(item_id, None)
                 pending = self._pending_user_input.pop(item_id, None)
                 if pending is not None:
                     pending["raw_events"].append(raw_event)
@@ -590,7 +652,8 @@ class StreamTranslator:
         oidx = self._emitted_calls + 1   # +1 to stay clear of the message item
         cid = "fc_" + uuid.uuid4().hex[:24]
         name = call["name"]
-        arguments = call["arguments"]
+        arguments = renest_tool_arguments(
+            name, call["arguments"], self.flattened_tool_args)
         if (self.valid_tool_names is not None
                 and name not in self.valid_tool_names):
             _record_unknown_tool_drop(name, self.valid_tool_names,
@@ -1068,6 +1131,7 @@ class ChatToResponsesTranslator:
     _reasoning_item_emitted: bool = False
     _reasoning_done: bool = False
     _message_item_emitted: bool = False
+    _usage: dict[str, Any] = field(default_factory=dict)
     # Same semantics as StreamTranslator.valid_tool_names — None means no
     # validation (legacy pass-through). When set, function_calls naming a
     # tool not in the set are rewritten to a synthetic `shell echo` call.
@@ -1119,6 +1183,9 @@ class ChatToResponsesTranslator:
             self._resp_id = data.get("id") or "resp_" + uuid.uuid4().hex[:12]
         if not self._model:
             self._model = data.get("model") or ""
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            self._usage = usage
 
         if not self._started:
             self._started = True
@@ -1360,7 +1427,9 @@ class ChatToResponsesTranslator:
             oidx = tc_base + self._emitted_calls - 1
             cid = entry["id"] or "fc_" + uuid.uuid4().hex[:24]
             name = entry["name"]
-            arguments = entry["arguments"]
+            arguments = renest_tool_arguments(
+                name, entry["arguments"], self.flattened_tool_args)
+            entry["arguments"] = arguments
             if (self.valid_tool_names is not None
                     and name not in self.valid_tool_names):
                 _record_unknown_tool_drop(
@@ -1429,6 +1498,7 @@ class ChatToResponsesTranslator:
                 "status": "completed",
                 "model": self._model,
                 "output": output_items,
+                "usage": _translated_usage(self._usage),
             },
             "sequence_number": self._next_seq(),
         })
@@ -1441,3 +1511,24 @@ class ChatToResponsesTranslator:
     @staticmethod
     def _sse(event: str, payload: dict[str, Any]) -> bytes:
         return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+
+
+def _translated_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(usage, dict):
+        return {}
+    out = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens",
+                                  usage.get("prompt_tokens", 0) +
+                                  usage.get("completion_tokens", 0)),
+    }
+    if usage.get("prompt_cache_hit_tokens") is not None:
+        out["prompt_cache_hit_tokens"] = usage.get("prompt_cache_hit_tokens", 0)
+    if usage.get("prompt_cache_miss_tokens") is not None:
+        out["prompt_cache_miss_tokens"] = usage.get("prompt_cache_miss_tokens", 0)
+    if isinstance(usage.get("completion_tokens_details"), dict):
+        rt = usage["completion_tokens_details"].get("reasoning_tokens")
+        if isinstance(rt, int):
+            out["output_tokens_details"] = {"reasoning_tokens": rt}
+    return out

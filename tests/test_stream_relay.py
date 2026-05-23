@@ -100,11 +100,12 @@ def _make_scripted_stream(scripts: list):
       ("err", status, body_bytes) → error response with body
       ("exc", exception)          → raise on aenter
     Returns (stream_fn, state)."""
-    state = {"calls": [], "headers": [], "idx": 0}
+    state = {"calls": [], "headers": [], "json": [], "idx": 0}
 
     def stream_fn(self, method, url, **kwargs):
         state["calls"].append(url)
         state["headers"].append(dict(kwargs.get("headers") or {}))
+        state["json"].append(kwargs.get("json"))
         sc = scripts[state["idx"]]
         state["idx"] += 1
         kind = sc[0]
@@ -235,6 +236,44 @@ class TestStreamProducer:
         new_auth = state["headers"][1].get("Authorization", "")
         assert "local-leaky-key" not in new_auth
         assert new_auth == "Bearer frontier-rebuilt-key"
+
+    @pytest.mark.asyncio
+    async def test_retry_escalate_rewrites_body_model(self):
+        scripts = [
+            ("err", 400, b'{"error":"schema mismatch"}'),
+            ("ok", [b"ok\n\n"]),
+        ]
+        stream_fn, state = _make_scripted_stream(scripts)
+
+        class _FrontierBackend:
+            base_url = "http://frontier.test/v1"
+            model = "gpt-5.5"
+            api_key_env = ""
+
+        class _Cfg(_FakeCfg):
+            frontier = _FrontierBackend()
+
+        def build_frontier_retry_target(headers, body, reason):
+            retry_body = dict(body)
+            retry_body["model"] = "gpt-5.5"
+            return (
+                "http://frontier.test/v1/responses",
+                {"X-Frontier": "1"},
+                retry_body,
+                _make_decision("frontier", reason),
+                _Cfg.frontier,
+            )
+
+        producer = _make_producer(
+            cfg=_Cfg(),
+            build_frontier_retry_target=build_frontier_retry_target,
+        )
+        chunk_q: asyncio.Queue = asyncio.Queue()
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            await producer.run(chunk_q)
+        assert len(state["json"]) == 2
+        assert state["json"][0]["model"] == "x"
+        assert state["json"][1]["model"] == "gpt-5.5"
 
     @pytest.mark.asyncio
     async def test_retry_escalate_drops_auth_when_no_frontier_key(self):

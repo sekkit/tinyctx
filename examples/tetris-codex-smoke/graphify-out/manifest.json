@@ -1,0 +1,22 @@
+{
+  "C:\\Dev\\tinyctx\\examples\\tetris-codex-smoke\\game.js": {
+    "mtime": 1779463664.1845295,
+    "ast_hash": "b1485baeefcd719f5ac1b44a89a14f5e",
+    "semantic_hash": ""
+  },
+  "C:\\Dev\\tinyctx\\examples\\tetris-codex-smoke\\game.test.mjs": {
+    "mtime": 1779463664.18553,
+    "ast_hash": "0dc7bd33d18c4dc22f4b7d4ac6cb07e2",
+    "semantic_hash": ""
+  },
+  "C:\\Dev\\tinyctx\\examples\\tetris-codex-smoke\\index.html": {
+    "mtime": 1779463664.1825292,
+    "ast_hash": "41ce5481b260ce5ef90d3c30b3d73ba9",
+    "semantic_hash": ""
+  },
+  "C:\\Dev\\tinyctx\\examples\\tetris-codex-smoke\\README.md": {
+    "mtime": 1779463664.186031,
+    "ast_hash": "8c755c126c0089ca059a7d99c7c0579c",
+    "semantic_hash": ""
+  }
+}

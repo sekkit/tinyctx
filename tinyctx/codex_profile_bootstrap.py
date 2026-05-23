@@ -1,7 +1,6 @@
-"""Auto-write `[model_providers.tinyctx]` and `[profiles.tinyctx]` to
-~/.codex/config.toml.
+"""Auto-write tinyctx Codex provider/profile blocks to ~/.codex/config.toml.
 
-Without these two blocks, `codex --profile tinyctx` fails with
+Without the provider/profile blocks, `codex --profile tinyctx` fails with
 "profile not found" — meaning the proxy is up but codex never routes
 through it. The previous install.sh PRINTED the blocks at the end and
 asked the user to copy-paste them into the codex config; for anyone who
@@ -11,7 +10,7 @@ silently broken.
 
 This module makes registration the install script's responsibility, with
 the same idempotent append_mcp_block helper the per-server bootstraps
-use. Two markers, two append calls, lock-protected, safe to re-run.
+use. Each marker gets an append call, lock-protected and safe to re-run.
 
 Env vars:
     TINYCTX_CODEX_PROFILE_DISABLE=1   bypass entirely
@@ -22,7 +21,7 @@ Env vars:
     TINYCTX_CODEX_CONFIG=PATH         override ~/.codex/config.toml path
 
 CLI:
-    python -m tinyctx.codex_profile_bootstrap            # install both blocks
+    python -m tinyctx.codex_profile_bootstrap            # install blocks
     python -m tinyctx.codex_profile_bootstrap status     # report state
     python -m tinyctx.codex_profile_bootstrap uninstall  # strip both blocks
 """
@@ -46,6 +45,7 @@ LOG_FILE = TINYCTX_HOME / "logs" / "codex-profile-bootstrap.log"
 
 _PROVIDER_MARKER = "[model_providers.tinyctx]"
 _PROFILE_MARKER = "[profiles.tinyctx]"
+_GOAL_PROFILE_MARKER = "[profiles.tinyctx-goal]"
 
 _PROVIDER_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
@@ -69,6 +69,23 @@ model_provider = "tinyctx"
 model = "{model}"
 model_context_window = {ctx}
 model_auto_compact_token_limit = {auto_compact}
+"""
+
+_GOAL_PROFILE_BLOCK_TEMPLATE = """
+# Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
+# Long-running Codex goal profile. Activate with `codex --profile tinyctx-goal`.
+# This profile enables goal mode and bypasses approvals/sandboxing; use only
+# in project paths you explicitly trust.
+{marker}
+model_provider = "tinyctx"
+model = "{model}"
+model_context_window = 1050000
+model_auto_compact_token_limit = 997500
+model_reasoning_effort = "high"
+plan_mode_reasoning_effort = "xhigh"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+features = {{ goals = true }}
 """
 
 
@@ -113,6 +130,7 @@ class State:
     codex_config_exists: bool = False
     has_provider_block: bool = False
     has_profile_block: bool = False
+    has_goal_profile_block: bool = False
 
 
 def detect_state(codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
@@ -124,6 +142,8 @@ def detect_state(codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
             from ._codex_toml import has_mcp_block
             s.has_provider_block = has_mcp_block(codex_config, _PROVIDER_MARKER)
             s.has_profile_block = has_mcp_block(codex_config, _PROFILE_MARKER)
+            s.has_goal_profile_block = has_mcp_block(
+                codex_config, _GOAL_PROFILE_MARKER)
         except OSError as e:
             # Detection probe: config exists but unreadable. Leave both
             # flags False so bootstrap re-patches (idempotent — safe).
@@ -142,6 +162,13 @@ def _build_profile_block() -> str:
         model=_profile_model(),
         ctx=_profile_context(),
         auto_compact=_profile_auto_compact(),
+    )
+
+
+def _build_goal_profile_block() -> str:
+    return _GOAL_PROFILE_BLOCK_TEMPLATE.format(
+        marker=_GOAL_PROFILE_MARKER,
+        model=_profile_model(),
     )
 
 
@@ -164,6 +191,13 @@ def patch_codex_config(*, config_path: Path = CODEX_CONFIG_DEFAULT,
         _build_profile_block(), dry_run=dry_run)
     msgs.append(f"profile: {msg2}")
     if not ok2:
+        overall_ok = False
+
+    ok3, msg3 = append_mcp_block(
+        config_path, _GOAL_PROFILE_MARKER,
+        _build_goal_profile_block(), dry_run=dry_run)
+    msgs.append(f"goal profile: {msg3}")
+    if not ok3:
         overall_ok = False
 
     return overall_ok, msgs
@@ -206,7 +240,8 @@ def bootstrap(*, dry_run: bool = False,
 
 def _strip_blocks(text: str) -> str:
     from ._codex_toml import strip_mcp_block
-    out = strip_mcp_block(text, _PROFILE_MARKER)
+    out = strip_mcp_block(text, _GOAL_PROFILE_MARKER)
+    out = strip_mcp_block(out, _PROFILE_MARKER)
     out = strip_mcp_block(out, _PROVIDER_MARKER)
     return out
 
@@ -219,6 +254,8 @@ def _print_state_human(state: State) -> None:
          "yes" if state.has_provider_block else "no"),
         ("[profiles.tinyctx]",
          "yes" if state.has_profile_block else "no"),
+        ("[profiles.tinyctx-goal]",
+         "yes" if state.has_goal_profile_block else "no"),
     ]
     print("codex-profile state:")
     for k, v in rows:

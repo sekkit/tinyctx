@@ -3,11 +3,11 @@
 Covers the install-time auto-write of:
   [model_providers.tinyctx]
   [profiles.tinyctx]
+  [profiles.tinyctx-goal]
 
-Both are required for `codex --profile tinyctx` to find the proxy after
-`./scripts/install.sh` completes; the previous installer printed them
-and asked the user to paste, leaving the install silently broken for
-anyone who skipped that step.
+The base provider/profile are required for `codex --profile tinyctx` to
+find the proxy after `./scripts/install.sh` completes; `tinyctx-goal`
+adds the long-running `/goal` shape without changing the default profile.
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ def test_detect_state_no_config(isolated_home):
     assert s.codex_config_exists is False
     assert s.has_provider_block is False
     assert s.has_profile_block is False
+    assert s.has_goal_profile_block is False
 
 
 def test_bootstrap_writes_both_blocks(isolated_home):
@@ -45,9 +46,12 @@ def test_bootstrap_writes_both_blocks(isolated_home):
     content = codex.read_text()
     assert "[model_providers.tinyctx]" in content
     assert "[profiles.tinyctx]" in content
+    assert "[profiles.tinyctx-goal]" in content
     assert 'base_url = "http://127.0.0.1:4141/v1"' in content
     assert 'model_provider = "tinyctx"' in content
     assert "model_context_window = 400000" in content
+    assert "model_context_window = 1050000" in content
+    assert "features = { goals = true }" in content
 
 
 def test_bootstrap_is_idempotent(isolated_home):
@@ -59,6 +63,7 @@ def test_bootstrap_is_idempotent(isolated_home):
     text = codex.read_text()
     assert text.count("[model_providers.tinyctx]") == 1
     assert text.count("[profiles.tinyctx]") == 1
+    assert text.count("[profiles.tinyctx-goal]") == 1
 
 
 def test_bootstrap_dry_run_writes_nothing(isolated_home):
@@ -125,6 +130,7 @@ def test_uninstall_strips_both_blocks(isolated_home):
     text = codex.read_text()
     assert "[model_providers.tinyctx]" not in text
     assert "[profiles.tinyctx]" not in text
+    assert "[profiles.tinyctx-goal]" not in text
 
 
 def test_uninstall_preserves_other_blocks(isolated_home):
@@ -191,5 +197,9 @@ def test_install_then_codex_can_resolve_profile(isolated_home):
     parsed = tomllib.loads(codex.read_text())
     assert "profiles" in parsed
     assert "tinyctx" in parsed["profiles"]
+    assert "tinyctx-goal" in parsed["profiles"]
     assert parsed["profiles"]["tinyctx"]["model_provider"] == "tinyctx"
+    goal_profile = parsed["profiles"]["tinyctx-goal"]
+    assert goal_profile["model_provider"] == "tinyctx"
+    assert goal_profile["features"]["goals"] is True
     assert parsed["model_providers"]["tinyctx"]["wire_api"] == "responses"

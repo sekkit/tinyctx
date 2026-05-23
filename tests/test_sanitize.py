@@ -10,6 +10,7 @@ from copy import deepcopy
 from tinyctx.sanitize import (
     _DEFAULT_ROLE_REWRITE_MAP,
     drop_orphan_tool_outputs,
+    hoist_input_messages_to_instructions,
     rewrite_input_roles,
 )
 
@@ -96,6 +97,42 @@ def test_custom_rewrite_map():
         body, rewrite_map={"developer": "system", "function": "tool"})
     assert n == 2
     assert [it["role"] for it in out["input"]] == ["system", "tool", "user"]
+
+
+def test_hoists_developer_and_system_input_messages_into_instructions():
+    body = {
+        "instructions": "base guidance",
+        "input": [
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "repo rules"}]},
+            {"type": "message", "role": "system",
+             "content": [{"type": "input_text", "text": "resume prior plan"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "resume"}]},
+        ],
+    }
+    snap = deepcopy(body)
+    out, n = hoist_input_messages_to_instructions(body)
+    assert n == 2
+    assert out["instructions"] == (
+        "repo rules\n\nresume prior plan\n\nbase guidance"
+    )
+    assert [it["role"] for it in out["input"]] == ["user"]
+    assert body == snap
+
+
+def test_hoist_skips_non_message_items_and_empty_content():
+    body = {
+        "input": [
+            {"type": "function_call", "role": "system",
+             "name": "noop", "arguments": "{}"},
+            {"type": "message", "role": "system", "content": []},
+            {"type": "message", "role": "user", "content": "hello"},
+        ],
+    }
+    out, n = hoist_input_messages_to_instructions(body)
+    assert n == 0
+    assert out is body
 
 
 def test_non_dict_items_are_skipped():

@@ -62,6 +62,7 @@ def test_state_empty_shape(tmp_path: Path):
     assert body["exec_resume_history"] == []
     assert body["synthetic_continue_state"] == {}
     assert isinstance(body["exec_resume_state"], dict)
+    assert isinstance(body["integrations"], dict)
 
 
 def test_state_with_one_active_session(tmp_path: Path):
