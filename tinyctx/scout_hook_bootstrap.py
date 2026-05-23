@@ -5,14 +5,14 @@ summary; codex's SessionStart hook is what actually injects it as
 `additionalContext` for turn 1. Without that hook, the scout cache exists
 but never reaches a session — exactly the gap observed in production.
 
-This module merges a single SessionStart entry pointing at
-`scripts/scout-session-start.sh` into the codex hooks file. Idempotent:
+This module merges a single SessionStart entry pointing at the platform
+scout startup script into the codex hooks file. Idempotent:
 detected via the hook's command path; if it's already present we leave
 the file untouched. Co-exists with the existing `cm-hook-shim
 sessionstart` entry — codex runs every entry under SessionStart in order.
 
 Disable: TINYCTX_SCOUT_HOOK_DISABLE=1
-Override script path: TINYCTX_SCOUT_HOOK_SCRIPT=/path/to/scout-session-start.sh
+Override script path: TINYCTX_SCOUT_HOOK_SCRIPT=/path/to/scout-session-start
 """
 from __future__ import annotations
 
@@ -69,26 +69,69 @@ def _resolve_main_repo(repo_root: Path) -> Path:
     return repo_root
 
 
+def _default_script_name() -> str:
+    return "scout-session-start.bat" if os.name == "nt" else "scout-session-start.sh"
+
+
 def _default_script_path() -> str:
-    """Locate scripts/scout-session-start.sh shipped with this install,
+    """Locate the scout SessionStart script shipped with this install,
     preferring the stable main checkout over any worktree the bootstrap
     happens to be running from."""
     forced = os.environ.get("TINYCTX_SCOUT_HOOK_SCRIPT")
     if forced:
         return forced
+    script_name = _default_script_name()
     # tinyctx/scout_hook_bootstrap.py -> repo (or worktree) root
     raw_root = Path(__file__).resolve().parent.parent
     here = _resolve_main_repo(raw_root)
-    cand = here / "scripts" / "scout-session-start.sh"
+    cand = here / "scripts" / script_name
     if cand.is_file():
         return str(cand)
     # Fall back to ~/dev/tinyctx (typical user layout)
     cand2 = (Path.home() / "dev" / "tinyctx"
-             / "scripts" / "scout-session-start.sh")
+             / "scripts" / script_name)
     if cand2.is_file():
         return str(cand2)
     # Last resort: worktree-local. Caller will check existence.
-    return str(raw_root / "scripts" / "scout-session-start.sh")
+    return str(raw_root / "scripts" / script_name)
+
+
+def _normalize_hook_command(cmd: str) -> str:
+    return os.path.normcase(os.path.normpath(cmd.strip().strip('"')))
+
+
+def _same_hook_command(left: str, right: str) -> bool:
+    return _normalize_hook_command(left) == _normalize_hook_command(right)
+
+
+def _is_scout_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    cmd = hook.get("command") or ""
+    return (
+        "scout-session-start" in cmd
+        or hook.get("_added_by") == "tinyctx.scout_hook_bootstrap"
+    )
+
+
+def _without_scout_hooks(session_start: list) -> tuple[list, int]:
+    new_groups: list = []
+    removed = 0
+    for group in session_start:
+        if not isinstance(group, dict):
+            new_groups.append(group)
+            continue
+        kept_hooks = []
+        for h in group.get("hooks") or []:
+            if _is_scout_hook(h):
+                removed += 1
+                continue
+            kept_hooks.append(h)
+        if kept_hooks:
+            new_group = dict(group)
+            new_group["hooks"] = kept_hooks
+            new_groups.append(new_group)
+    return new_groups, removed
 
 
 @dataclass
@@ -117,7 +160,8 @@ def detect_state(hooks_path: Path = CODEX_HOOKS_PATH) -> State:
                     if not isinstance(h, dict):
                         continue
                     cmd = h.get("command") or ""
-                    if "scout-session-start" in cmd:
+                    if _is_scout_hook(h) and \
+                       _same_hook_command(cmd, s.script_path):
                         s.hook_already_registered = True
         except (OSError, json.JSONDecodeError) as e:
             _log(f"hooks.json read failed: {e}")
@@ -126,7 +170,7 @@ def detect_state(hooks_path: Path = CODEX_HOOKS_PATH) -> State:
 
 def register(hooks_path: Path = CODEX_HOOKS_PATH, *,
              dry_run: bool = False) -> tuple[bool, str]:
-    """Idempotently add a SessionStart entry running scout-session-start.sh.
+    """Idempotently add a SessionStart entry running scout-session-start.
     Co-exists with any pre-existing SessionStart entries.
     """
     state = detect_state(hooks_path)
@@ -149,9 +193,13 @@ def register(hooks_path: Path = CODEX_HOOKS_PATH, *,
         data["hooks"] = {}
     if not isinstance(data["hooks"].get("SessionStart"), list):
         data["hooks"]["SessionStart"] = []
+    session_start = data["hooks"]["SessionStart"]
+    data["hooks"]["SessionStart"], removed = _without_scout_hooks(
+        session_start
+    )
 
     # Append our entry. Mirror codex's documented schema:
-    #   { "hooks": [ {"type":"command","command":"<sh>"} ] }
+    #   { "hooks": [ {"type":"command","command":"<script>"} ] }
     data["hooks"]["SessionStart"].append({
         "hooks": [
             {"type": "command", "command": state.script_path,
@@ -168,7 +216,8 @@ def register(hooks_path: Path = CODEX_HOOKS_PATH, *,
                               encoding="utf-8")
     except OSError as e:
         return False, f"write failed: {e}"
-    return True, f"registered SessionStart hook at {hooks_path}"
+    verb = "updated" if removed else "registered"
+    return True, f"{verb} SessionStart hook at {hooks_path}"
 
 
 def unregister(hooks_path: Path = CODEX_HOOKS_PATH, *,
@@ -183,25 +232,7 @@ def unregister(hooks_path: Path = CODEX_HOOKS_PATH, *,
         return False, f"hooks.json unreadable: {e}"
 
     session_start = (data.get("hooks") or {}).get("SessionStart") or []
-    new_groups: list = []
-    removed = 0
-    for group in session_start:
-        if not isinstance(group, dict):
-            new_groups.append(group)
-            continue
-        kept_hooks = []
-        for h in group.get("hooks") or []:
-            if isinstance(h, dict):
-                cmd = h.get("command") or ""
-                if "scout-session-start" in cmd or \
-                   h.get("_added_by") == "tinyctx.scout_hook_bootstrap":
-                    removed += 1
-                    continue
-            kept_hooks.append(h)
-        if kept_hooks:
-            new_group = dict(group)
-            new_group["hooks"] = kept_hooks
-            new_groups.append(new_group)
+    new_groups, removed = _without_scout_hooks(session_start)
     if removed == 0:
         return True, "no scout hook entry found"
 

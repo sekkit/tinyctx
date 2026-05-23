@@ -95,6 +95,41 @@ def test_register_idempotent(isolated, monkeypatch):
     assert hooks.read_text() == snap
 
 
+def test_register_replaces_stale_scout_hook(isolated, monkeypatch):
+    hooks, tmp = isolated
+    old_script = tmp / "scout-session-start.sh"
+    new_script = tmp / "scout-session-start.bat"
+    old_script.write_text("#!/bin/bash\n")
+    new_script.write_text("@echo off\n")
+    monkeypatch.setenv("TINYCTX_SCOUT_HOOK_SCRIPT", str(new_script))
+    hooks.parent.mkdir(parents=True, exist_ok=True)
+    hooks.write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command",
+                            "command": "cm-hook-shim sessionstart"}]},
+                {"hooks": [{"type": "command",
+                            "command": str(old_script),
+                            "_added_by": "tinyctx.scout_hook_bootstrap"}]},
+            ],
+        }
+    }))
+
+    ok, msg = shb.register(hooks)
+
+    assert ok
+    assert "updated" in msg
+    data = json.loads(hooks.read_text())
+    commands = [
+        h["command"]
+        for group in data["hooks"]["SessionStart"]
+        for h in group["hooks"]
+    ]
+    assert "cm-hook-shim sessionstart" in commands
+    assert str(new_script) in commands
+    assert str(old_script) not in commands
+
+
 def test_register_dry_run_does_not_write(isolated, monkeypatch):
     hooks, tmp = isolated
     _fake_script(tmp, monkeypatch)
@@ -177,18 +212,19 @@ def test_resolve_main_repo_ignores_unrelated_worktrees_dir():
 
 
 def test_default_script_path_prefers_main_checkout_over_worktree(monkeypatch,
-                                                                  tmp_path):
+                                                                   tmp_path):
     """When bootstrap is imported from a worktree, _default_script_path
-    must return the main-checkout copy of scout-session-start.sh, not
+    must return the main-checkout copy of the platform scout script, not
     the worktree-local one."""
+    script_name = shb._default_script_name()
     main_repo = tmp_path / "tinyctx-main"
     worktree = main_repo / ".claude" / "worktrees" / "branch-name"
     main_scripts = main_repo / "scripts"
     worktree_scripts = worktree / "scripts"
     main_scripts.mkdir(parents=True)
     worktree_scripts.mkdir(parents=True)
-    (main_scripts / "scout-session-start.sh").write_text("#!/bin/bash\n")
-    (worktree_scripts / "scout-session-start.sh").write_text("#!/bin/bash\n")
+    (main_scripts / script_name).write_text("#!/bin/bash\n")
+    (worktree_scripts / script_name).write_text("#!/bin/bash\n")
 
     # Pretend the bootstrap module lives inside the worktree
     fake_file = worktree / "tinyctx" / "scout_hook_bootstrap.py"
@@ -199,8 +235,26 @@ def test_default_script_path_prefers_main_checkout_over_worktree(monkeypatch,
 
     out = shb._default_script_path()
     # Must point to main checkout, NOT to the worktree
-    assert str(main_scripts / "scout-session-start.sh") == out
+    assert str(main_scripts / script_name) == out
     assert ".claude/worktrees" not in out
+
+
+def test_default_script_path_uses_bat_on_windows(monkeypatch, tmp_path):
+    main_repo = tmp_path / "tinyctx-main"
+    scripts = main_repo / "scripts"
+    scripts.mkdir(parents=True)
+    bat = scripts / "scout-session-start.bat"
+    bat.write_text("@echo off\n")
+
+    fake_file = main_repo / "tinyctx" / "scout_hook_bootstrap.py"
+    fake_file.parent.mkdir(parents=True)
+    fake_file.touch()
+    monkeypatch.setattr(shb, "__file__", str(fake_file))
+    monkeypatch.setattr(shb.os, "name", "nt")
+    monkeypatch.delenv("TINYCTX_SCOUT_HOOK_SCRIPT", raising=False)
+
+    out = shb._default_script_path()
+    assert str(bat) == out
 
 
 def test_disabled_env_short_circuits_main(isolated, monkeypatch, capsys):
