@@ -153,6 +153,9 @@ class StreamProducer:
         log: Callable[..., None],
         build_frontier_retry_target: Callable[..., Any],
         resolve_api_key: Callable[..., str | None],
+        transport_factory: Callable[
+            [Decision], httpx.AsyncBaseTransport | None
+        ] | None = None,
     ):
         self._url = url
         self._headers = headers
@@ -168,6 +171,7 @@ class StreamProducer:
         self._log = log
         self._build_frontier_retry_target = build_frontier_retry_target
         self._resolve_api_key = resolve_api_key
+        self._transport_factory = transport_factory
         # Mutable per-attempt state.
         self._retry_state = retry_policy.RequestRetryState()
         self._attempt_url = url
@@ -190,8 +194,11 @@ class StreamProducer:
                 err_body_for_retry = ""
                 retry_after_s = 0.0
                 try:
+                    transport = (self._transport_factory(self._attempt_decision)
+                                 if self._transport_factory is not None
+                                 else self._transport)
                     async with httpx.AsyncClient(
-                            timeout=self._timeout, transport=self._transport) as client:
+                            timeout=self._timeout, transport=transport) as client:
                         async with client.stream(
                                 "POST", self._attempt_url,
                                 headers=self._attempt_headers,

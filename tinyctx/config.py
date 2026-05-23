@@ -33,6 +33,15 @@ def _env_bool(name: str) -> bool | None:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_proxy(name: str, default: str | None = None) -> str | None:
+    if name not in os.environ:
+        return default
+    v = (os.environ.get(name) or "").strip()
+    if v.lower() in {"", "0", "false", "none", "off", "direct"}:
+        return None
+    return v
+
+
 # ---------------------------------------------------------------------------
 # Namespaced views (P8)
 #
@@ -298,6 +307,9 @@ class BackendCfg:
     model: str = ""
     wire_api: str = "responses"
     timeout_s: float = 300.0
+    # Optional outbound HTTP proxy for this backend. Values without a scheme
+    # are normalized to http:// by the transport builder.
+    proxy: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     # The model's advertised input-context window (tokens). Drives the
     # "escalate when local can't fit it" routing branch — see router.decide.
@@ -373,6 +385,7 @@ class Config:
         model=_env("TINYCTX_LOCAL_MODEL", "qwen3.6-27b") or "",
         wire_api=_env("TINYCTX_LOCAL_WIRE_API", "chat") or "chat",
         timeout_s=float(_env("TINYCTX_LOCAL_TIMEOUT_S", "180") or 180),
+        proxy=_env_proxy("TINYCTX_LOCAL_PROXY"),
         # Cap runaway output. Without this, DeepSeek/etc. can stream
         # 1+ MB of tokens for 80+ seconds (observed today: a 77k-input
         # turn produced 1.25 MB / 80 s before the upstream cut its own
@@ -403,6 +416,7 @@ class Config:
         model=_env("TINYCTX_FRONTIER_MODEL", "gpt-5.5") or "",
         wire_api="responses",
         timeout_s=float(_env("TINYCTX_FRONTIER_TIMEOUT_S", "300") or 300),
+        proxy=_env_proxy("TINYCTX_FRONTIER_PROXY", "http://127.0.0.1:10809"),
         # Codex.app 0.128 hard-codes context_window=272000 for gpt-5.5
         # in its model catalog. Setting it here lets
         # `effective_proactive_compact_threshold` derive the right
@@ -1194,12 +1208,14 @@ def load_config() -> Config:
         ("TINYCTX_LOCAL_BASE_URL", ("local", "base_url")),
         ("TINYCTX_LOCAL_MODEL", ("local", "model")),
         ("TINYCTX_LOCAL_WIRE_API", ("local", "wire_api")),
+        ("TINYCTX_LOCAL_PROXY", ("local", "proxy")),
         ("TINYCTX_FRONTIER_BASE_URL", ("frontier", "base_url")),
         ("TINYCTX_FRONTIER_MODEL", ("frontier", "model")),
         ("TINYCTX_FRONTIER_WIRE_API", ("frontier", "wire_api")),
+        ("TINYCTX_FRONTIER_PROXY", ("frontier", "proxy")),
     ):
-        v = _env(env_key)
-        if v is not None:
+        v = _env_proxy(env_key) if attr[1] == "proxy" else _env(env_key)
+        if v is not None or (attr[1] == "proxy" and env_key in os.environ):
             section, key = attr
             setattr(getattr(cfg, section), key, v)
     fr = _env("TINYCTX_FORCE_ROUTE")

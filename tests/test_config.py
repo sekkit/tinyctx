@@ -78,6 +78,7 @@ def test_backendcfg_minimal_defaults() -> None:
     assert bc.model == ""
     assert bc.wire_api == "responses"
     assert bc.timeout_s == 300.0
+    assert bc.proxy is None
     assert bc.headers == {}
     assert bc.context_window == 0
     assert bc.context_safe_fraction == 0.0
@@ -387,11 +388,13 @@ def _clear_backend_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TINYCTX_LOCAL_MODEL",
         "TINYCTX_LOCAL_WIRE_API",
         "TINYCTX_LOCAL_TIMEOUT_S",
+        "TINYCTX_LOCAL_PROXY",
         "TINYCTX_LOCAL_MAX_OUTPUT_TOKENS",
         "TINYCTX_FRONTIER_BASE_URL",
         "TINYCTX_FRONTIER_API_KEY",
         "TINYCTX_FRONTIER_MODEL",
         "TINYCTX_FRONTIER_TIMEOUT_S",
+        "TINYCTX_FRONTIER_PROXY",
         "TINYCTX_FRONTIER_CONTEXT_WINDOW",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -406,6 +409,7 @@ def test_config_local_backend_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.local.model == "qwen3.6-27b"
     assert cfg.local.wire_api == "chat"
     assert cfg.local.timeout_s == 180.0
+    assert cfg.local.proxy is None
     assert cfg.local.inject_defaults == {
         "text.format.type": "text",
         "max_output_tokens": 16000,
@@ -442,11 +446,23 @@ def test_config_frontier_backend_defaults(
     assert cfg.frontier.model == "gpt-5.5"
     assert cfg.frontier.wire_api == "responses"
     assert cfg.frontier.timeout_s == 300.0
+    assert cfg.frontier.proxy == "http://127.0.0.1:10809"
     assert cfg.frontier.context_window == 272_000
     assert cfg.frontier.supported_tool_types == ()
     assert cfg.frontier.strip_request_fields == ("max_output_tokens",)
     assert cfg.frontier.inject_defaults == {}
     assert cfg.frontier.translate_tool_calls is False
+
+
+def test_config_frontier_proxy_env_override_and_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("TINYCTX_FRONTIER_PROXY", "127.0.0.1:7890")
+    assert Config().frontier.proxy == "127.0.0.1:7890"
+
+    monkeypatch.setenv("TINYCTX_FRONTIER_PROXY", "off")
+    assert Config().frontier.proxy is None
 
 
 def test_config_frontier_context_window_env_override(
@@ -607,16 +623,19 @@ model = "toml-model"
 
 [frontier]
 base_url = "https://from-toml.example.com/v1"
+proxy = "http://from-toml-proxy:10809"
 """,
         encoding="utf-8",
     )
     monkeypatch.setenv("TINYCTX_CONFIG", str(toml))
     monkeypatch.setenv("TINYCTX_LOCAL_BASE_URL", "http://from-env:1234/v1")
     monkeypatch.setenv("TINYCTX_FRONTIER_BASE_URL", "https://from-env.example/v1")
+    monkeypatch.setenv("TINYCTX_FRONTIER_PROXY", "off")
     cfg = load_config()
     # env wins
     assert cfg.local.base_url == "http://from-env:1234/v1"
     assert cfg.frontier.base_url == "https://from-env.example/v1"
+    assert cfg.frontier.proxy is None
     # field that the env didn't touch keeps the TOML value
     assert cfg.local.model == "toml-model"
 

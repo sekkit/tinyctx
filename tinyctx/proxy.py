@@ -29,7 +29,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
 import httpx
@@ -405,6 +405,38 @@ def _resolve_api_key(backend: BackendCfg, codex_auth: str | None) -> str | None:
 
 def _select_backend(decision: Decision) -> BackendCfg:
     return CFG.local if decision.route == "local" else CFG.frontier
+
+
+_DIRECT_PROXY_VALUES = {"", "0", "false", "none", "off", "direct"}
+
+
+def _normalize_proxy_url(proxy: str | None) -> str | None:
+    if proxy is None:
+        return None
+    value = str(proxy).strip()
+    if value.lower() in _DIRECT_PROXY_VALUES:
+        return None
+    if "://" not in value:
+        value = f"http://{value}"
+    return value
+
+
+def _upstream_retry_count() -> int:
+    raw = os.environ.get("TINYCTX_UPSTREAM_RETRIES")
+    if raw is None:
+        raw = str(getattr(CFG, "upstream_retry_count", 1))
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _build_upstream_transport(backend: BackendCfg) -> httpx.AsyncHTTPTransport:
+    proxy_url = _normalize_proxy_url(getattr(backend, "proxy", None))
+    kwargs: dict[str, Any] = {"retries": _upstream_retry_count()}
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+    return httpx.AsyncHTTPTransport(**kwargs)
 
 
 def _record_adaptive_outcome(
@@ -1627,13 +1659,13 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
     # after which codex.app stalled for 2 hours) are retried silently
     # without exposing the user to error toasts. Genuine server
     # responses pass through untouched. Set retries=0 to disable.
-    transport = httpx.AsyncHTTPTransport(retries=int(
-        os.environ.get("TINYCTX_UPSTREAM_RETRIES", "1") or 1
-    ))
+    transport = _build_upstream_transport(_select_backend(decision))
     if is_stream:
         return StreamingResponse(
             _stream_proxy(url, headers, body, sid, decision, timeout,
                           transport=transport,
+                          transport_factory=lambda d: _build_upstream_transport(
+                              _select_backend(d)),
                           translate_tool_calls=translate_tool_calls,
                           chat_to_responses=chat_to_responses,
                           trace=trace,
@@ -1656,7 +1688,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
     erg_key = conv_sid if conv_sid else sid
     last_response_payload: Any = None
     last_response_status: int = 0
-    async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+    client = httpx.AsyncClient(timeout=timeout, transport=transport)
+    try:
         while True:
             retry_state.record_attempt()
             attempt_url = cur_url
@@ -1775,6 +1808,13 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
                         pass
                 retry_state.record_escalation()
+            if new_decision.route != cur_decision.route:
+                await client.aclose()
+                client = httpx.AsyncClient(
+                    timeout=timeout,
+                    transport=_build_upstream_transport(
+                        _select_backend(new_decision)),
+                )
             _log("retry_attempted",
                  session=sid,
                  attempt_number=retry_state.attempts_used,
@@ -1849,12 +1889,17 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.elapsed_s = round(time.time() - started, 3)
             trace.emit(CFG.log_dir)
         return JSONResponse(content=payload, status_code=r.status_code)
+    finally:
+        await client.aclose()
 
 
 async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         proj_sid: str, decision: Decision,
                         timeout: httpx.Timeout,
                         *, transport: httpx.AsyncBaseTransport | None = None,
+                        transport_factory: Callable[
+                            [Decision], httpx.AsyncBaseTransport | None
+                        ] | None = None,
                         translate_tool_calls: bool = False,
                         chat_to_responses: bool = False,
                         trace: RequestTrace | None = None,
@@ -2015,6 +2060,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 url=url, headers=headers, body=body,
                 proj_sid=proj_sid, conv_sid=conv_sid,
                 decision=decision, timeout=timeout, transport=transport,
+                transport_factory=transport_factory,
                 erg_key=erg_key, request_id=request_id,
                 cfg=CFG, log=_log,
                 build_frontier_retry_target=_build_frontier_retry_target,

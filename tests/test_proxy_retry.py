@@ -239,6 +239,40 @@ def _make_mock_post(responses: list):
     return _post, state
 
 
+def _transport_proxy_url(transport: httpx.AsyncBaseTransport) -> str | None:
+    pool = getattr(transport, "_pool", None)
+    proxy_url = getattr(pool, "_proxy_url", None)
+    if proxy_url is None:
+        return None
+    scheme = getattr(proxy_url, "scheme", b"")
+    host = getattr(proxy_url, "host", b"")
+    target = getattr(proxy_url, "target", b"/")
+    if isinstance(scheme, bytes):
+        scheme = scheme.decode()
+    if isinstance(host, bytes):
+        host = host.decode()
+    if isinstance(target, bytes):
+        target = target.decode()
+    return f"{scheme}://{host}:{getattr(proxy_url, 'port', '')}{target}"
+
+
+def test_build_upstream_transport_uses_frontier_proxy_by_default(
+    proxy_module,
+) -> None:
+    local_transport = proxy_module._build_upstream_transport(proxy_module.CFG.local)
+    frontier_transport = proxy_module._build_upstream_transport(
+        proxy_module.CFG.frontier)
+    try:
+        assert _transport_proxy_url(local_transport) is None
+        assert (
+            _transport_proxy_url(frontier_transport)
+            == "http://127.0.0.1:10809/"
+        )
+    finally:
+        asyncio.run(local_transport.aclose())
+        asyncio.run(frontier_transport.aclose())
+
+
 class TestForwardRetryNonStream:
     """End-to-end retry tests against _forward's non-stream branch."""
 
@@ -274,6 +308,43 @@ class TestForwardRetryNonStream:
         info = _erg.consume_force_frontier("conv-a")
         assert info is not None
         assert "4xx" in info["reason"] or "escalate" in info["reason"]
+
+    @pytest.mark.asyncio
+    async def test_local_to_frontier_retry_rebuilds_proxy_transport(
+            self, proxy_module):
+        build_calls = []
+        real_build = proxy_module._build_upstream_transport
+
+        def spy_build(backend):
+            build_calls.append((backend.base_url, backend.proxy))
+            return real_build(backend)
+
+        responses = [
+            (400, {"error": {"message": "schema mismatch"}}),
+            (200, {"id": "resp", "output": []}),
+        ]
+        post_fn, _state = _make_mock_post(responses)
+        with patch.object(httpx.AsyncClient, "post", post_fn), \
+             patch.object(proxy_module, "_build_upstream_transport", spy_build):
+            from tinyctx.router import Decision
+            from tinyctx.trace import RequestTrace
+            decision = Decision("local", "test", is_compaction=False)
+            await proxy_module._forward(
+                "http://local.test/v1/responses",
+                {"Content-Type": "application/json"},
+                {"model": "qwen-test", "input": []},
+                is_stream=False,
+                sid="s-proxy-retry",
+                decision=decision,
+                trace=RequestTrace(session_id="s-proxy-retry"),
+                conv_sid="conv-proxy-retry",
+            )
+
+        assert build_calls[0] == ("http://local.test/v1", None)
+        assert build_calls[-1] == (
+            "http://frontier.test/v1",
+            "http://127.0.0.1:10809",
+        )
 
     @pytest.mark.asyncio
     async def test_local_500_retries_same_then_escalates(self, proxy_module):
@@ -598,7 +669,15 @@ class TestStreamProxyRetry:
             ("ok", [b'event: response.completed\ndata: {"type":"response.completed"}\n\n']),
         ]
         stream_fn, state = _make_mock_stream(scripts)
-        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+        build_calls = []
+        real_build = proxy_module._build_upstream_transport
+
+        def spy_build(backend):
+            build_calls.append((backend.base_url, backend.proxy))
+            return real_build(backend)
+
+        with patch.object(httpx.AsyncClient, "stream", stream_fn), \
+             patch.object(proxy_module, "_build_upstream_transport", spy_build):
             from tinyctx.router import Decision
             from tinyctx.trace import RequestTrace
             decision = Decision("local", "test", is_compaction=False)
@@ -618,6 +697,10 @@ class TestStreamProxyRetry:
         assert len(state["calls"]) == 2
         assert "local.test" in state["calls"][0]
         assert "frontier.test" in state["calls"][1]
+        assert build_calls[-1] == (
+            "http://frontier.test/v1",
+            "http://127.0.0.1:10809",
+        )
         # success body forwarded to client (not the 400 error)
         assert b"response.completed" in body_bytes
         # No `event: error` from the 400 should have been streamed to

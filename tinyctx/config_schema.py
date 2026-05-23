@@ -124,6 +124,13 @@ def _validate_field(
     if key == "base_url":
         if not isinstance(value, str) or not value.startswith(("http://", "https://")):
             errors.append(_err(section, key, "base_url must start with http:// or https://"))
+    elif key == "proxy":
+        if value in (None, ""):
+            return
+        if not isinstance(value, str):
+            errors.append(_err(section, key, "proxy must be a string"))
+        elif "://" in value and not value.startswith(("http://", "https://")):
+            errors.append(_err(section, key, "proxy must use http:// or https://"))
     elif key == "wire_api":
         if value not in ("chat", "responses"):
             errors.append(_err(section, key, "wire_api must be chat or responses"))
@@ -158,6 +165,7 @@ def _validate_field(
 def _backend_fields(*, local: bool) -> list[dict[str, Any]]:
     fields = [
         _field("base_url", "Base URL", "url"),
+        _field("proxy", "Outbound proxy", "string"),
         _field("wire_api", "Wire API", "enum", options=["chat", "responses"]),
         _field("model", "Model", "string"),
         _field("api_key_env", "API key env var", "string"),

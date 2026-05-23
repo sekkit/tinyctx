@@ -4,6 +4,7 @@ def test_validate_sections_accepts_chatgpt_frontier_without_openai_key():
     result = validate_sections({
         "frontier": {
             "base_url": "https://chatgpt.com/backend-api/codex",
+            "proxy": "127.0.0.1:10809",
             "wire_api": "responses",
             "model": "gpt-5.5",
         }
@@ -85,6 +86,29 @@ def test_validate_sections_rejects_bad_url_and_wire_api():
     assert "http:// or https://" in messages
     assert "chat or responses" in messages
     assert "auto, local, or frontier" in messages
+
+
+def test_validate_sections_rejects_bad_proxy_scheme():
+    from tinyctx.config_schema import validate_sections
+
+    result = validate_sections({
+        "frontier": {"proxy": "socks5://127.0.0.1:10809"},
+    })
+
+    assert result["ok"] is False
+    messages = " ".join(e["message"] for e in result["errors"])
+    assert "proxy must use http:// or https://" in messages
+
+
+def test_schema_exposes_frontier_proxy_field():
+    from tinyctx.config_schema import config_schema
+
+    frontier_fields = {
+        field["name"]
+        for field in config_schema()["sections"]["frontier"]
+    }
+
+    assert "proxy" in frontier_fields
 
 
 def test_validate_sections_accepts_self_classify_legacy_switch():
