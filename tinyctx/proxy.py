@@ -882,6 +882,7 @@ async def responses(request: Request) -> Any:
             GuardContext,
             GuardPipeline,
             PlanPersistenceInjector,
+            SelfImprovementGuard,
             SoftCompletionGate,
             StuckLoopGuard,
             trace_guard_results,
@@ -910,6 +911,8 @@ async def responses(request: Request) -> Any:
                 cwd=cwd_hdr,
                 plan_ttl_s=CFG.plan_persistence_ttl_s,
                 session_id=sid))
+        if getattr(CFG, "self_improvement_enabled", False):
+            active_guards.append(SelfImprovementGuard())
         guard_ctx = GuardContext(
             body=body, proj_sid=proj_sid, conv_sid=conv_sid,
             turn_count=turns,
@@ -984,6 +987,16 @@ async def responses(request: Request) -> Any:
                 elif gr.additional_log.get("exception_type"):
                     _log("plan_persistence_error", session=sid,
                           error=gr.reason)
+            elif gr.guard_name == "self_improvement":
+                if gr.fired:
+                    _log("self_improvement_degradation_detected",
+                          session=sid, proj_sid=proj_sid,
+                          reasons=gr.additional_log.get("reasons"),
+                          error_rate=gr.additional_log.get("error_rate"),
+                          avg_latency_s=gr.additional_log.get("avg_latency_s"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("self_improvement_guard_error",
+                          session=sid, error=gr.reason)
 
         # Single roll-up event so dashboards can see what fired in one
         # place without scanning across the per-guard log events above.
@@ -2495,6 +2508,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 elapsed=elapsed,
                 started=started,
                 url=url,
+                route=decision.route,
             ))
         except Exception as _e:  # noqa: BLE001
             _log("post_stream_analyze_error",

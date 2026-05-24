@@ -711,6 +711,15 @@ class Config:
     # this to 5s without losing accuracy.
     self_classify_timeout_s: float = 30.0
 
+    # Self-improvement: performance regression watchdog. Tracks per-request
+    # metrics (route, status, latency, bytes) and periodically evaluates
+    # against historical baselines. When degradation is detected (error rate
+    # 2x baseline, latency 1.5x baseline), the SelfImprovementGuard escalates
+    # the next request to frontier. Default OFF. See tinyctx/self_improvement.py.
+    self_improvement_enabled: bool = False
+    self_improvement_eval_interval: int = 50
+    self_improvement_stats_window: int = 50
+
     # Stuck-loop watchdog: after the agent has run N+ turns without
     # convergence (defined as: tracker not advancing, no advisor call
     # in the recent past), inject a `<system-reminder>` into the next
@@ -1271,4 +1280,13 @@ def load_config() -> Config:
     lmcache = _env_bool("TINYCTX_LOCAL_LMCACHE_PASSTHROUGH")
     if lmcache is not None:
         cfg.local.lmcache_passthrough = lmcache
+    sie = _env_bool("TINYCTX_SELF_IMPROVEMENT_ENABLED")
+    if sie is not None:
+        cfg.self_improvement_enabled = sie
+    sei = _env("TINYCTX_SELF_IMPROVEMENT_EVAL_INTERVAL")
+    if sei is not None:
+        cfg.self_improvement_eval_interval = int(sei)
+    sisw = _env("TINYCTX_SELF_IMPROVEMENT_STATS_WINDOW")
+    if sisw is not None:
+        cfg.self_improvement_stats_window = int(sisw)
     return cfg

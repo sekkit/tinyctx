@@ -171,6 +171,7 @@ class PostStreamContext:
     elapsed: float
     started: float
     url: str
+    route: str = ""
 
 
 class PostStreamAnalyzer:
@@ -197,8 +198,34 @@ class PostStreamAnalyzer:
         """Run the full post-stream pipeline. Returns immediately after
         the synchronous parts (empty-response guard + forensics); the
         classifier runs as a fire-and-forget background task."""
+        self._maybe_run_self_improvement(ctx)
         self._maybe_spawn_classifier(ctx)
         self._maybe_run_empty_response_guard(ctx)
+
+    # -- self-improvement recording (synchronous) --------------------
+
+    def _maybe_run_self_improvement(self, ctx: PostStreamContext) -> None:
+        """Record request metrics for self-improvement analysis.
+
+        Runs synchronously (fast: appends to an in-memory ring buffer
+        and conditionally triggers a local aggregation)."""
+        if not getattr(self._cfg, "self_improvement_enabled", False):
+            return
+        try:
+            from . import self_improvement as _si
+            _si.record_request(
+                ctx.proj_sid,
+                ctx.conv_sid or ctx.proj_sid,
+                route=ctx.route,
+                status=ctx.status,
+                elapsed_s=ctx.elapsed,
+                bytes_out=ctx.bytes_out,
+                upstream_failed=ctx.upstream_failed,
+                cfg=self._cfg,
+            )
+        except Exception as e:
+            self._log("self_improvement_record_error",
+                      session=ctx.proj_sid, error=str(e))
 
     # -- soft-completion classifier (background) ---------------------
 

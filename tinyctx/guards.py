@@ -537,3 +537,45 @@ class PlanPersistenceInjector:
             reason=",".join(bits),
             additional_log={"cwd": self.cwd[:120], **pdata_meta},
         )
+
+
+class SelfImprovementGuard:
+    """Force next request to frontier when self-improvement evaluation
+    detected performance degradation (elevated error rate or latency).
+
+    The flag is set by `self_improvement._maybe_evaluate()` in the
+    post-stream phase. This guard consumes it pre-flight. Priority 60
+    ensures more urgent guards (ForceFrontierGuard=10, EscalationLadder=25)
+    take precedence."""
+
+    name = "self_improvement"
+    priority = 60
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: compaction or forced model")
+        if ctx.force_route is not None:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason=f"skipped: force_route already={ctx.force_route}")
+
+        from . import self_improvement as _si
+        info = _si.consume_degradation_flag(ctx.proj_sid)
+        if info is None:
+            return GuardResult(guard_name=self.name, fired=False)
+
+        ctx.force_route = "frontier"
+        reasons = info.get("reasons", [])
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            force_route="frontier",
+            reason=f"performance degraded: {','.join(reasons)}",
+            additional_log={
+                "reasons": reasons,
+                "error_rate": info.get("error_rate"),
+                "avg_latency_s": info.get("avg_latency_s"),
+            },
+        )
