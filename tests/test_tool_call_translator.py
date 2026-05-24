@@ -1394,6 +1394,247 @@ def test_extract_valid_tool_names_handles_both_shapes():
     assert _extract_valid_tool_names({"tools": "junk"}) is None
 
 
+# ──────────────────────────────────────────────── Hermes-JSON variant (B)
+# qwen3.6-barubary-hermes-json-v1 template emits this shape. Body inside
+# the <tool_call> envelope is a single JSON object {"name", "arguments"}.
+
+
+def test_parse_hermes_json_body_basic():
+    text = (
+        "<tool_call>\n"
+        '{"name": "ls", "arguments": {"path": "/tmp"}}\n'
+        "</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["name"] == "ls"
+    assert json.loads(out[0]["arguments"]) == {"path": "/tmp"}
+
+
+def test_parse_hermes_json_body_with_nested_args():
+    text = (
+        "<tool_call>\n"
+        '{"name": "ctx_batch_execute", "arguments": '
+        '{"commands": [{"label": "a", "command": "ls"}, '
+        '{"label": "b", "command": "pwd"}]}}\n'
+        "</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["name"] == "ctx_batch_execute"
+    args = json.loads(out[0]["arguments"])
+    assert args["commands"][0]["command"] == "ls"
+    assert args["commands"][1]["label"] == "b"
+
+
+def test_parse_hermes_json_body_with_code_fences():
+    """The model occasionally wraps JSON in ```json fences despite the
+    template's explicit IMPORTANT instructions otherwise. We tolerate."""
+    text = (
+        "<tool_call>\n"
+        "```json\n"
+        '{"name": "shell", "arguments": {"command": ["echo", "hi"]}}\n'
+        "```\n"
+        "</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["name"] == "shell"
+    assert json.loads(out[0]["arguments"]) == {"command": ["echo", "hi"]}
+
+
+def test_parse_hermes_json_body_arguments_as_string_passthrough():
+    """When `arguments` is already a JSON-encoded string (template FIX9
+    rendering of historical assistant turns), keep it verbatim."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "shell", "arguments": "{\\"command\\":[\\"ls\\"]}"}\n'
+        "</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert json.loads(out[0]["arguments"]) == {"command": ["ls"]}
+
+
+def test_parse_hermes_json_body_multiple_calls():
+    text = (
+        '<tool_call>\n{"name": "ls", "arguments": {"path": "/a"}}\n</tool_call>'
+        "\n\n"
+        '<tool_call>\n{"name": "ls", "arguments": {"path": "/b"}}\n</tool_call>'
+    )
+    out = parse_tool_call_block(text)
+    assert [c["name"] for c in out] == ["ls", "ls"]
+    assert [json.loads(c["arguments"])["path"] for c in out] == ["/a", "/b"]
+
+
+def test_parse_hermes_json_body_skips_missing_name():
+    """Malformed body with no name field → no call extracted (no crash)."""
+    text = '<tool_call>\n{"arguments": {"path": "/tmp"}}\n</tool_call>'
+    assert parse_tool_call_block(text) == []
+
+
+# ──────────────────────────────────────────────── Hermes-XML hybrid (C)
+# Off-distribution drift on qwen3.6: model wraps JSON args in <arguments>
+# XML and uses <tool name="..."> instead of either pure JSON or pythonic
+# XML. Close tags often malformed (e.g. </tool_name> instead of </tool>).
+
+
+def test_parse_hermes_xml_body_basic():
+    text = (
+        "<tool_call>\n"
+        '<tool name="ctx_batch_execute">\n'
+        '<arguments>\n{"commands": [{"label": "x", "command": "ls"}]}\n</arguments>\n'
+        "</tool>\n"
+        "</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["name"] == "ctx_batch_execute"
+    args = json.loads(out[0]["arguments"])
+    assert args["commands"][0]["command"] == "ls"
+
+
+def test_parse_hermes_xml_body_tolerates_malformed_close():
+    """The user's reported trace: model closed with </tool_name> instead
+    of </tool>. The outer </tool_call> is the real boundary; we extract
+    successfully anyway."""
+    text = (
+        "<tool_call>\n"
+        '<tool name="ctx_batch_execute">\n'
+        "<arguments>\n"
+        '{"commands": [{"label": "Paper search", "command": "pwsh ..."}, '
+        '{"label": "ls", "command": "ls C:\\\\Dev\\\\tinyctx\\\\"}]}\n'
+        "</arguments>\n"
+        "</tool_name>\n"
+        "</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["name"] == "ctx_batch_execute"
+    args = json.loads(out[0]["arguments"])
+    assert len(args["commands"]) == 2
+
+
+def test_parse_hermes_xml_body_with_single_quotes_on_name():
+    text = (
+        "<tool_call>\n"
+        "<tool name='shell'>\n"
+        '<arguments>{"command": ["pwd"]}</arguments>\n'
+        "</tool>\n</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["name"] == "shell"
+
+
+def test_parse_hermes_xml_body_preserves_raw_args_on_unparseable_json():
+    """If <arguments> body isn't parseable JSON, keep it verbatim — codex
+    side may still accept (or sanitize.renest_tool_arguments may fix it)."""
+    text = (
+        "<tool_call>\n"
+        '<tool name="weird">\n'
+        "<arguments>not really json {{</arguments>\n"
+        "</tool>\n</tool_call>"
+    )
+    out = parse_tool_call_block(text)
+    assert len(out) == 1
+    assert out[0]["arguments"] == "not really json {{"
+
+
+def test_rebuild_response_handles_hermes_json_variant():
+    response = {
+        "output": [
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "status": "completed",
+             "content": [
+                 {"type": "output_text",
+                  "text": '<tool_call>\n{"name": "shell", "arguments": '
+                          '{"command": ["ls"]}}\n</tool_call>'}
+             ]}
+        ]
+    }
+    out = rebuild_response(response)
+    fcs = [it for it in out["output"] if it.get("type") == "function_call"]
+    assert len(fcs) == 1
+    assert fcs[0]["name"] == "shell"
+    assert json.loads(fcs[0]["arguments"]) == {"command": ["ls"]}
+
+
+def test_rebuild_response_handles_hermes_xml_variant():
+    response = {
+        "output": [
+            {"id": "msg_1", "type": "message", "role": "assistant",
+             "status": "completed",
+             "content": [
+                 {"type": "output_text",
+                  "text": '<tool_call>\n<tool name="shell">\n'
+                          '<arguments>{"command":["pwd"]}</arguments>\n'
+                          '</tool_name>\n</tool_call>'}
+             ]}
+        ]
+    }
+    out = rebuild_response(response)
+    fcs = [it for it in out["output"] if it.get("type") == "function_call"]
+    assert len(fcs) == 1
+    assert fcs[0]["name"] == "shell"
+    assert json.loads(fcs[0]["arguments"]) == {"command": ["pwd"]}
+
+
+def test_stream_translator_emits_function_call_for_hermes_json_variant():
+    """Hermes-JSON arrives fragmented across deltas; translator buffers
+    until the </tool_call> close arrives, then emits structured events."""
+    t = StreamTranslator()
+    deltas = [
+        "thinking... ",
+        '<tool_call>\n{"name": "shell", ',
+        '"arguments": {"command": ["ls", "/tmp"]}}',
+        "\n</tool_call>",
+    ]
+    out_bytes = []
+    for d in deltas:
+        chunk = (
+            "event: response.output_text.delta\n"
+            "data: " + json.dumps({
+                "type": "response.output_text.delta",
+                "item_id": "m1", "output_index": 0,
+                "content_index": 0, "delta": d, "sequence_number": 1,
+            }) + "\n\n"
+        ).encode("utf-8")
+        out_bytes.extend(t.feed(chunk))
+    out = b"".join(out_bytes).decode("utf-8")
+    assert "thinking..." in out
+    assert "function_call" in out
+    assert "response.function_call_arguments.done" in out
+    assert "/tmp" in out
+
+
+def test_stream_translator_emits_function_call_for_hermes_xml_variant():
+    """Hermes-XML hybrid (malformed close) fragmented across deltas → still
+    extracts a structured function_call."""
+    t = StreamTranslator()
+    deltas = [
+        '<tool_call>\n<tool name="shell">\n',
+        '<arguments>{"command": ["echo", "hi"]}</arguments>\n',
+        '</tool_name>\n</tool_call>',
+    ]
+    out_bytes = []
+    for d in deltas:
+        chunk = (
+            "event: response.output_text.delta\n"
+            "data: " + json.dumps({
+                "type": "response.output_text.delta",
+                "item_id": "m1", "output_index": 0,
+                "content_index": 0, "delta": d, "sequence_number": 1,
+            }) + "\n\n"
+        ).encode("utf-8")
+        out_bytes.extend(t.feed(chunk))
+    out = b"".join(out_bytes).decode("utf-8")
+    assert "function_call" in out
+    assert "response.function_call_arguments.done" in out
+    assert '"shell"' in out
+    assert "echo" in out
+
+
 if __name__ == "__main__":
     import sys
     failed = 0

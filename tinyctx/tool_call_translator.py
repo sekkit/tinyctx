@@ -58,53 +58,145 @@ from .sanitize import renest_tool_arguments
 # ───────────────────────────── format detection ───────────────────────────
 
 
-# Permissive XML-ish regex tuned to the Barubary template's emit grammar:
-#     <tool_call>
-#     <function=NAME>
-#     <parameter=KEY>
-#     VALUE  (may span lines)
-#     </parameter>
-#     ... more parameters ...
-#     </function>
-#     </tool_call>
+# The only invariant across all model emit shapes is the
+# `<tool_call>...</tool_call>` envelope. Inside, three body shapes occur:
 #
-# The model occasionally drops a closing tag or trims newlines, so we accept
-# both tight and loose whitespace and fail gracefully (return [] from
-# parse_tool_call_block on malformed input).
+#   A. pythonic XML (original Barubary template):
+#        <function=NAME>
+#        <parameter=KEY>VALUE</parameter>
+#        ...
+#        </function>
+#
+#   B. Hermes JSON (qwen3.6-barubary-hermes-json-v1.jinja, current default):
+#        {"name": "NAME", "arguments": {...}}
+#        — optional ```json fences tolerated.
+#
+#   C. Hermes XML hybrid (off-distribution drift, seen on qwen3.6):
+#        <tool name="NAME">
+#        <arguments>{...JSON...}</arguments>
+#        </tool>   close tag may be malformed (</tool_name>) or missing —
+#                  the outer </tool_call> is the real boundary.
+#
+# parse_tool_call_block tries variant B first (current template's intent),
+# then C, then A. Each body parser returns [] when its shape doesn't match,
+# so callers see a uniform interface.
 _TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*"
+    r"<tool_call>(.*?)</tool_call>",
+    re.DOTALL,
+)
+_FUNCTION_PARAM_BODY_RE = re.compile(
     r"<function=([^\s>]+)>\s*"
     r"((?:<parameter=[^\s>]+>.*?</parameter>\s*)*?)"
-    r"</function>\s*"
-    r"</tool_call>",
+    r"</function>",
     re.DOTALL,
 )
 _PARAM_RE = re.compile(
     r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>",
     re.DOTALL,
 )
+# Variant C: tolerate single/double quotes around NAME, optional attrs
+# on <arguments>, and any (or no) close tag after </arguments>.
+_HERMES_XML_BODY_RE = re.compile(
+    r"<tool\s+name\s*=\s*[\"']?([^\"'\s>]+)[\"']?\s*>"
+    r"\s*<arguments\b[^>]*>\s*(.*?)\s*</arguments>",
+    re.DOTALL,
+)
 _PARTIAL_OPEN_RE = re.compile(r"<tool_call\b", re.IGNORECASE)
 
 
 def parse_tool_call_block(text: str) -> list[dict[str, Any]]:
-    """Find every complete `<tool_call>` block in `text` and return one
-    `{"name": str, "arguments": str-json}` per call."""
+    """Find every complete `<tool_call>...</tool_call>` envelope in `text`
+    and return one `{"name": str, "arguments": str-json}` per call. Body
+    may be any of the three variants documented above `_TOOL_CALL_RE`."""
     out: list[dict[str, Any]] = []
     for m in _TOOL_CALL_RE.finditer(text):
+        body = m.group(1).strip()
+        if not body:
+            continue
+        calls = (_parse_hermes_json_body(body)
+                 or _parse_hermes_xml_body(body)
+                 or _parse_function_param_body(body))
+        if calls:
+            out.extend(calls)
+    return out
+
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?[ \t]*\r?\n?", "", s, count=1,
+                   flags=re.IGNORECASE)
+    if s.endswith("```"):
+        s = re.sub(r"\r?\n?[ \t]*```\s*$", "", s, count=1)
+    return s.strip()
+
+
+def _parse_function_param_body(body: str) -> list[dict[str, Any]]:
+    """Variant A: pythonic XML `<function=N><parameter=K>V</parameter></function>`."""
+    out: list[dict[str, Any]] = []
+    for m in _FUNCTION_PARAM_BODY_RE.finditer(body):
         name = m.group(1).strip()
         params_blob = m.group(2)
         args: dict[str, Any] = {}
         for pm in _PARAM_RE.finditer(params_blob):
             key = pm.group(1).strip()
             val = pm.group(2)
-            # Numeric / boolean / JSON guess: if the value parses as JSON,
-            # keep it native; else string. This keeps codex-side schema
-            # validators happy when they expect typed args.
             args[key] = _coerce_value(val)
         out.append({
             "name": name,
             "arguments": json.dumps(args, ensure_ascii=False),
         })
+    return out
+
+
+def _parse_hermes_json_body(body: str) -> list[dict[str, Any]]:
+    """Variant B: Hermes JSON `{"name":N,"arguments":{...}}`. Accepts
+    optional ```json fences. Returns [] when body isn't a JSON object,
+    name is missing, or JSON is unparseable — caller falls through."""
+    s = _strip_code_fences(body)
+    if not s or s[0] != "{":
+        return []
+    try:
+        obj = json.loads(s)
+    except (ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(obj, dict):
+        return []
+    name = obj.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return []
+    raw_args = obj.get("arguments")
+    if isinstance(raw_args, str):
+        # Already JSON-encoded (template FIX9 path) — keep verbatim.
+        arguments_str = raw_args
+    else:
+        try:
+            arguments_str = json.dumps(raw_args if raw_args is not None else {},
+                                       ensure_ascii=False)
+        except (ValueError, TypeError):
+            return []
+    return [{"name": name.strip(), "arguments": arguments_str}]
+
+
+def _parse_hermes_xml_body(body: str) -> list[dict[str, Any]]:
+    """Variant C: Hermes XML hybrid `<tool name="N"><arguments>JSON</arguments>`.
+    Tolerates malformed close tags (`</tool_name>`, missing, etc.) since
+    the outer `</tool_call>` envelope is the real boundary."""
+    out: list[dict[str, Any]] = []
+    for m in _HERMES_XML_BODY_RE.finditer(body):
+        name = m.group(1).strip()
+        if not name:
+            continue
+        raw_args = m.group(2).strip()
+        if raw_args:
+            try:
+                parsed = json.loads(raw_args)
+                arguments_str = json.dumps(parsed, ensure_ascii=False)
+            except (ValueError, json.JSONDecodeError):
+                arguments_str = raw_args
+        else:
+            arguments_str = "{}"
+        out.append({"name": name, "arguments": arguments_str})
     return out
 
 
