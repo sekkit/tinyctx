@@ -156,6 +156,14 @@ class RequestTrace:
     global_agent_rules_injected: bool = False
     global_agent_rules_chars: int = 0
 
+    # Platform-specific tool/shell rules (tinyctx/platform_rules.py)
+    # injection. True when the proxy prepended the host's block this
+    # request; False when the host is unrecognised, the block was
+    # already present (hop/replay/user customization), or the feature
+    # is disabled via CFG.inject_platform_rules.
+    platform_rules_injected: bool = False
+    platform_rules_chars: int = 0
+
     # Model-driven self-classification (Anthropic Advisor Strategy
     # aligned): when the proxy asked the local model "should this turn
     # escalate?", these fields capture its answer. p=0.0 (default)

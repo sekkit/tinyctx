@@ -63,6 +63,7 @@ from .router import (
     decide,
     estimate_tokens,
     is_compaction_request,
+    _detect_images,
     _flatten_text,
 )
 from .sanitize import (
@@ -1081,6 +1082,7 @@ async def responses(request: Request) -> Any:
             _log("self_classify_error", session=sid, error=str(e))
 
     # ─── Single consolidated route decision ──────────────────────────
+    has_image = _detect_images(body)
     route_ctx = RouteContext(
         body=body,
         proj_sid=proj_sid,
@@ -1093,6 +1095,7 @@ async def responses(request: Request) -> Any:
         is_compaction=is_compaction,
         classify_p=classify_p,
         classify_reason=classify_reason,
+        has_image=has_image,
     )
     router = Router(CFG).with_codex_auth(request.headers.get("authorization"))
     decision = router.decide(route_ctx)
@@ -1387,6 +1390,20 @@ async def responses(request: Request) -> Any:
                 trace.global_agent_rules_chars = agent_rules.template_chars()
         except Exception as e:  # noqa: BLE001
             _log("agent_rules_inject_error", session=sid, error=str(e))
+
+    # Host-platform-specific tool/shell rules. Tells the model not to
+    # suggest POSIX-only invocations on Windows (and vice-versa). The
+    # block is detected once at import per platform.system(), so it's
+    # cache-stable for the proxy's lifetime — upstream prompt cache hits.
+    if getattr(CFG, "inject_platform_rules", True):
+        try:
+            from . import platform_rules
+            body, was_injected = platform_rules.inject_into_body(body)
+            trace.platform_rules_injected = was_injected
+            if was_injected:
+                trace.platform_rules_chars = platform_rules.template_chars()
+        except Exception as e:  # noqa: BLE001
+            _log("platform_rules_inject_error", session=sid, error=str(e))
 
     # Task Orchestrator: classify task type with local heuristics/planner,
     # suggest Skill/MCP usage, optionally inject a validated Dynamic Skill

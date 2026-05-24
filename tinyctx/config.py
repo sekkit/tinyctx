@@ -152,6 +152,7 @@ class RoutingView(_NSView):
         "adaptive_model_sample_size": "adaptive_model_sample_size",
         "self_classify_threshold": "self_classify_threshold",
         "self_classify_escalates_to_frontier": "self_classify_escalates_to_frontier",
+        "image_prefer_frontier": "image_prefer_frontier",
     }
 
 
@@ -453,6 +454,7 @@ class Config:
     escalate_input_tokens: int = 0          # 0 = disabled (was 60_000)
     escalate_turn_count: int = 0            # 0 = disabled (was 15)
     escalate_on_error_streak: int = 2       # repeated tool-failure -> frontier (kept; Anthropic "when stuck")
+    image_prefer_frontier: bool = True      # route image-bearing prompts to frontier (vision support)
 
     # SmallCode-inspired adaptive model select: keep a rolling in-memory
     # health window for the local backend. If automatic requests have seen
@@ -1042,6 +1044,17 @@ class Config:
     # dir. See tinyctx/agent_rules.py.
     inject_global_agent_rules: bool = True
 
+    # Inject a host-platform-specific tool/shell rules block
+    # (tinyctx/platform_rules.py) so the upstream model picks correct
+    # invocations for THIS machine: no .sh / grep / bash -c on Windows,
+    # no apt-get / systemctl on macOS, etc. Detected once via
+    # platform.system() at import, byte-stable per process so the
+    # upstream prompt cache hits. Default on; disable only if your
+    # deployment is genuinely cross-host (e.g. proxy on Linux serving
+    # mixed-OS codex clients), in which case the global AGENTS.md is
+    # the right place for any catch-all guidance.
+    inject_platform_rules: bool = True
+
     # Auto-register external MCP servers (graphify, gitnexus) into
     # ~/.codex/config.toml on proxy startup. The registration is
     # idempotent (delegates to _codex_toml.append_mcp_block — line-exact
@@ -1249,6 +1262,9 @@ def load_config() -> Config:
     ame = _env_bool("TINYCTX_ADAPTIVE_MODEL_ENABLED")
     if ame is not None:
         cfg.adaptive_model_enabled = ame
+    ipf = _env_bool("TINYCTX_IMAGE_PREFER_FRONTIER")
+    if ipf is not None:
+        cfg.image_prefer_frontier = ipf
     vb = _env("TINYCTX_VERBOSE")
     if vb is not None:
         cfg.verbose = vb == "1"

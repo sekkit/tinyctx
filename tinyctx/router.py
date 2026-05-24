@@ -17,8 +17,9 @@ the backend URL + model + headers + wire_api + timeout, so proxy.py
 no longer has to re-derive any of that. Each rule is a small `_X_rule`
 method returning a Decision or None; the first non-None wins. The order
 of rules is the priority order (compaction beats force_route beats
-explicit-model beats goal-control beats error_streak beats adaptive
-backend-health beats capacity beats classify beats default).
+explicit-model beats image-to-frontier beats goal-control beats
+error_streak beats adaptive backend-health beats capacity beats
+classify beats default).
 
 The legacy `decide()` free function is preserved unchanged — many tests
 and the chat-completions handler still call it directly and we don't
@@ -121,6 +122,7 @@ class RouteContext:
     is_compaction: bool = False
     classify_p: float = 0.0
     classify_reason: str = ""
+    has_image: bool = False                # set by proxy from body scan
 
 
 def _flatten_text(node: Any) -> str:
@@ -171,6 +173,28 @@ def _tail_user_text(body: dict[str, Any]) -> str:
     if not (role == "user" or (typ == "message" and role == "user")):
         return ""
     return _flatten_text(last.get("content"))
+
+
+def _detect_images(body: dict[str, Any]) -> bool:
+    """Check whether the request body contains image content items.
+
+    Scans input/messages for content items with type=input_image or
+    image_url.  Local models (chat-completions wire) typically reject
+    these with HTTP 400, so detecting them early lets the router send
+    image-bearing prompts straight to frontier.
+    """
+    items = body.get("input") or body.get("messages") or []
+    if not isinstance(items, list):
+        return False
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        content = it.get("content")
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") in ("input_image", "image_url"):
+                    return True
+    return False
 
 
 def goal_control_signal(body: dict[str, Any]) -> str:
@@ -231,6 +255,10 @@ def decide(body: dict[str, Any], cfg, *, error_streak: int = 0) -> Decision:
     if compact and cfg.redirect_compaction_to_local:
         return Decision("local", "compaction handoff -> cheap path",
                         is_compaction=True, est_input_tokens=est, turn_count=turns)
+
+    if getattr(cfg, "image_prefer_frontier", True) and _detect_images(body):
+        return Decision("frontier", "image detected → frontier",
+                        est_input_tokens=est, turn_count=turns)
 
     if getattr(cfg, "goal_control_frontier_enabled", True):
         goal_signal = goal_control_signal(body)
@@ -382,6 +410,7 @@ class Router:
             self._compaction_rule,
             self._force_route_rule,
             self._explicit_model_rule,
+            self._image_to_frontier_rule,
             self._goal_control_rule,
             self._error_streak_rule,
             self._adaptive_model_rule,
@@ -508,8 +537,23 @@ class Router:
                 ctx, "client requested tinyctx-frontier")
         return None
 
+    def _image_to_frontier_rule(self, ctx: RouteContext) -> Decision | None:
+        """4. Image-bearing prompts → frontier.
+
+        Local chat-completions backends (DeepSeek, Ollama) reject
+        input_image content with HTTP 400.  When the request body
+        contains images and image_prefer_frontier is enabled, route
+        straight to frontier so vision-capable models handle them.
+        Disable via config.toml [routing] image_prefer_frontier=false
+        or env TINYCTX_IMAGE_PREFER_FRONTIER=0."""
+        if not getattr(self.cfg, "image_prefer_frontier", True):
+            return None
+        if ctx.has_image:
+            return self._make_frontier_decision(ctx, "image detected → frontier")
+        return None
+
     def _error_streak_rule(self, ctx: RouteContext) -> Decision | None:
-        """5. Repeated tool-failure streak → frontier.
+        """6. Repeated tool-failure streak → frontier.
 
         Anthropic "when stuck, escalate" — N consecutive failures on
         local means cheap model isn't making progress, so try the
@@ -521,7 +565,7 @@ class Router:
         return None
 
     def _adaptive_model_rule(self, ctx: RouteContext) -> Decision | None:
-        """6. Rolling local backend failure rate → frontier.
+        """7. Rolling local backend failure rate → frontier.
 
         Ported from SmallCode's adaptive model select, narrowed to tinyctx's
         local/frontier topology. It only applies after explicit route pins
@@ -544,7 +588,7 @@ class Router:
         )
 
     def _goal_control_rule(self, ctx: RouteContext) -> Decision | None:
-        """4. `/goal` control-plane turns → frontier.
+        """5. `/goal` control-plane turns → frontier.
 
         tinyctx's best goal-mode shape keeps ordinary execution on the
         cheap model, but routes high-leverage control decisions to the
@@ -562,7 +606,7 @@ class Router:
             ctx, f"goal-control turn -> frontier ({signal})")
 
     def _capacity_rule(self, ctx: RouteContext) -> Decision | None:
-        """7. Local context capacity escalation → frontier.
+        """8. Local context capacity escalation → frontier.
 
         Belt-and-suspenders for small-context local backends (LMStudio
         32k, Ollama default). Disabled when context_safe_fraction is 0
@@ -589,7 +633,7 @@ class Router:
         return None
 
     def _classify_rule(self, ctx: RouteContext) -> Decision | None:
-        """8. Self-classify advisor recommendation.
+        """9. Self-classify advisor recommendation.
 
         The local model itself classified this turn as needing the
         advisor. Threshold defaults to 0.7 and is configurable. Default
@@ -607,7 +651,7 @@ class Router:
         return None
 
     def _default_rule(self, ctx: RouteContext) -> Decision:
-        """9. Default → local (cheap path).
+        """10. Default → local (cheap path).
 
         Small/short request with no escalation signal; this is the win
         path that justifies the proxy's existence."""
