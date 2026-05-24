@@ -496,6 +496,7 @@ def _record_adaptive_outcome(
     *,
     ok: bool,
     status: int | None = None,
+    session: str = "",
 ) -> None:
     if not getattr(CFG, "adaptive_model_enabled", True):
         return
@@ -507,6 +508,7 @@ def _record_adaptive_outcome(
         )
         _log(
             "adaptive_model_outcome",
+            session=session,
             route=decision.route,
             model=decision.model,
             ok=ok,
@@ -1758,7 +1760,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                 exc = e
             if r is not None and r.status_code < 400:
                 _record_adaptive_outcome(
-                    cur_decision, ok=True, status=r.status_code)
+                    cur_decision, ok=True, status=r.status_code,
+                    session=sid)
                 _SESSION_ERROR_STREAK[sid] = 0
                 break  # success — fall through to payload handling
             # Failure path — classify and decide next action.
@@ -1783,7 +1786,8 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             )
             retry_state.last_action = action
             _record_adaptive_outcome(
-                cur_decision, ok=False, status=http_status)
+                cur_decision, ok=False, status=http_status,
+                session=sid)
             _SESSION_ERROR_STREAK[sid] += 1
             if action.decision == "propagate":
                 if conn_error:
@@ -2301,7 +2305,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     status = r.status_code
                     if r.status_code >= 400:
                         _record_adaptive_outcome(
-                            decision, ok=False, status=r.status_code)
+                            decision, ok=False, status=r.status_code,
+                            session=proj_sid)
                         _SESSION_ERROR_STREAK[proj_sid] += 1
                         text = (await r.aread()).decode("utf-8", "replace")
                         _log("upstream_error", session=proj_sid,
@@ -2346,7 +2351,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             for out in translator.flush():
                                 yield out
                         _record_adaptive_outcome(
-                            decision, ok=True, status=r.status_code)
+                            decision, ok=True, status=r.status_code,
+                            session=proj_sid)
     except _stall.StallCancelledError as e:
         # Watchdog cancelled the in-flight relay; emit terminator and
         # set force-frontier flag for the follow-up turn.
@@ -2360,7 +2366,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             e, proj_sid=proj_sid, conv_sid=conv_sid,
             bytes_out=bytes_out, started=started, url=url)
         status = res.status
-        _record_adaptive_outcome(decision, ok=False, status=status)
+        _record_adaptive_outcome(decision, ok=False, status=status,
+                                 session=proj_sid)
         yield res.error_event
         upstream_failed = res.upstream_failed
         upstream_failure_msg = res.upstream_failure_msg
@@ -2373,7 +2380,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             bytes_out=bytes_out, started=started, url=url,
             erg_key=erg_key, request_id=request_id)
         status = res.status
-        _record_adaptive_outcome(decision, ok=False, status=status)
+        _record_adaptive_outcome(decision, ok=False, status=status,
+                                 session=proj_sid)
         yield res.error_event
         upstream_failed = res.upstream_failed
         upstream_failure_msg = res.upstream_failure_msg

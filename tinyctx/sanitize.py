@@ -56,7 +56,20 @@ _RESULT_SHRINK_MARKER = "[tinyctx: tool result summarized]"
 
 def strip_encrypted_content(body: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of `body` with `encrypted_content` removed from every
-    reasoning-style item. Cheap deepcopy - request bodies are small."""
+    reasoning-style item. Also folds codex 0.128's `content[reasoning_text]`
+    payload back into the spec-compliant `summary[summary_text]` slot.
+
+    Why the content→summary fold lives here, not as a separate function:
+    both transforms walk the same reasoning items and both exist to keep
+    cross-model requests upstream-compatible. The Responses API spec gives
+    reasoning items a `summary` array; `content` on a reasoning item is
+    rejected by strict validators (LMStudio and chatgpt.com both return
+    `array_above_max_length` HTTP 400 when content has length > 0). The
+    400 then escalates to frontier, which in turn fails — zero-byte
+    response and codex aborts the session. See forensics dumps from
+    2026-05-23 (rq_33b8a7e... and the upstream_400 entries).
+
+    Cheap deepcopy - request bodies are small."""
     out = deepcopy(body)
     for key in ("input", "messages"):
         items = out.get(key)
@@ -65,9 +78,19 @@ def strip_encrypted_content(body: dict[str, Any]) -> dict[str, Any]:
         for it in items:
             if not isinstance(it, dict):
                 continue
+            # Strip proxy-synthesized IDs from ANY item type.
+            # Reasoning items get `rs_tinyctx_<hash>` from
+            # _fold_reasoning_content_into_summary.  When store=false
+            # the upstream looks up every id-bearing item and 400s on
+            # "not found."  Removing the id tells the upstream the item
+            # is new (not a stored-item reference).
+            existing_id = it.get("id")
+            if isinstance(existing_id, str) and existing_id.startswith("rs_tinyctx_"):
+                it.pop("id", None)
             t = it.get("type") or it.get("role") or ""
             if t in _REASONING_ITEM_TYPES:
                 it.pop("encrypted_content", None)
+                _fold_reasoning_content_into_summary(it)
             # nested content arrays
             content = it.get("content")
             if isinstance(content, list):
@@ -79,6 +102,57 @@ def strip_encrypted_content(body: dict[str, Any]) -> dict[str, Any]:
     if isinstance(inc, list):
         out["include"] = [x for x in inc if x != "reasoning.encrypted_content"]
     return out
+
+
+def _fold_reasoning_content_into_summary(item: dict[str, Any]) -> None:
+    """Move text from `item.content[reasoning_text]` into
+    `item.summary[summary_text]`, drop the `content` field, and ensure
+    the item carries an `id` (synthesizing one if missing).
+
+    Mutates `item` in place. Idempotent: if `content` is missing/empty or
+    every entry is empty after extraction, the field is just removed.
+
+    Why the `id` synthesis: LMStudio (and any strict OpenAI-Responses
+    validator) requires `id` on reasoning items in `input[]` —
+    `ResponseReasoningItemParam` has it as a required field. Codex 0.128
+    emits reasoning items WITHOUT `id`. After stripping `content` the
+    item would still be rejected without an `id`. We synthesize a stable
+    `rs_tinyctx_<8hex>` prefix so the upstream's pydantic validator
+    accepts the union variant. The synthetic id doesn't need to match
+    anything in the upstream's cache — it just satisfies the schema.
+
+    The fold is conservative — it only extracts entries with
+    `type == "reasoning_text"`. Other shapes (e.g. unknown future
+    content types) are dropped silently because the upstream would reject
+    them anyway. If `summary` already has entries, the folded text is
+    appended after them so existing summary order is preserved."""
+    content = item.get("content")
+    folded_texts: list[str] = []
+    if isinstance(content, list) and content:
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") != "reasoning_text":
+                continue
+            text = c.get("text")
+            if isinstance(text, str) and text:
+                folded_texts.append(text)
+    item.pop("content", None)
+    if folded_texts:
+        summary = item.get("summary")
+        if not isinstance(summary, list):
+            summary = []
+        for t in folded_texts:
+            summary.append({"type": "summary_text", "text": t})
+        item["summary"] = summary
+    # Strip synthetic IDs the proxy added on a previous pass.
+    # These IDs satisfy the schema validator but also cause the upstream
+    # to treat the item as a reference to a stored item.  When store=false
+    # the item lookup fails with 400 "Item not found."  Removing the id
+    # lets the upstream (re-)create the item as new.
+    existing_id = item.get("id")
+    if isinstance(existing_id, str) and existing_id.startswith("rs_tinyctx_"):
+        item.pop("id", None)
 
 
 def rewrite_model(body: dict[str, Any], target_model: str) -> dict[str, Any]:
@@ -1206,7 +1280,7 @@ def detect_tool_call_storm(
     body: dict[str, Any],
     *,
     recent_window: int = 8,
-    repeat_threshold: int = 3,
+    repeat_threshold: int = 5,
 ) -> dict[str, Any]:
     """Detect repeated identical tool calls in the recent transcript.
 
@@ -1251,7 +1325,7 @@ def collect_failure_signals(
     body: dict[str, Any],
     *,
     recent_window: int = 8,
-    storm_repeat_threshold: int = 3,
+    storm_repeat_threshold: int = 5,
 ) -> dict[str, Any]:
     """Collect conservative preflight failure signals from visible history.
 
@@ -1916,7 +1990,7 @@ def detect_tool_call_storm(
     body: dict[str, Any],
     *,
     recent_window: int = 8,
-    repeat_threshold: int = 3,
+    repeat_threshold: int = 5,
 ) -> dict[str, Any]:
     """Detect repeated identical tool calls in the recent transcript."""
     items = body.get("input") or body.get("messages")
@@ -1961,7 +2035,7 @@ def collect_failure_signals(
     body: dict[str, Any],
     *,
     recent_window: int = 8,
-    storm_repeat_threshold: int = 3,
+    storm_repeat_threshold: int = 5,
 ) -> dict[str, Any]:
     """Collect conservative preflight failure signals from visible history."""
     items = body.get("input") or body.get("messages")
