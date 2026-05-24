@@ -1303,6 +1303,19 @@ class ChatToResponsesTranslator:
                              "summary": []},
                     "sequence_number": self._next_seq(),
                 })
+            # Emit incremental reasoning_text.delta so codex's SSE parser
+            # sees events during long thinking phases. Without this, the
+            # proxy buffers all reasoning silently while codex waits — and
+            # codex's client-side idle timer (stream_idle_timeout_ms) fires
+            # the interruption before DeepSeek finishes thinking.
+            yield self._sse("response.reasoning_text.delta", {
+                "type": "response.reasoning_text.delta",
+                "item_id": self._reasoning_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": reasoning,
+                "sequence_number": self._next_seq(),
+            })
 
         # ── text content ──
         content = delta.get("content")
@@ -1390,6 +1403,14 @@ class ChatToResponsesTranslator:
 
     def _close_reasoning_item(self) -> Iterator[bytes]:
         self._reasoning_done = True
+        yield self._sse("response.reasoning_text.done", {
+            "type": "response.reasoning_text.done",
+            "item_id": self._reasoning_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": self._reasoning_buf,
+            "sequence_number": self._next_seq(),
+        })
         yield self._sse("response.output_item.done", {
             "type": "response.output_item.done",
             "output_index": 0,
@@ -1398,6 +1419,7 @@ class ChatToResponsesTranslator:
                 "type": "reasoning",
                 "summary": [{"type": "summary_text",
                               "text": self._reasoning_buf}],
+                "status": "completed",
             },
             "sequence_number": self._next_seq(),
         })
