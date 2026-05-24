@@ -53,6 +53,7 @@ file is added.
 - **Configuration model** — `Config`/`BackendCfg` defaults, TOML and environment overrides, namespaced views, fresh-instance isolation, context-window thresholds, retry/stall/forensics/guard defaults, visual config schema/presets, atomic TOML persistence, and verbose/log-dir behavior. Covered by `tests/test_config.py`, `tests/test_config_io.py`, `tests/test_config_schema.py`.
 - **Sanitization and history hygiene** — unsupported request fields/tools, Responses defaults/caps, encrypted content stripping, chat normalization, deduping repeated tool calls, failed-input purging, cache-aware mutation gates, and orphan tool-output handling. Covered by `tests/test_sanitize.py`, `tests/test_sanitize_dedup.py`.
 - **Guard rails** — policy guards, malformed request handling, and safety defaults. Covered by `tests/test_guards.py`.
+- **Escalation ladder** — graduated REFINE→PIVOT→SEARCH→BLOCKER escalation with per-session failure/pivot counters, strategy-change reminders, and frontier force-routing at PIVOT level. Covered by `tests/test_escalation.py`.
 - **Unified session state** — counters, flags, timestamps, bounded history, namespace isolation, snapshots, compaction resets, and falsy-session no-ops. Covered by `tests/test_session_state.py`.
 - **Self-improvement primitives** — filesystem session workspaces, context profiles, replayable trajectory ledgers, eval aggregation, candidate frontier scoring, and staged guardrail registries. Covered by `tests/test_self_improvement_primitives.py`.
 

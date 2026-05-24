@@ -351,6 +351,61 @@ class BudgetReminderGuard:
         )
 
 
+class EscalationLadderGuard:
+    """Graduated escalation ladder (REfiNE → PIVOT → SEARCH → BLOCKER).
+
+    Reads per-session failure/pivot counters from session_state, evaluates
+    the current escalation level, and injects the appropriate reminder +
+    force_route at each level.  Prevents the binary "fail once → jump to
+    dead frontier" stall seen in the Battle City session.
+
+    Priority 25 — runs after budget_reminder (20) but before stuck_loop
+    (30), so the ladder can escalate before the old watchdog fires.
+    """
+
+    name = "escalation_ladder"
+    priority = 25
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction:
+            return GuardResult(guard_name=self.name, fired=False,
+                                reason="skipped: compaction")
+        from . import escalation
+        result = escalation.evaluate_for_session(ctx.conv_sid)
+        if result is None or result.level == escalation.EscalationLevel.NORMAL:
+            return GuardResult(guard_name=self.name, fired=False)
+
+        # Inject reminder into body.input tail (recency-positioned).
+        if result.reminder is not None:
+            items = ctx.body.get("input")
+            if isinstance(items, list):
+                new_items = list(items)
+                new_items.append({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": result.reminder}],
+                })
+                out = dict(ctx.body)
+                out["input"] = new_items
+                ctx.body = out
+
+        # Set force_route at PIVOT and above.
+        if result.force_route is not None:
+            ctx.force_route = result.force_route
+
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=result.reminder is not None,
+            force_route=result.force_route,
+            reason=f"level={result.level.value}",
+            additional_log={
+                "escalation_level": result.level.value,
+                "force_route": result.force_route,
+            },
+        )
+
+
 class StuckLoopGuard:
     """Inject a stuck-loop `<system-reminder>` when turn_count climbs
     past `turn_trigger` without a recent advisor call. Keyed by

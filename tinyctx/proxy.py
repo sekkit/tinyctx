@@ -870,6 +870,7 @@ async def responses(request: Request) -> Any:
     try:
         from .guards import (
             BudgetReminderGuard,
+            EscalationLadderGuard,
             ForceFrontierGuard,
             GuardContext,
             GuardPipeline,
@@ -887,6 +888,8 @@ async def responses(request: Request) -> Any:
         # the guard); same gating shape as before.
         active_guards.append(BudgetReminderGuard(
             max_injections=CFG.max_continue_injections_per_session))
+        if getattr(CFG, "escalation_ladder_enabled", True):
+            active_guards.append(EscalationLadderGuard())
         if CFG.stuck_loop_watchdog_enabled:
             active_guards.append(StuckLoopGuard(
                 turn_trigger=CFG.stuck_loop_turn_trigger,

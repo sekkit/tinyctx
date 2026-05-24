@@ -250,6 +250,21 @@ class RequestTrace:
             # request that's emitting the trace.
             pass
 
+        # Record outcome for graduated escalation ladder.
+        # ok=True only for clean 200 with substantive response and no
+        # soft-completion punt. Everything else counts as a failure.
+        if self.session_id:
+            try:
+                from . import escalation
+                ok = (
+                    self.status == 200
+                    and self.bytes_out > 0
+                    and not self.soft_completion_detected
+                )
+                escalation.record_outcome(self.session_id, ok=ok)
+            except Exception:
+                pass  # escalation is best-effort advisory
+
 
 # ───────────────────────────── reader ─────────────────────────────
 

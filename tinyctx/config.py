@@ -729,6 +729,12 @@ class Config:
     # skip the watchdog nudge (it's already doing the right thing).
     stuck_loop_advisor_grace_s: float = 600.0
 
+    # Graduated escalation ladder (REFINE → PIVOT → SEARCH → BLOCKER).
+    # Prevents the binary "fail once → jump to dead frontier" stall by
+    # escalating through levels with strategy-change reminders at each
+    # step. Counters survive compaction; reset on session end.
+    escalation_ladder_enabled: bool = True
+
     # Soft-completion gate: when an agent ends a turn by asking the user
     # a meta-question ("what would you like to work on next?") instead
     # of completing tracker items + running verification, the proxy
