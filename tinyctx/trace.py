@@ -261,7 +261,8 @@ class RequestTrace:
                     and self.bytes_out > 0
                     and not self.soft_completion_detected
                 )
-                escalation.record_outcome(self.session_id, ok=ok)
+                escalation.record_outcome(
+                    self.project_session_key or self.session_id, ok=ok)
             except Exception:
                 pass  # escalation is best-effort advisory
 

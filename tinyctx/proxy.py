@@ -510,6 +510,7 @@ def _record_adaptive_outcome(
             decision,
             ok=ok,
             max_samples=CFG.adaptive_model_sample_size,
+            scope=session,
         )
         _log(
             "adaptive_model_outcome",

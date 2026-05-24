@@ -81,21 +81,26 @@ def backend_key(route: str, backend: Any) -> str:
     return f"{route}:{wire}:{base}:{model}"
 
 
-def decision_key(decision: Any) -> str:
+def decision_key(decision: Any, *, scope: str = "") -> str:
     route = getattr(decision, "route", "") or ""
     model = getattr(decision, "model", "") or ""
     wire = getattr(decision, "wire_api", "") or ""
     target = (getattr(decision, "target", "") or "").rstrip("/")
-    return f"{route}:{wire}:{target}:{model}"
+    base = f"{route}:{wire}:{target}:{model}"
+    return f"{scope}:{base}" if scope else base
 
 
-def record_decision(decision: Any, *, ok: bool, max_samples: int = 20
+def record_decision(decision: Any, *, ok: bool, max_samples: int = 20,
+                    scope: str = "",
                     ) -> AdaptiveHealth:
-    return STATE.record(decision_key(decision), ok=ok, max_samples=max_samples)
+    return STATE.record(decision_key(decision, scope=scope),
+                        ok=ok, max_samples=max_samples)
 
 
-def local_health(cfg: Any) -> AdaptiveHealth:
+def local_health(cfg: Any, *, scope: str = "") -> AdaptiveHealth:
     key = backend_key("local", getattr(cfg, "local", None))
+    if scope:
+        key = f"{scope}:{key}"
     return STATE.health(
         key,
         min_calls=getattr(cfg, "adaptive_model_min_calls", 3),
