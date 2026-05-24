@@ -1071,6 +1071,12 @@ class Config:
     # disable (e.g. when graph.json is stale or unavailable).
     ctx_pack_enabled: bool = True
 
+    # Instant project structure snapshot: synchronous dir-tree overview
+    # (~30ms) injected on every first request so the model has structural
+    # context from turn 0.  Complements the richer but async scout/ctx-pack
+    # pipeline.  Set false to disable.
+    snapshot_enabled: bool = True
+
     # Task Orchestrator: local-model task typing + Skill/MCP recommendation
     # injection. Keeps the actual Codex tool execution unchanged; tinyctx
     # only appends current-task guidance to instructions.

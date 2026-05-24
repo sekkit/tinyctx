@@ -1333,6 +1333,25 @@ async def responses(request: Request) -> Any:
         except Exception as e:  # noqa: BLE001 — auto-scout must never fail forward
             _log("auto_scout_error", session=sid, error=str(e))
 
+    # Snapshot: instant project structure overview (~30ms). Runs before
+    # the async scout/ctx-pack pipeline so the model always has a tree
+    # view from turn 0, even on first-ever request for a project.
+    if getattr(CFG, "snapshot_enabled", True):
+        try:
+            cwd_hdr = request.headers.get("x-codex-cwd")
+            if cwd_hdr:
+                from pathlib import Path as _PP2
+                from . import snapshot
+                project_root = _PP2(cwd_hdr).resolve()
+                if project_root.is_dir():
+                    snap_md = snapshot.build_snapshot(project_root)
+                    if snap_md:
+                        body = snapshot.inject_snapshot(body, snap_md)
+                        trace.snapshot_injected = True
+                        trace.snapshot_chars = len(snap_md)
+        except Exception:
+            pass  # snapshot is best-effort
+
     # ctx-pack: preemptively inject top-K key project files (ranked by
     # compression-biased PageRank from graph.json) into instructions.
     # Replaces N ctx_execute_file tool calls with a one-shot context block.

@@ -145,6 +145,8 @@ class RequestTrace:
     scout_chars: int = 0
     ctx_pack_injected: bool = False
     ctx_pack_chars: int = 0
+    snapshot_injected: bool = False
+    snapshot_chars: int = 0
 
     # Global agent rules (tinyctx/templates/AGENTS.md) injection. True
     # when the proxy prepended the bundled rules block this request.
