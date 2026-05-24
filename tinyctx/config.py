@@ -1064,6 +1064,13 @@ class Config:
     # scanner works without this.
     auto_scout_install_graphify: bool = False
 
+    # ctx-pack: preemptively inject top-K project files (ranked by
+    # compression-biased PageRank from the project's graph.json) into
+    # request body.instructions.  Replaces N ctx_execute_file tool
+    # calls with a single context block.  Default true; set false to
+    # disable (e.g. when graph.json is stale or unavailable).
+    ctx_pack_enabled: bool = True
+
     # Task Orchestrator: local-model task typing + Skill/MCP recommendation
     # injection. Keeps the actual Codex tool execution unchanged; tinyctx
     # only appends current-task guidance to instructions.

@@ -1333,6 +1333,27 @@ async def responses(request: Request) -> Any:
         except Exception as e:  # noqa: BLE001 — auto-scout must never fail forward
             _log("auto_scout_error", session=sid, error=str(e))
 
+    # ctx-pack: preemptively inject top-K key project files (ranked by
+    # compression-biased PageRank from graph.json) into instructions.
+    # Replaces N ctx_execute_file tool calls with a one-shot context block.
+    if getattr(CFG, "ctx_pack_enabled", True):
+        try:
+            cwd_hdr = request.headers.get("x-codex-cwd")
+            if cwd_hdr:
+                from pathlib import Path as _PP
+                from . import ctx_pack, scout as _scout
+                project_root = _PP(cwd_hdr).resolve()
+                if project_root.is_dir():
+                    cache = _scout.cache_dir(project_root)
+                    graph_path = cache / "graph.json"
+                    pack_md = ctx_pack.build_pack(graph_path, project_root)
+                    if pack_md:
+                        body = ctx_pack.inject_pack(body, pack_md)
+                        trace.ctx_pack_injected = True
+                        trace.ctx_pack_chars = len(pack_md)
+        except Exception:
+            pass  # ctx-pack is best-effort, never fail the request
+
     # Inject the bundled global agent rules (tinyctx/templates/AGENTS.md).
     # Idempotent: if codex.app already loaded ~/.codex/AGENTS.md the title
     # marker is already in instructions and we skip. Otherwise we prepend
