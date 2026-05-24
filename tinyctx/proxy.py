@@ -488,6 +488,11 @@ def _build_upstream_transport(backend: BackendCfg) -> httpx.AsyncHTTPTransport:
     kwargs: dict[str, Any] = {"retries": _upstream_retry_count()}
     if proxy_url:
         kwargs["proxy"] = proxy_url
+    # Never trust system proxy env vars (HTTP_PROXY / HTTPS_PROXY / etc.).
+    # When v2ray tunnel mode is active it may set these globally, but the
+    # proxy should always go direct unless explicitly configured via
+    # [local].proxy or [frontier].proxy in config.toml.
+    kwargs["trust_env"] = False
     return httpx.AsyncHTTPTransport(**kwargs)
 
 
