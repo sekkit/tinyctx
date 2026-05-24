@@ -311,6 +311,40 @@ def state_snapshot() -> dict[str, Any]:
         }
     except Exception as e:  # noqa: BLE001
         out["request_phase"] = {"error": str(e)}
+    # Autoresearch run status — scan workspace for autoresearch-results/
+    try:
+        import os as _os2
+        ar_runs: dict[str, Any] = {}
+        for candidate in (_os2.path.expanduser("~"), "/tmp"):
+            for root, dirs, _files in _os2.walk(candidate):
+                depth = root.count(_os2.sep) - candidate.count(_os2.sep)
+                if depth > 4:
+                    dirs.clear()
+                    continue
+                if "autoresearch-results" in dirs:
+                    state_path = _os2.path.join(root, "autoresearch-results", "state.json")
+                    try:
+                        with open(state_path, "r", encoding="utf-8") as fh:
+                            st = json.loads(fh.read())
+                        cfg = st.get("config", {})
+                        s = st.get("state", {})
+                        ar_runs[root] = {
+                            "goal": cfg.get("goal", "")[:120],
+                            "mode": cfg.get("session_mode", "?"),
+                            "metric": cfg.get("metric", "?"),
+                            "direction": cfg.get("direction", "?"),
+                            "iteration": s.get("iteration", 0),
+                            "keep_count": s.get("keep_count", 0),
+                            "discard_count": s.get("discard_count", 0),
+                            "best_metric": s.get("best_metric"),
+                            "current_metric": s.get("current_metric"),
+                        }
+                    except Exception:
+                        ar_runs[root] = {"error": "unreadable state.json"}
+        if ar_runs:
+            out["autoresearch_runs"] = ar_runs
+    except Exception:  # noqa: BLE001
+        pass
     # forensics dump count
     try:
         from pathlib import Path as _P

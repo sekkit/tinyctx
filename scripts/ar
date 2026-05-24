@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# ar — quick launcher for codex-autoresearch via tinyctx proxy
+#
+# Usage:
+#   ar loop "improve test coverage in src/"
+#   ar bg   "reduce lint warnings to zero"
+#   ar fix  "fix type errors in src/components"
+#   ar status              # show active run status
+#   ar stop                # stop background run
+#   ar resume              # resume interrupted run
+#   ar history             # show last 10 results
+#
+# Prerequisites:
+#   - codex CLI installed and in PATH
+#   - tinyctx proxy running on 127.0.0.1:4141
+#   - codex profile using tinyctx as provider
+#
+# The script auto-detects the repo root and passes it to autoresearch.
+# All codex API calls go through tinyctx for token savings.
+
+set -euo pipefail
+
+SKILL_ROOT="${CODEX_SKILLS_DIR:-$HOME/.codex/skills}/codex-autoresearch"
+SCRIPTS="$SKILL_ROOT/scripts"
+REPO=$(git rev-parse --show-toplevel 2>/dev/null || echo "$(pwd)")
+WORKSPACE="${AUTORESEARCH_WORKSPACE:-$REPO}"
+
+# ── colors ──────────────────────────────────────────────────────────
+c_reset='\033[0m'
+c_bold='\033[1m'
+c_cyan='\033[36m'
+c_green='\033[32m'
+c_yellow='\033[33m'
+c_red='\033[31m'
+
+banner() {
+    echo -e "${c_cyan}${c_bold}══ codex-autoresearch · tinyctx ${c_reset}${c_cyan}══${c_reset}"
+    echo -e "  proxy: ${c_green}127.0.0.1:4141${c_reset}  repo: ${c_yellow}$REPO${c_reset}"
+    echo ""
+}
+
+check_proxy() {
+    curl -s http://127.0.0.1:4141/ > /dev/null 2>&1 || {
+        echo -e "${c_red}✗ tinyctx proxy not running on :4141${c_reset}"
+        echo "  start it with: cd C:/Dev/tinyctx && python -m tinyctx.proxy"
+        exit 1
+    }
+}
+
+cmd_loop() {
+    local goal="${1:-}"
+    [ -z "$goal" ] && { echo "Usage: ar loop <goal>"; exit 1; }
+    banner
+    echo -e "${c_bold}Starting FOREGROUND loop${c_reset}"
+    echo -e "  goal: ${c_yellow}$goal${c_reset}"
+    echo ""
+    codex --model tinyctx-auto \
+        --dangerously-bypass-approvals-and-sandbox \
+        "$SKILL_ROOT/SKILL.md" \
+        "Use codex-autoresearch in loop mode. Goal: $goal. Scope: $REPO. Run in foreground, one iteration at a time."
+}
+
+cmd_bg() {
+    local goal="${1:-}"
+    [ -z "$goal" ] && { echo "Usage: ar bg <goal>"; exit 1; }
+    banner
+    echo -e "${c_bold}Starting BACKGROUND run${c_reset}"
+    echo -e "  goal: ${c_yellow}$goal${c_reset}"
+    echo ""
+    codex --model tinyctx-auto \
+        --dangerously-bypass-approvals-and-sandbox \
+        --enable goals --enable hooks \
+        "$SKILL_ROOT/SKILL.md" \
+        "Use codex-autoresearch in loop mode. Goal: $goal. Scope: $REPO. Run in BACKGROUND mode — launch via autoresearch_runtime_ctl.py and return a handoff summary."
+}
+
+cmd_fix() {
+    local goal="${1:-fix all errors}"
+    banner
+    echo -e "${c_bold}Starting FIX run${c_reset}"
+    echo -e "  goal: ${c_yellow}$goal${c_reset}"
+    echo ""
+    codex --model tinyctx-auto \
+        --dangerously-bypass-approvals-and-sandbox \
+        "$SKILL_ROOT/SKILL.md" \
+        "Mode: fix. Goal: $goal. Scope: $REPO. Run in foreground."
+}
+
+cmd_status() {
+    banner
+    if [ -f "$WORKSPACE/autoresearch-results/state.json" ]; then
+        echo -e "${c_green}✓ Run artifacts found${c_reset}"
+        python3 -c "
+import json, pathlib
+state = json.loads(pathlib.Path('$WORKSPACE/autoresearch-results/state.json').read_text())
+cfg = state.get('config',{})
+s = state.get('state',{})
+print(f\"  goal:    {cfg.get('goal','?')}\")
+print(f\"  mode:    {cfg.get('session_mode','?')}\")
+print(f\"  metric:  {cfg.get('metric','?')} ({cfg.get('direction','?')})\")
+print(f\"  iter:    {s.get('iteration',0)}  keep={s.get('keep_count',0)}  discard={s.get('discard_count',0)}\")
+print(f\"  best:    {s.get('best_metric','?')}  current: {s.get('current_metric','?')}\")
+"
+    else
+        echo -e "${c_yellow}No active run in $WORKSPACE${c_reset}"
+    fi
+
+    # Check background runtime
+    if [ -f "$WORKSPACE/autoresearch-results/runtime.json" ]; then
+        python3 "$SCRIPTS/autoresearch_runtime_ctl.py" status --repo "$REPO" 2>/dev/null || true
+    fi
+}
+
+cmd_stop() {
+    banner
+    python3 "$SCRIPTS/autoresearch_runtime_ctl.py" stop --repo "$REPO" 2>/dev/null || {
+        echo -e "${c_yellow}No background run to stop${c_reset}"
+    }
+}
+
+cmd_resume() {
+    banner
+    echo -e "${c_bold}Resuming run...${c_reset}"
+    codex --model tinyctx-auto \
+        --dangerously-bypass-approvals-and-sandbox \
+        "$SKILL_ROOT/SKILL.md" \
+        "Resume the autoresearch run in $WORKSPACE. Check state.json and results.tsv, then continue the loop."
+}
+
+cmd_history() {
+    if [ -f "$WORKSPACE/autoresearch-results/results.tsv" ]; then
+        head -3 "$WORKSPACE/autoresearch-results/results.tsv"
+        echo "..."
+        tail -10 "$WORKSPACE/autoresearch-results/results.tsv"
+    else
+        echo "No results.tsv found — no run has been started yet."
+    fi
+}
+
+# ── main ────────────────────────────────────────────────────────────
+check_proxy
+
+case "${1:-}" in
+    loop)   shift; cmd_loop "$*" ;;
+    bg)     shift; cmd_bg "$*" ;;
+    fix)    shift; cmd_fix "$*" ;;
+    status) cmd_status ;;
+    stop)   cmd_stop ;;
+    resume) cmd_resume ;;
+    history|log) cmd_history ;;
+    *)
+        echo "Usage: ar {loop|bg|fix} <goal>  |  ar {status|stop|resume|history}"
+        echo ""
+        echo "Examples:"
+        echo "  ar loop \"improve test coverage above 80%\""
+        echo "  ar bg   \"reduce lint warnings to zero\""
+        echo "  ar fix  \"fix all type errors in src/\""
+        echo "  ar status"
+        exit 1
+        ;;
+esac
