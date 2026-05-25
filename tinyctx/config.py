@@ -1217,7 +1217,7 @@ def load_config() -> Config:
         cfg.log_dir = Path(log_override).expanduser()
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 2 — file
+    # Step 2 — file (config.toml)
     path = Path(_env("TINYCTX_CONFIG", str(Path.home() / ".tinyctx" / "config.toml")) or "")
     if path.is_file() and tomllib is not None:
         data: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -1243,6 +1243,25 @@ def load_config() -> Config:
             attr = orch_map.get(k)
             if attr and hasattr(cfg, attr):
                 setattr(cfg, attr, v)
+
+    # Step 2.5 — optimized policy overlay (from policy_search)
+    # Loads ~/.tinyctx/policies/optimized.toml if it exists.  These values
+    # override config.toml defaults but are themselves overridden by env vars
+    # (step 3).  This is the "search offline, apply online" bridge.
+    _policy_path = Path.home() / ".tinyctx" / "policies" / "optimized.toml"
+    if _policy_path.is_file() and tomllib is not None:
+        try:
+            _policy_data: dict[str, Any] = tomllib.loads(_policy_path.read_text(encoding="utf-8"))
+            # Map policy_search field names → Config field names where they differ
+            _policy_field_map: dict[str, str] = {
+                "max_continue_injections": "max_continue_injections_per_session",
+            }
+            for k, v in _policy_data.items():
+                attr = _policy_field_map.get(k, k)
+                if hasattr(cfg, attr):
+                    setattr(cfg, attr, v)
+        except Exception:  # noqa: BLE001 — policy file must never block boot
+            pass
 
     # Step 3 — env overrides
     for env_key, attr in (
