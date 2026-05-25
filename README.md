@@ -209,11 +209,89 @@ tinyctx treats self-improvement as a measured release loop, not live recursive m
 
 - `workspace.py` creates the `.tinyctx/sessions/<id>/` filesystem contract and `context_profile.json` substrate.
 - `trajectory.py` stores replayable route/sanitize/compact/tool/error events from proxy logging, even when legacy verbose JSONL logging is off.
-- `eval_harness.py` runs deterministic replay suites and aggregates pass rate / score.
+- `eval_harness.py` runs deterministic replay suites and aggregates pass rate / score with **march-of-9s** normalization (AIRA-style: φ(s) = -log₁₀(|s - s_opt| + ε)).
 - `frontier.py` archives scored policy candidates with lineage, metrics, artifacts, and weighted best-candidate selection.
 - `guardrail_registry.py` provides a plugin-style staged guardrail runner for candidate checks.
 - `self_improvement.py` ties the loop together: evaluate a candidate, record start/end trajectory events, archive metrics, and report whether it is the current weighted winner.
 - `/dashboard/self-improvement` exposes the context profile, known sessions, trajectory summary, candidate frontier, and best candidate in both JSON and the live dashboard panel.
+
+**Production wiring** (post v0.8.0): `self_improvement` is now a live **performance regression watchdog** inside the proxy pipeline:
+
+- `PostStreamAnalyzer._maybe_run_self_improvement()` records per-request metrics (route, status, latency, bytes) to a session_state ring buffer after every stream completes.
+- Every N requests (default 50, configurable via `self_improvement_eval_interval`), it aggregates the recent window, builds a Candidate, and runs `evaluate_candidate()` against historical baselines.
+- If error rate exceeds 2× baseline or latency exceeds 1.5× baseline, a degradation flag is set. `SelfImprovementGuard` (priority 60, runs last in the pre-flight guard pipeline) consumes it and forces the next request to frontier.
+- Disabled by default (`self_improvement_enabled = false`). Enable with `self_improvement_enabled = true` in `[routing]` or `TINYCTX_SELF_IMPROVEMENT_ENABLED=1`.
+
+## AI-driven policy discovery (AIRA-style agentic search)
+
+tinyctx ships a full **offline policy search engine** inspired by Meta FAIR's AIRA paper ([arxiv 2605.15871](https://arxiv.org/abs/2605.15871)) — "Agentic Discovery of Neural Architectures." The core insight: the same draft → evaluate → improve → archive loop that AIRA uses to discover better neural architectures can discover better **proxy routing policies**.
+
+### Two-layer benchmark framework
+
+| Layer | What it tests | Speed | Requires proxy? |
+|-------|--------------|-------|-----------------|
+| **Simulation** (9 tasks) | Routing decisions, cost/safety trade-offs, boundary behavior, error recovery, tool repair, compaction | instant | No |
+| **Codex-level** (3 tasks) | Real agent loop execution — game development, CLI app building, research report writing | ~30-60s/task | Yes |
+
+### Simulation benchmarks (`tests/benchmarks/`)
+
+Each benchmark task is a self-contained directory (AIRS-Bench style):
+```
+routing_basic/          cost_sensitivity/       boundary_behavior/
+├── task.md             ├── task.md              ├── task.md
+├── metadata.yaml       ├── metadata.yaml        ├── metadata.yaml
+└── evaluate.py         └── evaluate.py          └── evaluate.py
+```
+
+`evaluate.py` simulates routing decisions for pre-recorded request scenarios and computes a composite score. Different policies produce meaningfully different scores:
+
+```
+conservative (rarely escalates):  score=0.429  ns=0.024  — misses edge cases
+baseline (default):              score=0.891  ns=0.096  — balanced
+aggressive (escalates early):    score=0.750  ns=0.060  — wastes frontier tokens
+```
+
+### Codex-level benchmarks
+
+Codex benchmarks run a **real agent loop** through the proxy — the model receives the task, makes tool calls (shell, read, write), and produces output files that `evaluate.py` inspects:
+
+```bash
+# Start proxy, then run codex benchmarks
+tinyctx-proxy &
+python -m tinyctx.policy_search codex --tasks tests/benchmarks/
+
+# Output:
+#   [OK] codex_game:   score=1.000  turns=2  tool_calls=2  elapsed=46.8s
+#   [OK] codex_report: score=1.000  turns=2  tool_calls=2  elapsed=44.8s
+```
+
+Three built-in codex tasks:
+- **codex_game** — "Create a Snake game in a single HTML file" (canvas, keyboard, score, collision detection)
+- **codex_app** — "Build a CLI to-do app in Python" (add/list/done, JSON persistence)
+- **codex_report** — "Research and write a report on context window management"
+
+### Policy search loop
+
+The search loop mirrors AIRA's draft → evaluate → improve → archive cycle:
+
+```bash
+# Simulation mode (milliseconds per evaluation)
+python -m tinyctx.policy_search search --tasks tests/benchmarks/ --budget 30
+
+# Codex mode (real agent execution, minutes per evaluation)
+python -m tinyctx.policy_search search --tasks tests/benchmarks/ --mode codex --budget 5
+```
+
+Policy candidates are parameterized variations of the routing/guard configuration. Each candidate is evaluated against the benchmark suite, archived to the frontier (JSONL), and the best candidate is improved via parameter perturbation. The final optimized policy is written to `~/.tinyctx/policies/optimized.toml` and **automatically loaded** by `load_config()` on next proxy start — closing the offline-search → online-apply loop.
+
+### Policy-aware agent behavior
+
+Different policies inject different instructions into the agent at runtime:
+
+- **Conservative** (high thresholds): "Work carefully. Verify each step. Plan before executing."
+- **Aggressive** (low thresholds): "Work quickly. If a tool fails once, try an alternative immediately."
+
+Live benchmark results confirm policy differentiation — the aggressive policy improved `codex_report` from 0.000 to 1.000.
 
 ## Compression-biased context ranking
 
@@ -230,14 +308,14 @@ graphify .
 ## Modules
 
 ```
-tinyctx/                          ~10K LOC, 66 modules
+tinyctx/                          ~13K LOC, 71 modules
   proxy.py                  FastAPI server + routing pipeline
   router.py                 Routing decision (heuristic + optional classifier)
   sanitize.py               13 transforms (above table)
   guards.py                 Pre-flight guards + protocol-neutral guardrail decisions
   read_delta.py             Repeat-Read collapse to unified diff
   lingua.py                 LLMLingua-2 pre-escalation compression hook
-  config.py                 Layered config: defaults < TOML file < TINYCTX_* env
+  config.py                 Layered config: defaults < TOML file < policy overlay < TINYCTX_* env
   compactor.py              3-role debate + judge merge → markdown summary + facts/compartments
   continuity.py             Persist compactions; --facts-only / --compartment recall
   historian.py              Rolling per-session digest (async update + opt-in substitute)
@@ -254,10 +332,14 @@ tinyctx/                          ~10K LOC, 66 modules
   trace.py                  RequestTrace dataclass + CLI viewer (compact / verbose / watch)
   workspace.py              .tinyctx session workspace + context_profile.json contract
   trajectory.py             Append-only replayable route/sanitize/compact/tool event ledger
-  eval_harness.py           Deterministic replay suite runner + aggregate metrics
+  eval_harness.py           Deterministic replay + march-of-9s normalized scoring
   frontier.py               Versioned candidate archive + weighted best-policy selection
   guardrail_registry.py     Plugin-style staged guardrail runner for candidate checks
   self_improvement.py       Governed eval -> trajectory -> frontier candidate loop
+  benchmark.py              AIRS-Bench-style task loader + runner + aggregate scoring
+  policy_search.py          AIRA-style offline policy search: draft→evaluate→improve→archive
+  codex_runner.py           Lightweight agent loop: SSE parsing, tool execution, workspace isolation
+  codex_benchmark.py        Codex-level benchmark tasks: real agent execution + output evaluation
   advisor.py                Anthropic Advisor Strategy MCP server (built-in)
   tool_call_translator.py   XML→struct + chat→responses SSE + 3-layer auto-answer for request_user_input
   _codex_toml.py            Shared helper: idempotent ~/.codex/config.toml MCP block injection
@@ -277,7 +359,8 @@ scripts/
 
 .codex-plugin/              Codex marketplace plugin manifest (plugin.json + hooks)
 
-tests/                      28 test files, 368 tests, no network required
+tests/                      31 test files, 57 benchmark/policy tests (425 total), no network required
+tests/benchmarks/           12 benchmark tasks (9 simulation + 3 codex-level)
 ```
 
 CLIs:
@@ -314,6 +397,13 @@ tinyctx-lingua    status / test / warmup            # LLMLingua-2 hook diagnosti
 python -m tinyctx.classifier train <labeled.jsonl>  # train escalation scorer (optional)
 python -m tinyctx.classifier predict est_tokens=80000 turn_count=20
 python -m tinyctx.graphify_adapter <graphify.json>  # convert a graphify export
+
+# Policy search & benchmarks
+python -m tinyctx.policy_search benchmark --tasks tests/benchmarks/          # run simulation benchmarks
+python -m tinyctx.policy_search search --tasks tests/benchmarks/ --budget 30 # sim policy search
+python -m tinyctx.policy_search codex --tasks tests/benchmarks/              # run codex benchmarks (needs proxy)
+python -m tinyctx.policy_search search --tasks tests/benchmarks/ --mode codex --budget 5  # codex policy search
+python -m tinyctx.policy_search export [candidate_id]                        # export best policy
 ```
 
 ## Multi-subagent compaction (and what happens when a session runs out)
@@ -475,6 +565,8 @@ While debugging the advisor path on codex 0.128, three independent codex 0.128 �
 - **`expand_mcp_namespaces`** (`tinyctx/sanitize.py`) — codex 0.128 wraps MCP tools in `type: "namespace"` shells. The proxy now expands them into top-level `type=function` entries (names like `mcp__advisor__ask_advisor`).
 - **`_flatten_tool_output`** — codex 0.128 returns rich tool outputs with `input_image` items mixed in (base64 PNGs from screenshots). DeepSeek's chat-completions API rejects these with HTTP 400. We now flatten to text + `[image attached]` placeholders.
 - **`reasoning_content` stub** — codex 0.128's `type=reasoning` items ship empty (real thinking text is server-only). DeepSeek's thinking-mode endpoint then 400s on the next turn unless every assistant message carries some `reasoning_content`. The proxy stubs an empty string so DeepSeek's strict check passes.
+- **`response.reasoning_text.delta` streaming** — DeepSeek's extended reasoning phase emits `reasoning_content` deltas for 3-5+ minutes before producing any content tokens. The proxy previously buffered all reasoning silently (only the final summary reached codex), which caused codex's client-side idle timer (`stream_idle_timeout_ms`) to fire mid-think and interrupt the session. Now each reasoning delta is forwarded incrementally as `response.reasoning_text.delta` SSE events, keeping codex's parser alive through the entire thinking phase.
+- **Tool schema pass-through** — DeepSeek's chat-completions API supports native tool calling. The proxy now forwards tool definitions to DeepSeek (`strip_tools = false` in the default config) so the model makes structured `function_call` items instead of hallucinating XML tool calls as plain text.
 
 Each one was triggered live during a real session (700+ turns) and identified via wire-body capture, codex.app binary reverse engineering, and DeepSeek error message inspection.
 
@@ -520,12 +612,13 @@ NEVER touches `instructions`, `tools`, user messages, or assistant messages — 
 
 ## Status
 
-- **v0.7.0** — works end-to-end with fake backends and against real codex CLI 0.125.0 / Codex.app 0.128.0-alpha.1.
-- **368 tests across 28 test files, all passing**.
+- **v0.8.0** — works end-to-end with fake backends and against real codex CLI 0.125.0 / Codex.app 0.128.0-alpha.1.
+- **425+ tests across 31 test files, all passing** (includes 57 benchmark & policy search tests, 12 benchmark task suites).
+- AIRA-style policy discovery pipeline: simulation (9 tasks) + codex-level (3 tasks) → offline search → optimized.toml → auto-loaded by proxy.
 - Advisor Strategy verified live on Codex.app 0.128 via the agent route (PING/PONG round-trip, frontier hit confirmed in trace).
 - Production: 700+ turns/day, 95%+ local hit rate, sub-1% upstream errors.
 - 7 OSS upstream dependencies wired (gitnexus, graphify, serena, caveman, context-mode, mem0, LLMLingua); all auto-installed by `scripts/install.sh`.
-- Total original code: ~10,400 LOC across 28 modules.
+- Total original code: ~13,000 LOC across 34 modules (proxy core) + 37 integration/bootstrap modules.
 
 ## Troubleshooting: `hook: ... Failed` in codex output
 
