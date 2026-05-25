@@ -810,10 +810,12 @@ _DASHBOARD_HTML = """<!doctype html>
   .conn-off { background: #ef4444; }
   details { margin-top: 8px; }
   details summary { cursor: pointer; color: #6b7280; font-size: 11px; }
+  .nav-link { display: inline-block; margin-left: 16px; font-size: 13px; font-weight: 500; color: #6366f1; text-decoration: none; padding: 4px 12px; border: 1px solid #c7d2fe; border-radius: 6px; }
+  .nav-link:hover { background: #eef2ff; color: #4f46e5; }
 </style>
 </head>
 <body>
-  <h1>tinyctx dashboard <span id="conn-indicator"><span class="conn conn-off"></span><span id="conn-text">connecting…</span></span></h1>
+  <h1>tinyctx dashboard <a href="/dashboard/config" class="nav-link">Config</a> <span id="conn-indicator"><span class="conn conn-off"></span><span id="conn-text">connecting…</span></span></h1>
 
   <div class="grid">
     <div class="card full">
@@ -1151,11 +1153,13 @@ button { border:0; border-radius:999px; padding:9px 14px; background:var(--accen
 button.secondary { background:#1e293b; color:var(--text); border:1px solid var(--line); }
 pre { white-space:pre-wrap; overflow:auto; max-height:340px; background:#020617; border:1px solid var(--line); border-radius:12px; padding:12px; }
 .ok { color:var(--ok); } .bad { color:var(--bad); } .muted { color:var(--muted); }
+.nav-link { display:inline-block; margin-left:16px; font-size:13px; font-weight:500; color:#818cf8; text-decoration:none; padding:4px 12px; border:1px solid #6366f1; border-radius:6px; }
+.nav-link:hover { background:#1e1b4b; color:#a5b4fc; }
 </style>
 </head>
 <body>
 <main>
-  <h1>tinyctx Config Center</h1>
+  <h1>tinyctx Config Center <a href="/dashboard" class="nav-link">Dashboard</a></h1>
   <p>Visual editor for <code>~/.tinyctx/config.toml</code>. Presets get you close; validation and test calls catch the sharp edges.</p>
   <div class="grid">
     <section class="card">
