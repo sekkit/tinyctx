@@ -107,6 +107,86 @@ v0.8.0 — production use at 700+ turns/day, 95%+ local hit rate, sub-1% upstrea
 
 MIT license. ~13K LOC original code across 71 modules. 7 upstream OSS integrations auto-wired.
 
+## Feature catalog
+
+### Safety & recovery guards
+
+Five independent watchdogs catch and auto-resolve session failure modes observed in production.
+
+| Guard | Trigger | Action |
+|-------|---------|--------|
+| `empty_response_guard` | Upstream returns <5 completion tokens (normal `stop`) | Force next turn to frontier — one-shot retry |
+| `stall_watchdog` | No SSE event from upstream for 180s | Declare stall, escalate, notify caller |
+| `stuck_loop` | Turn count exceeds 80 on same sub-problem | Inject `<system-reminder>` at recency position pushing advisor consult or user surface |
+| `exec_resume` | `soft_completion` classifier returns high-confidence PUNT | Fire `codex exec resume <sid> "<prompt>"` in side process — no user wake-up needed |
+| `choice_arbiter` | Agent asks "A or B?" instead of proceeding | Judge (local) extracts options → advisor (frontier) picks → inject synthetic user reply next turn |
+
+### Context engineering pipeline
+
+Six stages run on every request, each cache-aware and prompt-cache-preserving.
+
+| Stage | Module | What it does |
+|-------|--------|---------------|
+| Snapshot | `snapshot.py` | Inject directory-tree overview in ~30ms — structural context from turn 0 |
+| ctx-pack | `ctx_pack.py` | Pre-inject top-K files ranked by compression PageRank → one request replaces N `Read` tool calls |
+| Platform rules | `platform_rules.py` | Inject OS-specific shell/path guidance (Darwin / Linux / Windows) |
+| Agent rules | `agent_rules.py` | Inject bundled AGENTS.md into every request — rules ship with the proxy, no user config needed |
+| Historian | `historian.py` | Collapse repeat reads to unified diffs; dedup tool results |
+| Compactor | `compactor.py` | Replace codex single-pass summary with 3-role debate + 1-judge merge |
+
+### Project intelligence
+
+| Tool | What it does |
+|------|---------------|
+| `interest.py` | Compression-biased PageRank — ranks files by reductive (T₀) + deductive (I₀) compression score |
+| `scout.py` | Sub-agent local-model scan of top-K load-bearing symbols → byte-stable summary for AGENTS.md preamble |
+| `keypin.py` | Scan rollout JSONL for actual Read-tool frequency → `keyfiles.md` ranked by real usage |
+| `continuity.py` | Cross-session compaction recall — `tinyctx-recall` surfaces prior session summaries |
+
+### Multimodal cost optimization
+
+| Module | What it does |
+|--------|---------------|
+| `multimodal_preprocess` | Replace image attachments with text captions via `mm cat -m accurate` — image-bearing turns stay on cheap local model |
+| `mm_bootstrap` | Auto-install vlm-run/mm CLI for image→text captioning |
+
+### Reliability engineering
+
+| Module | What it does |
+|--------|---------------|
+| `forensics.py` | Full request/response/timing capture for failed turns — 100 dumps max, 10MB each, 7-day retention |
+| `escalation.py` | Graduated ladder: REFINE → PIVOT → SEARCH → BLOCKER instead of binary fail→frontier |
+| `frontier_health.py` | Frontier reachability tracking with exponential backoff cooldown — auto-recovers when healthy |
+
+### Agent infrastructure
+
+| Module | What it does |
+|--------|---------------|
+| `session_state` | Unified per-conversation state container — typed API, compaction-reset hooks, no per-module ad-hoc dicts |
+| `conv_id` | Stable conversation fingerprint — works around `prompt_cache_key` drift across mid-session identity shifts |
+| `plan_persistence` | Persist codex plans to disk keyed by cwd → new sessions pick up where prior ones left off |
+| `skill_catalog` + `dynamic_skill` | Task-type → skill routing catalog + LLM-generated dynamic skills |
+| `orchestration_injector` + `orchestration_runtime` | Task plan injection into instructions + runtime tracking |
+
+### Self-improvement & policy search
+
+| Module | What it does |
+|--------|---------------|
+| `eval_harness` | March-of-9s normalized scoring: φ(s) = -log₁₀(\|s − s_opt\| + ε) |
+| `self_improvement` | Governed candidate evaluation loop — run benchmark, archive winner, repeat |
+| AIRA policy overlay | Policy candidates auto-discovered, scored, archived; winning policy auto-loaded on proxy start |
+
+### Extended CLI surface
+
+```
+tinyctx-keypin scan [--top-n 20] [--days 30]   # most-read files from rollout
+tinyctx-scout init [--top-k 40]                 # ranked symbol summary
+tinyctx-recall                                  # cross-session compaction recall
+tinyctx-mem query <text>                        # mem0 memory search
+tinyctx-interest [--top-k 30]                   # compression PageRank
+python -m tinyctx.mm_bootstrap install|status   # mm CLI management
+```
+
 ## Technical foundations
 
 Four independent streams of research inform tinyctx's design.
