@@ -19,21 +19,11 @@ codex --profile tinyctx   # uses the proxy as model_provider
 
 ## Architecture
 
-```
-codex CLI
-  │  Responses API
-  ▼
-tinyctx-proxy (FastAPI, :4141)
-  │
-  ├─ route 95% → DeepSeek-V4-Flash (api.deepseek.com/v1)
-  │
-  └─ escalate 5% → GPT-5.5 (chatgpt.com/backend-api/codex)
-       ↑ triggered by: image detected, error streak ≥2,
-          self-classify p≥0.7, or guard pipeline force
+![tinyctx architecture](docs/assets/architecture.png)
 
-In parallel, codex talks directly to auto-installed MCP servers:
-  gitnexus · graphify · serena · caveman-shrink · context-mode · advisor
-```
+**Request lifecycle:** pre-flight pipeline (snapshot → ctx-pack → rules → historian) → router decision (95% local, 5% frontier) → SSE relay with tool translation → post-stream safety guards (stall, empty response, stuck loop, choice arbiter) → compaction intercept (3-role debate, never hits frontier).
+
+Codex talks directly to auto-installed MCP servers in parallel: gitnexus · graphify · serena · caveman-shrink · context-mode.
 
 ## Quick start
 
