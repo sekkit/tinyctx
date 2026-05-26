@@ -115,8 +115,8 @@ class State:
 
 
 def _which(cmd: str) -> str:
-    found = shutil.which(cmd)
-    return found or ""
+    from .mcp_registry import _which_with_fallbacks as _wf
+    return _wf(cmd) or ""
 
 
 def _node_major(version_str: str) -> int:

@@ -94,7 +94,8 @@ def _log(msg: str) -> None:
 
 
 def _which(cmd: str) -> str:
-    return shutil.which(cmd) or ""
+    from .mcp_registry import _which_with_fallbacks as _wf
+    return _wf(cmd) or ""
 
 
 def _find_serena() -> str:

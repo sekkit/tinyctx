@@ -377,6 +377,16 @@ def state_snapshot() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         out["tool_metrics"] = {"error": str(e)}
     try:
+        from . import frontier_health as _fh
+        out["frontier_health"] = _fh.snapshot()
+    except Exception as e:  # noqa: BLE001
+        out["frontier_health"] = {"error": str(e)}
+    try:
+        from . import token_tracker as _tt
+        out["token_tracker"] = _tt.snapshot()
+    except Exception as e:  # noqa: BLE001
+        out["token_tracker"] = {"error": str(e)}
+    try:
         out["integrations"] = _integration_snapshot()
     except Exception as e:  # noqa: BLE001
         out["integrations"] = {"error": str(e)}
@@ -478,10 +488,8 @@ def _integration_snapshot() -> dict[str, Any]:
 
     graphify_project_agents = _gfb.AGENTS_MARKER in project_agents_text
     graphify_project_hook = "graphify" in project_hooks_text
-    caveman_wrapping_gitnexus = (
-        "caveman-shrink" in codex_text and "gitnexus.CMD" in codex_text
-    )
-    context_mode_cmd = shutil.which("context-mode") or ""
+    from .mcp_registry import _which_with_fallbacks
+    context_mode_cmd = _which_with_fallbacks("context-mode") or ""
     context_mode_registered = "[mcp_servers.context-mode]" in codex_text
 
     return {
@@ -553,14 +561,11 @@ def _integration_snapshot() -> dict[str, Any]:
         ),
         "caveman": _entry(
             label="caveman-shrink",
-            installed=caveman.vendor_present and caveman.entry_present,
-            registered=caveman_wrapping_gitnexus,
-            ready=(caveman.vendor_present
-                   and caveman.entry_present
-                   and caveman_wrapping_gitnexus),
+            installed=caveman.caveman_shrink_present,
+            registered=caveman.caveman_shrink_present,
+            ready=caveman.caveman_shrink_present,
             details={
-                "entry": caveman.entry_path,
-                "wrapping_gitnexus": caveman_wrapping_gitnexus,
+                "command": caveman.caveman_shrink_path or "missing",
             },
         ),
     }
@@ -817,11 +822,14 @@ _DASHBOARD_HTML = """<!doctype html>
 <body>
   <h1>tinyctx dashboard <a href="/dashboard/config" class="nav-link">Config</a> <span id="conn-indicator"><span class="conn conn-off"></span><span id="conn-text">connecting…</span></span></h1>
 
+  <div id="project-tabs" style="margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap;">
+    <span class="project-tab active" data-hash="" style="background:#334155;color:#e2e8f0;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px;">all projects</span>
+  </div>
+
   <div class="grid">
     <div class="card full">
       <h2>aggregates · last 15 min</h2>
       <div class="stat-row" id="agg-stats">…</div>
-      <details><summary>raw aggregate JSON</summary><pre id="agg-raw">…</pre></details>
     </div>
 
     <div class="card">
@@ -830,21 +838,34 @@ _DASHBOARD_HTML = """<!doctype html>
     </div>
 
     <div class="card">
+      <h2>token stats</h2>
+      <div class="stat-row" id="token-stats">…</div>
+
       <h2>per-session state</h2>
       <table id="state-table">
         <thead><tr><th>session</th><th>request phase</th><th class="num">last reminder turn</th><th class="num">advisor age</th><th>soft-punt flag</th><th class="num">err streak</th></tr></thead>
         <tbody></tbody>
       </table>
-      <details><summary>raw state JSON</summary><pre id="state-raw">…</pre></details>
     </div>
 
     <div class="card full">
       <h2>integrations</h2>
+      <div id="install-bar" style="margin-bottom:8px;display:none;">
+        <button id="install-all-btn" class="btn" style="background:#334155;color:#e2e8f0;border:1px solid #475569;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px;">install all missing</button>
+        <span id="install-status" style="margin-left:8px;font-size:13px;color:#94a3b8;"></span>
+      </div>
       <table id="integration-table">
         <thead><tr><th>integration</th><th>status</th><th>installed</th><th>registered</th><th>details</th></tr></thead>
         <tbody></tbody>
       </table>
-      <details><summary>raw integration JSON</summary><pre id="integrations-raw">…</pre></details>
+    </div>
+
+    <div class="card">
+      <h2>mcp tool calls</h2>
+      <table id="tool-metrics-table">
+        <thead><tr><th>namespace</th><th class="num">calls</th></tr></thead>
+        <tbody><tr><td colspan="2">…</td></tr></tbody>
+      </table>
     </div>
 
     <div class="card full">
@@ -854,12 +875,11 @@ _DASHBOARD_HTML = """<!doctype html>
         <thead><tr><th>candidate</th><th>kind</th><th class="num">score</th><th class="num">pass rate</th><th>status</th></tr></thead>
         <tbody></tbody>
       </table>
-      <details><summary>raw self-improvement JSON</summary><pre id="self-improvement-raw">…</pre></details>
     </div>
   </div>
 
   <div class="footer">
-    proxy uptime <span id="uptime">…</span> · pid <span id="pid">…</span> · self_classify cache <span id="cache">…</span> entries · refresh state every 3s
+    proxy uptime <span id="uptime">…</span> · pid <span id="pid">…</span> · frontier <span id="frontier-status">…</span> · self_classify cache <span id="cache">…</span> entries · refresh state every 3s
   </div>
 
 <script>
@@ -1002,8 +1022,39 @@ _DASHBOARD_HTML = """<!doctype html>
     fetch("/dashboard/state", FETCH_OPTS).then(r => r.json()).then(s => {
       document.getElementById("uptime").textContent = formatUptime(s.uptime_s);
       document.getElementById("pid").textContent = s.proxy_pid;
+      const fh = s.frontier_health || {};
+      const fhEl = document.getElementById("frontier-status");
+      if (fh.unreachable) {
+        fhEl.innerHTML = `<span style="color:#f87171">unreachable (${fh.consecutive_failures}x, cd ${fh.cooldown_remaining_s}s)</span>`;
+      } else {
+        fhEl.innerHTML = `<span style="color:#4ade80">reachable</span>`;
+      }
       document.getElementById("cache").textContent = s.self_classify_cache_entries ?? "?";
-      document.getElementById("state-raw").textContent = JSON.stringify(s, null, 2);
+      // Token stats
+      const tt = s.token_tracker || {};
+      document.getElementById("token-stats").innerHTML = tokenStatsHTML(tt);
+
+      // If a project is selected, overlay with project-specific data
+      if (ACTIVE_PROJECT) {
+        fetch("/dashboard/projects/" + ACTIVE_PROJECT, FETCH_OPTS).then(r => r.json()).then(p => {
+          if (p && p.token) {
+            var fwd = p.token.forwarded_tokens || 0;
+            var est = p.token.est_input_tokens || 0;
+            var delta = est - fwd;
+            document.getElementById("token-stats").innerHTML = tokenStatsHTML({
+              requests: p.token.requests,
+              est_input_tokens: est,
+              injection_tokens: 0,
+              forwarded_tokens: fwd,
+              delta: delta,
+              advisor: {
+                requests: p.token.advisor_requests,
+                est_input_tokens: p.token.advisor_tokens,
+              },
+            });
+          }
+        }).catch(() => {});
+      }
 
       const tbody = document.querySelector("#state-table tbody");
       tbody.innerHTML = "";
@@ -1036,7 +1087,6 @@ _DASHBOARD_HTML = """<!doctype html>
       const itBody = document.querySelector("#integration-table tbody");
       itBody.innerHTML = "";
       const integrations = s.integrations || {};
-      document.getElementById("integrations-raw").textContent = JSON.stringify(integrations, null, 2);
       Object.entries(integrations).forEach(([key, info]) => {
         const tr = document.createElement("tr");
         const ready = !!info.ready;
@@ -1053,8 +1103,48 @@ _DASHBOARD_HTML = """<!doctype html>
         tr.innerHTML = `<td>${escapeHTML(info.label || key)}</td><td>${badge}</td><td>${installed ? "yes" : "no"}</td><td>${registered ? "yes" : "no"}</td><td>${escapeHTML(details || "—")}</td>`;
         itBody.appendChild(tr);
       });
+
+      // Show/hide install button based on whether anything is partial/missing
+      const hasMissing = Object.values(integrations).some(info => !info.ready);
+      document.getElementById("install-bar").style.display = hasMissing ? "" : "none";
     }).catch(() => {});
   }
+
+  function installAllMissing() {
+    const btn = document.getElementById("install-all-btn");
+    const status = document.getElementById("install-status");
+    btn.disabled = true;
+    btn.textContent = "installing...";
+    status.textContent = "";
+    fetch("/dashboard/integrations/install", { method: "POST", cache: "no-store" })
+      .then(r => r.json())
+      .then(results => {
+        const failed = Object.entries(results).filter(([, v]) => v.error);
+        const ok = Object.entries(results).filter(([, v]) => v.installed);
+        if (failed.length) {
+          status.textContent = failed.map(([k, v]) => `${k}: ${v.error}`).join("; ");
+          status.style.color = "#f87171";
+        } else if (ok.length) {
+          status.textContent = `installed: ${ok.map(([k]) => k).join(", ")}`;
+          status.style.color = "#4ade80";
+        } else {
+          status.textContent = "all components already installed";
+          status.style.color = "#94a3b8";
+        }
+        btn.disabled = false;
+        btn.textContent = "install all missing";
+        // Trigger immediate state refresh so table updates
+        setTimeout(pollState, 500);
+      })
+      .catch(err => {
+        status.textContent = "install request failed: " + err;
+        status.style.color = "#f87171";
+        btn.disabled = false;
+        btn.textContent = "install all missing";
+      });
+  }
+
+  document.getElementById("install-all-btn").addEventListener("click", installAllMissing);
 
   function pollAgg() {
     fetch("/dashboard/aggregates?since_s=900", FETCH_OPTS).then(r => r.json()).then(a => {
@@ -1076,7 +1166,6 @@ _DASHBOARD_HTML = """<!doctype html>
         ["turns/min",    a.turns_per_min],
       ].map(([k, v]) => `<div class="stat"><div class="stat-label">${k}</div><div class="stat-value">${escapeHTML(String(v))}</div></div>`).join("");
       document.getElementById("agg-stats").innerHTML = html;
-      document.getElementById("agg-raw").textContent = JSON.stringify(a, null, 2);
     }).catch(() => {});
   }
 
@@ -1086,7 +1175,6 @@ _DASHBOARD_HTML = """<!doctype html>
       if (!session) return base;
       return fetch(`/dashboard/self-improvement?session=${encodeURIComponent(session)}`, FETCH_OPTS).then(r => r.json());
     }).then(s => {
-      document.getElementById("self-improvement-raw").textContent = JSON.stringify(s, null, 2);
       const summary = s.trajectory?.summary || {};
       const bestId = s.frontier?.best?.candidate_id || "";
       const stats = [
@@ -1116,10 +1204,87 @@ _DASHBOARD_HTML = """<!doctype html>
     return `${(s / 3600).toFixed(1)}h`;
   }
 
-  pollState(); pollAgg(); pollSelfImprovement();
+  function pollToolMetrics() {
+    fetch("/dashboard/tool-metrics", FETCH_OPTS).then(r => r.json()).then(tm => {
+      const tbody = document.querySelector("#tool-metrics-table tbody");
+      tbody.innerHTML = "";
+      const namespaces = Object.entries(tm.by_namespace || {})
+        .sort((a, b) => b[1] - a[1]);
+      if (!namespaces.length) {
+        tbody.innerHTML = "<tr><td colspan='2'>no calls yet</td></tr>";
+        return;
+      }
+      const total = namespaces.reduce((s, [, n]) => s + n, 0);
+      namespaces.forEach(([ns, count]) => {
+        const pct = total > 0 ? (count / total * 100).toFixed(0) : 0;
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${escapeHTML(ns)}</td><td class="num">${count} <span style="color:#64748b;font-size:11px;">(${pct}%)</span></td>`;
+        tbody.appendChild(tr);
+      });
+    }).catch(() => {});
+  }
+
+  let ACTIVE_PROJECT = "";  // empty = all projects
+
+  function pollProjects() {
+    fetch("/dashboard/projects", FETCH_OPTS).then(r => r.json()).then(projects => {
+      const tabs = document.getElementById("project-tabs");
+      if (!Array.isArray(projects) || projects.length <= 1) {
+        tabs.innerHTML = '<span style="color:#64748b;font-size:13px;">no projects yet</span>';
+        return;
+      }
+      tabs.innerHTML = "";
+      // "all projects" tab
+      const allTab = document.createElement("span");
+      allTab.className = "project-tab" + (ACTIVE_PROJECT === "" ? " active" : "");
+      allTab.dataset.hash = "";
+      allTab.textContent = "all projects";
+      allTab.style.cssText = "background:#334155;color:#e2e8f0;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px;";
+      if (ACTIVE_PROJECT === "") allTab.style.background = "#475569";
+      allTab.onclick = function() { selectProject(""); };
+      tabs.appendChild(allTab);
+      // project tabs
+      projects.forEach(p => {
+        const tab = document.createElement("span");
+        tab.className = "project-tab" + (ACTIVE_PROJECT === p.cwd_hash ? " active" : "");
+        tab.dataset.hash = p.cwd_hash;
+        const name = p.display_name || p.cwd_hash.slice(0, 8);
+        const reqs = p.token ? p.token.requests : 0;
+        tab.textContent = name + " (" + reqs + ")";
+        tab.style.cssText = "background:#334155;color:#e2e8f0;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px;";
+        if (ACTIVE_PROJECT === p.cwd_hash) tab.style.background = "#475569";
+        tab.onclick = function() { selectProject(p.cwd_hash); };
+        tabs.appendChild(tab);
+      });
+    }).catch(() => {});
+  }
+
+  function selectProject(hash) {
+    ACTIVE_PROJECT = hash;
+    pollProjects();
+    pollState();
+  }
+
+  function tokenStatsHTML(tt) {
+    if (!tt) return "…";
+    var delta = tt.delta ?? 0;
+    var deltaStr = (delta >= 0 ? "+" : "") + kb(Math.abs(delta)) + " tok";
+    return [
+      ["requests", tt.requests ?? 0],
+      ["input (codex)", kb(tt.est_input_tokens) + " tok"],
+      ["+ injections", kb(tt.injection_tokens) + " tok"],
+      ["forwarded (LLM)", kb(tt.forwarded_tokens) + " tok"],
+      ["net delta", deltaStr],
+      ["advisor", tt.advisor ? (tt.advisor.requests + " calls / " + kb(tt.advisor.est_input_tokens) + " tok") : "—"],
+    ].map(function(p) { return '<div class="stat"><div class="stat-label">' + p[0] + '</div><div class="stat-value">' + String(p[1]) + '</div></div>'; }).join("");
+  }
+
+  pollState(); pollAgg(); pollSelfImprovement(); pollToolMetrics(); pollProjects();
   setInterval(pollState, 3000);
   setInterval(pollAgg, 5000);
   setInterval(pollSelfImprovement, 7000);
+  setInterval(pollToolMetrics, 5000);
+  setInterval(pollProjects, 15000);
 })();
 </script>
 </body>
@@ -1572,6 +1737,45 @@ def register(app: Any, log_dir: Path) -> None:
     @app.get("/dashboard/integrations")
     def _dashboard_integrations() -> JSONResponse:
         return JSONResponse(_integration_snapshot(), headers=_NO_STORE_HEADERS)
+
+    @app.post("/dashboard/integrations/install")
+    def _dashboard_integrations_install() -> JSONResponse:
+        """Run unified installer for all missing components."""
+        try:
+            from . import installer
+            results = installer.install_all_missing()
+            return JSONResponse(results)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/dashboard/projects")
+    def _dashboard_projects() -> JSONResponse:
+        """List all known projects with their persisted stats."""
+        try:
+            from . import project_store as _ps
+            projects = _ps.list_all()
+            # Add display-friendly names (last path component)
+            for p in projects:
+                cwd = p.get("cwd", "")
+                p["display_name"] = Path(cwd).name or cwd or "unknown"
+                p["short_hash"] = p.get("cwd_hash", "")[:8]
+            return JSONResponse(projects)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/dashboard/projects/{cwd_hash}")
+    def _dashboard_project_detail(cwd_hash: str) -> JSONResponse:
+        """Get a single project's persisted stats."""
+        try:
+            from . import project_store as _ps
+            data = _ps.get_project(cwd_hash)
+            if data is None:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            data["display_name"] = Path(data.get("cwd", "")).name or "unknown"
+            data["short_hash"] = data.get("cwd_hash", "")[:8]
+            return JSONResponse(data)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     @app.get("/dashboard/plans")
     def _dashboard_plans() -> JSONResponse:

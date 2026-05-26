@@ -1,33 +1,29 @@
-"""Caveman (caveman-shrink MCP) auto-vendor bootstrap.
+"""Caveman (caveman-shrink MCP) auto-install bootstrap.
 
-Caveman (JuliusBrussee/caveman, MIT) ships a `caveman-shrink` stdio
-**middleware**: it wraps an upstream MCP server and compresses prose
-fields (tool descriptions, etc.) on the wire. It is NOT a standalone
-MCP server — running it without an upstream command crashes immediately
-with "missing upstream command" (verified live 2026-05-10).
+Caveman (JuliusBrussee/caveman, MIT) ships `caveman-shrink` as a standalone
+npm package — an MCP **middleware**: it wraps an upstream MCP server and
+compresses prose fields (tool descriptions, etc.) on the wire. It is NOT a
+standalone MCP server — running it without an upstream command crashes
+immediately with "missing upstream command" (verified live 2026-05-10).
 
-So this bootstrap does TWO of the three obvious things and skips the
-third:
-  1. ✓ git-clone caveman to ~/.tinyctx/vendor/caveman
-  2. ✓ npm install the caveman-shrink subdir so its deps are present
-  3. ✗ Auto-register a `[mcp_servers.caveman-shrink]` block —
-     deliberately omitted. There's no sensible default upstream to wrap;
-     wrapping requires per-project decision (e.g. wrap gitnexus, or
-     wrap a tools-heavy MCP that has bloated descriptions).
+Install: `npm i -g caveman-shrink` — the binary lands at the npm global
+bin dir (typically ~/.local/node/bin/caveman-shrink).
 
-To USE caveman-shrink after the vendor step, the user manually wraps
-a target MCP server in their codex config:
+Bootstrap does TWO things and deliberately skips the third:
+  1. npm i -g caveman-shrink (so the binary is on PATH)
+  2. idempotent re-run safe — skips if already installed
+  3. NO auto codex config block — caveman-shrink is middleware, cannot
+     run without an upstream server; the user composes their own wrapper
+
+To USE caveman-shrink after install, the user manually wraps a target
+MCP server in their codex config:
 
     [mcp_servers.gitnexus-shrunk]
     type = "stdio"
-    command = "/path/to/node"
-    args = [
-        "/Users/x/.tinyctx/vendor/caveman/mcp-servers/caveman-shrink/index.js",
-        "/path/to/gitnexus", "mcp",
-    ]
+    command = "caveman-shrink"
+    args = ["/path/to/gitnexus", "mcp"]
 
 Disable: TINYCTX_CAVEMAN_DISABLE=1
-Override clone target: TINYCTX_CAVEMAN_VENDOR=...
 """
 from __future__ import annotations
 
@@ -41,16 +37,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from ._codex_toml import append_mcp_block, has_mcp_block, strip_mcp_block
+from .mcp_registry import _which_with_fallbacks
 
 
-CAVEMAN_REPO = os.environ.get(
-    "TINYCTX_CAVEMAN_REPO",
-    "https://github.com/JuliusBrussee/caveman.git")
+CAVEMAN_SHRINK_PKG = os.environ.get(
+    "TINYCTX_CAVEMAN_SHRINK_PKG", "caveman-shrink")
+CAVEMAN_SHRINK_BIN = os.environ.get(
+    "TINYCTX_CAVEMAN_SHRINK_BIN", "caveman-shrink")
 
 TINYCTX_HOME = Path(os.environ.get("TINYCTX_HOME", str(Path.home() / ".tinyctx")))
-DEFAULT_VENDOR = Path(
-    os.environ.get("TINYCTX_CAVEMAN_VENDOR", str(TINYCTX_HOME / "vendor" / "caveman"))
-)
 LOG_FILE = TINYCTX_HOME / "logs" / "caveman-bootstrap.log"
 
 CODEX_CONFIG_DEFAULT = (
@@ -58,9 +53,6 @@ CODEX_CONFIG_DEFAULT = (
     if os.environ.get("TINYCTX_CODEX_CONFIG")
     else Path.home() / ".codex" / "config.toml"
 )
-
-# Caveman ships multiple MCP servers; this is the most useful one.
-SHRINK_REL_PATH = "mcp-servers/caveman-shrink/index.js"
 
 _CONFIG_MARKER = "[mcp_servers.caveman-shrink]"
 
@@ -82,110 +74,92 @@ def _log(msg: str) -> None:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}  {msg}\n")
     except OSError:
-        # Why: _log itself must never raise — bootstrap log is advisory.
         pass
 
 
-def _which(c: str) -> str:
-    return shutil.which(c) or ""
+def _which(cmd: str) -> str:
+    return _which_with_fallbacks(cmd) or ""
+
+
+def _find_caveman_shrink() -> str:
+    """Find caveman-shrink binary. Checks env override first, then PATH
+    (with fallback dirs for launchd/systemd PATH stripping)."""
+    forced = os.environ.get("TINYCTX_CAVEMAN_SHRINK_BIN")
+    if forced:
+        return forced
+    return _which(CAVEMAN_SHRINK_BIN)
+
+
+def _npm() -> str | None:
+    npm = os.environ.get("TINYCTX_NPM") or _which("npm")
+    return npm or None
+
+
+# ──────────────────────────── state ───────────────────────────────
 
 
 @dataclass
 class State:
     disabled: bool = False
-    vendor_dir: str = ""
-    vendor_present: bool = False
-    entry_path: str = ""
-    entry_present: bool = False
-    git_path: str = ""
+    caveman_shrink_path: str = ""
+    caveman_shrink_present: bool = False
     node_path: str = ""
+    npm_present: bool = False
     codex_config_has_caveman: bool = False
 
 
-def detect_state(*, vendor: Path = DEFAULT_VENDOR,
-                 codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
+def detect_state(*, codex_config: Path = CODEX_CONFIG_DEFAULT) -> State:
     s = State()
     s.disabled = os.environ.get("TINYCTX_CAVEMAN_DISABLE", "0") == "1"
-    s.vendor_dir = str(vendor)
-    s.vendor_present = vendor.is_dir() and (vendor / ".git").is_dir()
-    s.entry_path = str(vendor / SHRINK_REL_PATH)
-    s.entry_present = (vendor / SHRINK_REL_PATH).is_file()
-    s.git_path = _which("git")
     s.node_path = _which("node")
+    s.npm_present = bool(_npm())
+    cs = _find_caveman_shrink()
+    if cs:
+        s.caveman_shrink_path = cs
+        s.caveman_shrink_present = True
     s.codex_config_has_caveman = has_mcp_block(codex_config, _CONFIG_MARKER)
     return s
 
 
-def _run(cmd: list[str], *, timeout: int = 300, cwd: str | None = None
-         ) -> tuple[bool, str]:
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, cwd=cwd)
-    except subprocess.TimeoutExpired:
-        return False, f"timeout after {timeout}s"
-    except OSError as e:
-        return False, f"OSError: {e}"
-    if r.returncode != 0:
-        tail = (r.stderr or r.stdout or "")[-300:].strip()
-        return False, f"rc={r.returncode}: {tail}"
-    return True, "ok"
+# ─────────────────────────── install ──────────────────────────────
 
 
-def vendor(state: State, *, vendor_dir: Path = DEFAULT_VENDOR,
-           dry_run: bool = False) -> tuple[bool, str]:
-    if state.vendor_present:
-        # update with `git pull` to keep close to head; non-fatal if it fails.
-        if dry_run:
-            return True, f"DRY-RUN would `git -C {vendor_dir} pull`"
-        if not state.git_path:
-            return True, "vendor present (git not found, skip pull)"
-        ok, msg = _run([state.git_path, "-C", str(vendor_dir), "pull",
-                        "--ff-only", "--quiet"], timeout=60)
-        if not ok:
-            _log(f"git pull non-fatal: {msg}")
-        return True, "vendor up-to-date"
-    if not state.git_path:
-        return False, "git not on PATH"
-    if dry_run:
-        return True, (f"DRY-RUN: git clone --depth 1 "
-                      f"{CAVEMAN_REPO} {vendor_dir}")
-    vendor_dir.parent.mkdir(parents=True, exist_ok=True)
-    return _run([state.git_path, "clone", "--depth", "1", CAVEMAN_REPO,
-                 str(vendor_dir)], timeout=300)
-
-
-def npm_install_shrink(state: State, *, vendor_dir: Path = DEFAULT_VENDOR,
-                       dry_run: bool = False) -> tuple[bool, str]:
-    """Run `npm install` in mcp-servers/caveman-shrink/ so caveman-shrink's
-    runtime deps are present. Without this, spawning the server fails with
-    `Cannot find module ...`. Idempotent — npm itself short-circuits when
-    deps are already up to date.
-    """
-    npm = _which("npm")
+def install_via_npm(*, dry_run: bool = False) -> tuple[bool, str]:
+    """Run `npm i -g caveman-shrink@latest`. Returns (ok, message)."""
+    npm = _npm()
     if not npm:
-        return False, "npm not on PATH (caveman-shrink deps will be missing)"
-    shrink_dir = vendor_dir / "mcp-servers" / "caveman-shrink"
-    if not shrink_dir.is_dir():
-        return False, f"shrink subdir missing: {shrink_dir}"
+        return False, "npm not on PATH"
+    cmd = [npm, "install", "-g", f"{CAVEMAN_SHRINK_PKG}@latest"]
     if dry_run:
-        return True, f"DRY-RUN would `npm install` in {shrink_dir}"
-    return _run([npm, "install", "--silent", "--no-audit",
-                 "--no-fund", "--omit=dev"],
-                timeout=300, cwd=str(shrink_dir))
+        return True, "DRY-RUN: " + " ".join(cmd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "npm install timed out after 5min"
+    except OSError as e:
+        return False, f"npm install failed: {e}"
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "")[-500:]
+        return False, f"npm install rc={r.returncode}: {tail}"
+    return True, "npm install ok"
+
+
+# ─────────────────────── codex config ─────────────────────────────
 
 
 def patch_codex_config(state: State, *,
                        config_path: Path = CODEX_CONFIG_DEFAULT,
                        dry_run: bool = False) -> tuple[bool, str]:
-    if not state.entry_present:
-        return False, f"caveman entry missing: {state.entry_path}"
-    if not state.node_path:
-        return False, "node not on PATH"
+    if not state.caveman_shrink_present:
+        return False, f"caveman-shrink binary missing"
     block = _CONFIG_BLOCK_TEMPLATE.format(
-        marker=_CONFIG_MARKER, node=state.node_path,
-        entry=state.entry_path)
+        marker=_CONFIG_MARKER, node=state.node_path or "node",
+        entry=state.caveman_shrink_path)
     return append_mcp_block(config_path, _CONFIG_MARKER, block,
                              dry_run=dry_run)
+
+
+# ────────────────────────── bootstrap ─────────────────────────────
 
 
 @dataclass
@@ -197,48 +171,39 @@ class BootstrapReport:
     success: bool
 
 
-def bootstrap(*, do_vendor: bool = True, do_config: bool = False,
+def bootstrap(*, install: bool = True, do_config: bool = False,
               dry_run: bool = False,
-              vendor_dir: Path = DEFAULT_VENDOR,
               codex_config: Path = CODEX_CONFIG_DEFAULT
               ) -> BootstrapReport:
-    """Default: clone caveman + npm-install caveman-shrink deps. NO codex
-    config write — caveman-shrink is middleware that wraps another MCP
-    server, not a standalone server, so a default `[mcp_servers.caveman-shrink]`
-    block would just crash at startup. The user composes their own
-    wrapper entry; see module docstring for the example.
+    """Default: npm i -g caveman-shrink. NO codex config write — caveman-shrink
+    is middleware that wraps another MCP server, not a standalone server.
 
     Pass `do_config=True` only if you know what you're doing — it writes
-    a broken standalone block that codex cannot start.
+    a block that needs manual upstream configuration before codex can start it.
     """
     actions: list[str] = []
     skipped: list[str] = []
-    state = detect_state(vendor=vendor_dir, codex_config=codex_config)
+    state = detect_state(codex_config=codex_config)
     state_before = asdict(state)
     _log(f"start state={state_before} dry_run={dry_run}")
 
     if state.disabled:
         skipped.append("TINYCTX_CAVEMAN_DISABLE=1")
         return BootstrapReport(state_before, actions,
-                               asdict(detect_state(vendor=vendor_dir,
-                                                    codex_config=codex_config)),
+                               asdict(detect_state(codex_config=codex_config)),
                                skipped, success=True)
 
-    if do_vendor:
-        ok, msg = vendor(state, vendor_dir=vendor_dir, dry_run=dry_run)
-        actions.append(f"vendor: {msg}")
+    if install and not state.caveman_shrink_present:
+        ok, msg = install_via_npm(dry_run=dry_run)
+        actions.append(f"npm-install: {msg}")
         if ok and not dry_run:
-            state = detect_state(vendor=vendor_dir, codex_config=codex_config)
-        # npm install caveman-shrink deps; non-fatal if it fails
-        ok2, msg2 = npm_install_shrink(state, vendor_dir=vendor_dir,
-                                        dry_run=dry_run)
-        actions.append(f"npm-install-shrink: {msg2}")
+            state = detect_state(codex_config=codex_config)
+    elif install:
+        skipped.append("caveman-shrink already installed")
 
     # Default: do_config=False because caveman-shrink is middleware, not
-    # a standalone server. Whatever was previously written by an older
-    # version of this bootstrap is now broken; remove it on every run.
+    # a standalone server. Strip any previously written standalone block.
     if not do_config and not dry_run:
-        from ._codex_toml import strip_mcp_block
         if codex_config.is_file():
             try:
                 text = codex_config.read_text(encoding="utf-8", errors="replace")
@@ -254,30 +219,32 @@ def bootstrap(*, do_vendor: bool = True, do_config: bool = False,
             except OSError as e:
                 _log(f"strip-broken-block failed: {e}")
 
-    if do_config and state.entry_present:
+    if do_config and state.caveman_shrink_present:
         ok, msg = patch_codex_config(state, config_path=codex_config,
                                       dry_run=dry_run)
         actions.append(f"codex config: {msg}")
-    elif do_config and not state.entry_present:
-        skipped.append("config: caveman entry not found "
-                       f"({state.entry_path}); vendor first")
+    elif do_config and not state.caveman_shrink_present:
+        skipped.append("config: caveman-shrink binary not found; install first")
 
-    final = detect_state(vendor=vendor_dir, codex_config=codex_config)
-    success = all(("rc=" not in a or "rc=0" in a) and "git not on PATH" not in a
-                  for a in actions)
+    final = detect_state(codex_config=codex_config)
+    success = all(
+        ("rc=" not in a or "rc=0" in a) and "npm not on PATH" not in a
+        for a in actions
+    )
     return BootstrapReport(state_before, actions, asdict(final),
                            skipped, success)
+
+
+# ──────────────────────────── CLI ─────────────────────────────────
 
 
 def _print_state_human(state: State) -> None:
     rows = [
         ("disabled (env)", "yes" if state.disabled else "no"),
-        ("git", state.git_path or "missing"),
         ("node", state.node_path or "missing"),
-        ("vendor dir", state.vendor_dir),
-        ("vendor cloned", "yes" if state.vendor_present else "no"),
-        ("entry script", state.entry_path),
-        ("entry present", "yes" if state.entry_present else "no"),
+        ("npm", "yes" if state.npm_present else "no"),
+        ("caveman-shrink path", state.caveman_shrink_path or "missing"),
+        ("caveman-shrink present", "yes" if state.caveman_shrink_present else "no"),
         ("[mcp_servers.caveman-shrink]",
          "yes" if state.codex_config_has_caveman else "no"),
     ]
@@ -292,15 +259,12 @@ def main(argv: list[str] | None = None) -> int:
                    choices=["install", "status", "uninstall", "config-only"])
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--quiet", action="store_true")
-    p.add_argument("--vendor-dir", default=str(DEFAULT_VENDOR))
     p.add_argument("--codex-config", default=str(CODEX_CONFIG_DEFAULT))
     args = p.parse_args(argv)
-    vendor_path = Path(args.vendor_dir).expanduser()
     codex_path = Path(args.codex_config).expanduser()
 
     if args.cmd == "status":
-        _print_state_human(detect_state(vendor=vendor_path,
-                                         codex_config=codex_path))
+        _print_state_human(detect_state(codex_config=codex_path))
         return 0
 
     if args.cmd == "uninstall":
@@ -318,14 +282,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("no caveman block to remove")
         return 0
 
-    do_v = args.cmd == "install"
-    # `config-only` is now an explicit "I know what I'm doing — write the
-    # standalone block anyway" escape hatch; default `install` does NOT
-    # write the standalone block (caveman-shrink is middleware).
+    do_install = args.cmd == "install"
     do_c = args.cmd == "config-only"
-    report = bootstrap(do_vendor=do_v, do_config=do_c,
-                       dry_run=args.dry_run, vendor_dir=vendor_path,
-                       codex_config=codex_path)
+    report = bootstrap(install=do_install, do_config=do_c,
+                       dry_run=args.dry_run, codex_config=codex_path)
 
     if not args.quiet:
         print(f"[caveman-bootstrap] success={report.success}")

@@ -484,6 +484,48 @@ def _upstream_retry_count() -> int:
         return 1
 
 
+def _record_token_tracker(trace, decision) -> None:
+    """Feed one request's token stats into the in-memory and persistent trackers."""
+    if trace is None:
+        return
+    est = getattr(trace, "est_input_tokens", 0) or 0
+    fwd = getattr(trace, "forwarded_tokens_est", 0) or 0
+    route = getattr(trace, "route", "") or ""
+    is_adv = bool(getattr(trace, "forced_by_client_model", False)
+                  and route == "frontier")
+    cwd = getattr(trace, "cwd", "") or ""
+    # Injection overhead: sum of all proxy-added context, converted to tokens
+    inj_chars = sum(
+        getattr(trace, f, 0) or 0
+        for f in ("scout_chars", "ctx_pack_chars", "snapshot_chars",
+                   "global_agent_rules_chars", "platform_rules_chars")
+    )
+    inj_tokens = int(inj_chars / 3.6)
+    try:
+        from . import token_tracker as _tt
+        _tt.record(
+            est_input_tokens=est,
+            injection_tokens=inj_tokens,
+            forwarded_tokens=fwd,
+            bytes_out=getattr(trace, "bytes_out", 0) or 0,
+            route=route,
+            is_advisor=is_adv,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from . import project_store as _ps
+        _ps.record(
+            cwd=cwd,
+            est_input_tokens=est,
+            forwarded_tokens=fwd,
+            route=route,
+            is_advisor=is_adv,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _build_upstream_transport(backend: BackendCfg) -> httpx.AsyncHTTPTransport:
     proxy_url = _normalize_proxy_url(getattr(backend, "proxy", None))
     kwargs: dict[str, Any] = {"retries": _upstream_retry_count()}
@@ -760,6 +802,28 @@ def _auto_register_mcp_servers_on_startup() -> None:
         _log("mcp_registry_bootstrap_failed", error=str(e))
 
 
+@APP.on_event("startup")
+def _auto_install_missing_on_startup() -> None:
+    """Auto-install missing components on proxy startup. Idempotent — each
+    component's bootstrap skips if already installed. Toggle off via
+    CFG.auto_install_missing_components = False."""
+    if not CFG.auto_install_missing_components:
+        return
+    try:
+        from . import installer
+        results = installer.install_all_missing()
+        installed = [k for k, v in results.items() if v.get("installed")]
+        failed = {k: v["error"] for k, v in results.items() if v.get("error")}
+        skipped = [
+            k for k, v in results.items()
+            if not v.get("installed") and not v.get("was_missing")
+        ]
+        _log("auto_install_missing_done",
+             installed=installed, skipped=skipped, failed=failed)
+    except Exception as e:  # noqa: BLE001 — never let startup hook crash the proxy
+        _log("auto_install_missing_failed", error=str(e))
+
+
 @APP.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -888,6 +952,7 @@ async def responses(request: Request) -> Any:
             trace_guard_results,
         )
         cwd_hdr = request.headers.get("x-codex-cwd") or ""
+        trace.cwd = cwd_hdr
         state_dir = CFG.log_dir.parent / "state"
         active_guards: list[Any] = []
         if CFG.empty_response_guard_enabled:
@@ -1534,6 +1599,17 @@ async def responses(request: Request) -> Any:
         _log("tool_schema_flattened", session=sid,
              tools=flat_info.get("flattened_tools", []))
 
+    # Caveman inline compression: shorten verbose tool descriptions and
+    # (optionally) instructions using regex rules. Pure Python, no deps,
+    # no codex config changes. Runs BEFORE lingua so lingua only sees the
+    # already-shortened prose.
+    if CFG.caveman_compress_enabled:
+        from . import caveman_compress as _cc
+        if CFG.caveman_compress_tool_descriptions:
+            body = _cc.compress_tool_descriptions(body)
+        if CFG.caveman_compress_instructions:
+            body = _cc.compress_instructions(body)
+
     # Frontier-only: LLMLingua-2 pre-escalation compression of bulky
     # tool-result payloads. Default off; gated by `frontier_lingua_enabled`.
     # Targets only function_call_output / tool_result items (skips
@@ -1842,6 +1918,13 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     cur_decision, ok=True, status=r.status_code,
                     session=sid)
                 _SESSION_ERROR_STREAK[sid] = 0
+                # Frontier succeeded — clear unreachable flag
+                if cur_decision.route == "frontier":
+                    try:
+                        from . import frontier_health as _fh
+                        _fh.mark_reachable()
+                    except Exception:  # noqa: BLE001
+                        pass
                 break  # success — fall through to payload handling
             # Failure path — classify and decide next action.
             retry_after = 0.0
@@ -1878,16 +1961,12 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                         trace.status = 0
                         trace.elapsed_s = round(time.time() - started, 3)
                         trace.emit(CFG.log_dir)
-                    # Set force_next_to_frontier if classifier asked for it
                     if action.escalate_flag_reason:
                         try:
                             from . import empty_response_guard as _erg
                             _erg.force_next_to_frontier(
                                 erg_key, action.escalate_flag_reason)
-                        except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
-                            # Why: missing this flag means next turn
-                            # routes to default backend (no correctness
-                            # loss; this turn's response already returned).
+                        except Exception:  # noqa: BLE001
                             pass
                     return JSONResponse(
                         {"error": {"message": str(exc),
@@ -2023,6 +2102,7 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.prompt_cache_hit_ratio = round(hit / total, 4) if total > 0 else 0.0
             trace.elapsed_s = round(time.time() - started, 3)
             trace.emit(CFG.log_dir)
+        _record_token_tracker(trace, cur_decision)
         return JSONResponse(content=payload, status_code=r.status_code)
     finally:
         await client.aclose()
@@ -2530,6 +2610,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             trace.elapsed_s = elapsed
             trace.keepalives_emitted = keepalives_emitted
             trace.emit(CFG.log_dir)
+        _record_token_tracker(trace, decision)
         _phase_set(proj_sid,
                    RequestPhase.stalled if upstream_failed else RequestPhase.done,
                    request_id)

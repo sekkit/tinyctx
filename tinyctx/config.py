@@ -701,7 +701,7 @@ class Config:
     # Legacy / emergency switch: when true, a self-classify hit routes
     # the whole turn to frontier. Default false keeps frontier usage near
     # advisor-strategy levels instead of making frontier the executor.
-    self_classify_escalates_to_frontier: bool = False
+    self_classify_escalates_to_frontier: bool = True
     # Time budget for the classifier call. Reasoning-class local models
     # (qwen3.x-think, DeepSeek-R1 family) burn 200-1500 tokens on hidden
     # chain-of-thought before emitting the JSON verdict; at 50 tok/s that
@@ -1071,6 +1071,32 @@ class Config:
     # bootstrap modules below) and skipped entirely when the tools
     # aren't on PATH. See tinyctx/mcp_registry.py for the full contract.
     auto_register_mcp_servers: bool = True
+
+    # Auto-install missing components (context-mode, gitnexus, graphify,
+    # serena, caveman) on proxy startup. Each component's bootstrap is
+    # idempotent — already-installed components are skipped. Set false to
+    # disable (e.g. in air-gapped or managed deployments).
+    auto_install_missing_components: bool = True
+
+    # Caveman-style inline compression: apply prose-shortening regex rules
+    # to tool descriptions and instructions in the proxy pipeline. Pure
+    # Python, zero dependencies, no codex config changes needed. Default on
+    # — typical 30-50% reduction on tool description tokens.
+    caveman_compress_enabled: bool = True
+    # Compress tool descriptions (the `description` field of each tool in
+    # body.tools). This is the biggest per-tool token cost in the system
+    # prompt — caveman rules cut verbosity while preserving code/paths/URLs.
+    caveman_compress_tool_descriptions: bool = True
+    # Compress body.instructions (the system prompt). Instructions are
+    # cache-critical so this only fires when CacheAwareMutator gate is
+    # already open for this request.
+    caveman_compress_instructions: bool = False
+
+    # When frontier is unreachable, the proxy auto-falls-back to local
+    # and injects a <system-reminder> so the model tells the user.
+    # After cooldown expires, the next request retries frontier.
+    # Exponential backoff per consecutive failure: 30→60→120→300s max.
+    frontier_unreachable_cooldown_s: float = 30.0
 
     # Auto-scout: zero-config project context bootstrap.
     # When True, the proxy reads `x-codex-cwd` from each request and

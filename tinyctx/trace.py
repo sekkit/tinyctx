@@ -42,6 +42,7 @@ class RequestTrace:
     # in proactive_compact cache, error_streak escalation, and
     # mutation-gate timing. See proxy._project_session_key.
     project_session_key: str = ""
+    cwd: str = ""  # from x-codex-cwd header, for per-project stats
     started_at: float = field(default_factory=time.time)
 
     # routing decision
