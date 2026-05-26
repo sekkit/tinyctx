@@ -106,3 +106,39 @@ tinyctx-dreamer run      # periodic maintenance: scout + keypin + GC
 v0.8.0 — production use at 700+ turns/day, 95%+ local hit rate, sub-1% upstream errors. Works with Codex CLI 0.125.0 and Codex.app 0.128.0+.
 
 MIT license. ~13K LOC original code across 71 modules. 7 upstream OSS integrations auto-wired.
+
+## Technical foundations
+
+Four independent streams of research inform tinyctx's design.
+
+### 1. Compression-biased context ranking
+
+*Aksenov, Bodnia, Freedman, Mulligan — [Compression Is All You Need (arxiv 2603.20396)](https://arxiv.org/abs/2603.20396)*
+
+The central finding: human mathematics lives in the polynomial-growth (A_n) regime, where a small set of hierarchically-nested macros buys exponential expansion. The paper proposes **PageRank with teleportation biased toward high-compression nodes**: nodes whose content compresses well (high reductive compression T_0 = unwrapped/wrapped) and whose signatures are small relative to body (high deductive compression I_0 = body/signature) get more teleportation mass. For a code corpus, this picks the load-bearing abstractions — utility modules, well-named interfaces, deeply-nested but terse APIs — that should be primed into the agent's context.
+
+tinyctx implements this in `interest.py`: build a code graph (gitnexus/graphify), compute J_0 = β·T_0 + (1-β)·I_0 for each node, run compression-biased PageRank, inject top-K files into context. Strictly stronger ranking than uniform-personalization PageRank (what aider's repomap does).
+
+### 2. Prefix reuse as the dominant cost lever
+
+*LMCache project — [Prefix-aware LLM serving](https://arxiv.org/abs/2407.17788)*
+
+The key metric: ~92% of Claude Code traffic is prefix-reuse, climbing to ~98% in execution phase. With Anthropic's 10× prompt-cache read discount, that's ~5-10× cost reduction from cache discipline alone. The implication for a routing proxy: **cache stability dominates every other optimization**. Mutating history bytes before 5 minutes of idle time destroys cache hits worth more than any per-token compression could save.
+
+tinyctx's `CacheAwareMutator` gates every history-mutating transform (dedup, purge, historian substitution, read_delta, caveman compression, LLMLingua) behind dual triggers: 5-minute TTL OR context usage above threshold. In the common case (<5 min between turns, <80% context), the proxy touches nothing and the cache stays hot.
+
+### 3. Agentic policy discovery (AIRA)
+
+*Meta FAIR — [AIRA: Agentic Discovery of Neural Architectures (arxiv 2605.15871)](https://arxiv.org/abs/2605.15871)*
+
+The insight: the draft → evaluate → improve → archive loop that discovers neural architectures can also discover **better proxy routing policies**. Parameterize routing configs (escalation thresholds, tool trim budgets, cache-awareness knobs), evaluate each candidate against deterministic benchmark suites (simulation + real codex execution), archive winners, perturb and repeat.
+
+tinyctx ships this loop offline: `policy_search.py` manages the cycle, `eval_harness.py` scores candidates with march-of-9s normalization (φ(s) = -log₁₀(|s − s_opt| + ε)), `frontier.py` archives scored candidates with lineage. The winning policy is auto-loaded by the proxy on next start.
+
+### 4. The Advisor Strategy
+
+*Anthropic — [The Advisor Strategy](https://claude.com/blog/the-advisor-strategy)*
+
+Instead of all-or-nothing per-request escalation (local model OR frontier model), thread a third path: the executor decides per-turn whether to consult the frontier **as a tool**. 99% of turns run on the cheap model. When the executor hits a hard decision (torn between architectures, 2+ failed approaches, non-trivial security choice), it spawns a sub-agent bound to GPT-5.5, gets 100-200 words of guidance, then continues. Anthropic reports +2.7 SWE-bench points at −11.9% cost using Sonnet+Opus pairing.
+
+tinyctx implements this via codex's native `spawn_agent(role="advisor")` + a `self_classify` classifier that detects hard decisions (p≥0.7) and auto-escalates. The advisor sub-thread's `model="tinyctx-frontier"` forces the proxy to route to GPT-5.5, confirmed in live traces.
