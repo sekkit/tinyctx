@@ -482,6 +482,48 @@ class SoftCompletionGate:
         )
 
 
+class AdvisorContinuationGuard:
+    """Inject advisor-derived continuation work as synthetic user input on
+    the next request after a successful advisor output was observed in the
+    previous turn.
+
+    Priority 46 — after SoftCompletionGate (40) and ChoiceArbiterGuard (45),
+    before PlanPersistenceInjector (50).
+    """
+
+    name = "advisor_continuation"
+    priority = 46
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: compaction or forced model")
+        try:
+            from . import advisor_continuation as _ac
+        except ImportError:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: advisor_continuation module not available")
+        pending = _ac.consume_pending_work(ctx.conv_sid)
+        if pending is None and ctx.conv_sid != ctx.proj_sid:
+            pending = _ac.consume_pending_work(ctx.proj_sid)
+        if pending is None:
+            return GuardResult(guard_name=self.name, fired=False)
+        new_body, was_inj = _ac.inject_pending_work_into_body(ctx.body, pending)
+        if not was_inj:
+            return GuardResult(guard_name=self.name, fired=False)
+        ctx.body = new_body
+        ctx.injected_reminders.append(self.name)
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=True,
+            reason=f"injected advisor continuation: {pending.work_text[:80]}",
+            additional_log={"source": pending.source},
+        )
+
+
 class PlanPersistenceInjector:
     """Save the current turn's progress tracker (update_plan /
     TodoWrite) to disk for this cwd, and inject a previously-saved
@@ -536,6 +578,57 @@ class PlanPersistenceInjector:
             body_mutated=injected,
             reason=",".join(bits),
             additional_log={"cwd": self.cwd[:120], **pdata_meta},
+        )
+
+
+class ChoiceArbiterGuard:
+    """Inject advisor's choice as synthetic user message when the previous
+    turn asked the user to pick between options. The verdict is stored by
+    `choice_arbiter.intercept()` during stream-rewrite; this guard consumes
+    it pre-flight and injects it into body.input so the model sees the
+    decision on the next turn without the user typing.
+
+    Priority 45 — after SoftCompletionGate (40) so the gate reminder
+    fires first, but before PlanPersistenceInjector (50) so the injected
+    user message is part of the body that plan persistence inspects.
+    """
+
+    name = "choice_arbiter"
+    priority = 45
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: compaction or forced model")
+
+        try:
+            from . import choice_arbiter as _ca
+        except ImportError:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: choice_arbiter module not available")
+        verdict = _ca.consume_verdict(ctx.conv_sid)
+        if verdict is None and ctx.conv_sid != ctx.proj_sid:
+            verdict = _ca.consume_verdict(ctx.proj_sid)
+        if verdict is None:
+            return GuardResult(guard_name=self.name, fired=False)
+
+        new_body, was_inj = _ca.inject_verdict_into_body(ctx.body, verdict)
+        if not was_inj:
+            return GuardResult(guard_name=self.name, fired=False)
+
+        ctx.body = new_body
+        ctx.injected_reminders.append(self.name)
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=True,
+            reason=f"injected advisor choice: {verdict.advisor_choice[:80]}",
+            additional_log={
+                "question": verdict.question[:120],
+                "options": verdict.options,
+            },
         )
 
 

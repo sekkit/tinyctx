@@ -630,6 +630,7 @@ async def classify_at_stream_end(
         timeout_s: float = 30.0,
         threshold: float = 0.7,
         conv_sid: str | None = None,
+        current_route: str = "",
 ) -> ClassifyResult | None:
     """Run the LLM behavioral classifier against the accumulated stream
     buffer for `proj_sid`. Sets the per-session flag if verdict is
@@ -646,7 +647,7 @@ async def classify_at_stream_end(
     diag = await classify_at_stream_end_diag(
         proj_sid, local_base_url, local_model,
         api_key=api_key, timeout_s=timeout_s, threshold=threshold,
-        conv_sid=conv_sid)
+        conv_sid=conv_sid, current_route=current_route)
     return diag.result
 
 
@@ -666,6 +667,7 @@ async def classify_at_stream_end_diag(
         short_text_threshold: int = 50,
         stop_text_threshold: int = 50,
         conv_sid: str | None = None,
+        current_route: str = "",
 ) -> ClassifyDiag:
     """Same as `classify_at_stream_end` but returns a `ClassifyDiag`
     capturing why the call returned None (for logging in the proxy
@@ -791,18 +793,20 @@ async def classify_at_stream_end_diag(
         # Bounded by the higher `soft_completion_auto_force_frontier_threshold`
         # so we don't escalate every borderline verdict.
         if result.p >= force_frontier_threshold:
-            try:
-                from . import empty_response_guard as _erg
-                # Scope force-frontier escalation to the per-conversation
-                # key when known; the consumption site in proxy.py checks
-                # conv_sid first. Falls back to proj_sid for callers that
-                # haven't been migrated to pass conv_sid (back-compat).
-                flag_key = conv_sid if conv_sid else proj_sid
-                _erg.force_next_to_frontier(
-                    flag_key,
-                    f"soft_punt p={result.p:.2f}: {result.reason[:60]}")
-            except Exception:  # noqa: BLE001 — guard must never break classifier
-                pass
+            # Don't re-set force_frontier when already on frontier —
+            # avoids infinite loop where every frontier response
+            # triggers force_frontier again, killing cache hits.
+            if current_route == "frontier":
+                diag.skipped_reason = f"force_frontier skipped: already on frontier"
+            else:
+                try:
+                    from . import empty_response_guard as _erg
+                    flag_key = conv_sid if conv_sid else proj_sid
+                    _erg.force_next_to_frontier(
+                        flag_key,
+                        f"soft_punt p={result.p:.2f}: {result.reason[:60]}")
+                except Exception:  # noqa: BLE001 — guard must never break classifier
+                    pass
     return diag
 
 

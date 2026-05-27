@@ -824,6 +824,21 @@ def _auto_install_missing_on_startup() -> None:
         _log("auto_install_missing_failed", error=str(e))
 
 
+@APP.on_event("startup")
+def _auto_open_dashboard() -> None:
+    """Open the dashboard in the default browser on startup.
+    Delayed 1.5s to let uvicorn bind the port first."""
+    try:
+        import threading, time, webbrowser
+        url = f"http://{CFG.host}:{CFG.port}/dashboard"
+        threading.Thread(
+            target=lambda: (time.sleep(1.5), webbrowser.open(url)),
+            daemon=True,
+        ).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @APP.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -888,6 +903,29 @@ async def responses(request: Request) -> Any:
     streak = _SESSION_ERROR_STREAK[proj_sid]
     _phase_set(proj_sid, RequestPhase.classifying, trace.request_id)
 
+    # ─── Multimodal preprocess (gated, default OFF) ──────────────────
+    # Replace image attachments with mm-generated captions BEFORE any
+    # body-derived signal is computed. Doing it here means est_tokens,
+    # _detect_images, and every downstream stage see the SAME shrunk
+    # body — otherwise the size rule would still escalate to frontier
+    # against the original base64 payload even after the image was
+    # stripped from the route check.
+    if getattr(CFG, "image_to_text_preprocess_enabled", False):
+        try:
+            from . import multimodal_preprocess as _mmp
+            body, _mm_stats = _mmp.preprocess(
+                body,
+                enabled=True,
+                timeout_s=getattr(CFG, "image_to_text_timeout_s", 30.0),
+                log=_log,
+            )
+            if _mm_stats.get("images_captioned"):
+                _log("multimodal_preprocess_applied",
+                     session=proj_sid, **_mm_stats)
+        except Exception as _mmp_e:  # noqa: BLE001 — never block routing
+            _log("multimodal_preprocess_error",
+                 session=proj_sid, error=str(_mmp_e))
+
     # Body-derived signals computed once, fed into guards + Router. We
     # used to compute these via `decide()` and then discard everything
     # except the decision; now we extract them directly and let the
@@ -941,6 +979,7 @@ async def responses(request: Request) -> Any:
     try:
         from .guards import (
             BudgetReminderGuard,
+            ChoiceArbiterGuard,
             EscalationLadderGuard,
             ForceFrontierGuard,
             GuardContext,
@@ -970,6 +1009,14 @@ async def responses(request: Request) -> Any:
                 advisor_grace_s=CFG.stuck_loop_advisor_grace_s))
         if CFG.soft_completion_gate_enabled:
             active_guards.append(SoftCompletionGate())
+        if getattr(CFG, "choice_arbiter_enabled", True):
+            active_guards.append(ChoiceArbiterGuard())
+        try:
+            from .guards import AdvisorContinuationGuard
+        except ImportError:
+            AdvisorContinuationGuard = None
+        if AdvisorContinuationGuard is not None:
+            active_guards.append(AdvisorContinuationGuard())
         if CFG.plan_persistence_enabled:
             active_guards.append(PlanPersistenceInjector(
                 state_dir=state_dir,
@@ -1051,6 +1098,23 @@ async def responses(request: Request) -> Any:
                               updated=gr.additional_log.get("updated"))
                 elif gr.additional_log.get("exception_type"):
                     _log("plan_persistence_error", session=sid,
+                          error=gr.reason)
+            elif gr.guard_name == "choice_arbiter":
+                if gr.fired:
+                    _log("choice_arbiter_injected",
+                          session=sid, proj_sid=proj_sid,
+                          question=gr.additional_log.get("question"),
+                          options=gr.additional_log.get("options"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("choice_arbiter_error", session=sid,
+                          error=gr.reason)
+            elif gr.guard_name == "advisor_continuation":
+                if gr.fired:
+                    _log("advisor_continuation_injected",
+                          session=sid, proj_sid=proj_sid,
+                          source=gr.additional_log.get("source"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("advisor_continuation_error", session=sid,
                           error=gr.reason)
             elif gr.guard_name == "self_improvement":
                 if gr.fired:
@@ -1160,6 +1224,7 @@ async def responses(request: Request) -> Any:
             _log("self_classify_error", session=sid, error=str(e))
 
     # ─── Single consolidated route decision ──────────────────────────
+    # (preprocess already ran upstream so `body` is the captioned form)
     has_image = _detect_images(body)
     route_ctx = RouteContext(
         body=body,
@@ -2365,6 +2430,64 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             text_excerpt,
                             diag.result.reason,
                             diag.result.p)
+                        # Choice arbiter: when the classifier detects
+                        # "asks user which option", run judge (local)
+                        # → advisor (frontier) → store verdict. The
+                        # verdict is consumed by ChoiceArbiterGuard
+                        # on the next request. Runs before the noop
+                        # continue injection so the next turn sees
+                        # the advisor's decision as user input.
+                        if getattr(CFG, "choice_arbiter_enabled", True):
+                            try:
+                                from . import choice_arbiter as _ca
+                            except ImportError:
+                                _ca = None
+                            if _ca is not None:
+                                try:
+                                    _ca_verdict = await _ca.intercept(
+                                        text_excerpt,
+                                        conv_sid=erg_key,
+                                        local_base_url=CFG.local.base_url,
+                                        local_model=CFG.local.model,
+                                        local_api_key=api_key,
+                                        frontier_base_url=CFG.frontier.base_url,
+                                        frontier_model=CFG.frontier.model,
+                                        frontier_api_key=_resolve_api_key(
+                                            CFG.frontier, None),
+                                    )
+                                    if _ca_verdict is not None:
+                                        _log("choice_arbiter_stored",
+                                             session=proj_sid,
+                                             question=_ca_verdict.question[:120],
+                                             options=_ca_verdict.options,
+                                             choice=_ca_verdict.advisor_choice[:120])
+                                except Exception as _ca_e:  # noqa: BLE001
+                                    _log("choice_arbiter_error",
+                                         session=proj_sid, error=str(_ca_e))
+                        try:
+                            from . import advisor_continuation as _ac
+                        except ImportError:
+                            _ac = None
+                        if _ac is not None:
+                            try:
+                                pending = await _ac.extract_pending_work_from_outgoing_sse(
+                                    outgoing_capture.decode("utf-8", "replace"),
+                                    local_base_url=CFG.local.base_url,
+                                    local_model=CFG.local.model,
+                                    api_key=api_key,
+                                )
+                                if pending:
+                                    stored = _ac.store_pending_work(
+                                        erg_key, pending,
+                                        source="stream_rewrite_advisor_output")
+                                    if stored:
+                                        _log("advisor_continuation_stored",
+                                             session=proj_sid,
+                                             source="stream_rewrite_advisor_output",
+                                             chars=len(pending))
+                            except Exception as _ac_e:  # noqa: BLE001
+                                _log("advisor_continuation_error",
+                                     session=proj_sid, error=str(_ac_e))
                         # Multi-strategy synthetic continue: rotate
                         # through codex builtins (shell / local_shell /
                         # update_plan) until codex actually dispatches
@@ -2387,8 +2510,16 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         else:
                             for evt in inj_events:
                                 yield _capture_outgoing(evt)
-                            _log("soft_completion_stream_rewrite_injected",
+                            # NOTE: This is a NOOP-continue injection
+                            # (shell true / local_shell / update_plan), NOT an
+                            # advisor sub-agent call. Real advisor calls only
+                            # happen when the executor itself emits
+                            # `model="tinyctx-frontier"`. See
+                            # `synthetic_continue.STRATEGIES` for what gets
+                            # injected here.
+                            _log("soft_completion_continue_injected",
                                  session=proj_sid,
+                                 kind="noop_continue",
                                  p=diag.result.p,
                                  reason=diag.result.reason,
                                  strategy=strategy["label"],
@@ -2623,8 +2754,25 @@ def _safe_json(r: httpx.Response) -> Any:
         return {"raw": r.text}
 
 
+def _coerce_int(v: Any) -> int:
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _extract_prompt_cache_usage(payload: Any) -> tuple[int, int]:
-    """Best-effort `(hit, miss)` from a response-ish payload."""
+    """Best-effort `(hit, miss)` from a response-ish payload.
+
+    Recognized usage shapes:
+      * DeepSeek / OpenAI chat-completions:
+        ``prompt_cache_hit_tokens`` + ``prompt_cache_miss_tokens``
+      * OpenAI Responses API (codex frontier):
+        ``input_tokens`` + ``input_tokens_details.cached_tokens``
+      * Anthropic Messages:
+        ``cache_read_input_tokens`` + ``cache_creation_input_tokens`` +
+        ``input_tokens`` (uncached this call).
+    """
     if not isinstance(payload, dict):
         return 0, 0
     usage = payload.get("usage")
@@ -2634,38 +2782,76 @@ def _extract_prompt_cache_usage(payload: Any) -> tuple[int, int]:
             usage = response.get("usage")
     if not isinstance(usage, dict):
         return 0, 0
-    hit = usage.get("prompt_cache_hit_tokens")
-    miss = usage.get("prompt_cache_miss_tokens")
-    try:
-        hit_i = int(hit) if hit is not None else 0
-    except (TypeError, ValueError):
-        hit_i = 0
-    try:
-        miss_i = int(miss) if miss is not None else 0
-    except (TypeError, ValueError):
-        miss_i = 0
-    return max(0, hit_i), max(0, miss_i)
+
+    # DeepSeek / OpenAI chat-completions
+    if (usage.get("prompt_cache_hit_tokens") is not None
+            or usage.get("prompt_cache_miss_tokens") is not None):
+        return (
+            max(0, _coerce_int(usage.get("prompt_cache_hit_tokens"))),
+            max(0, _coerce_int(usage.get("prompt_cache_miss_tokens"))),
+        )
+
+    # OpenAI Responses API. `input_tokens_details.cached_tokens` is the
+    # cache hit; the remainder of `input_tokens` is the miss.
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        hit = _coerce_int(details.get("cached_tokens"))
+        total = _coerce_int(usage.get("input_tokens",
+                                       usage.get("prompt_tokens")))
+        return max(0, hit), max(0, total - hit)
+
+    # Anthropic Messages. cache_read = hit; uncached input + write-on-miss
+    # cost = miss.
+    if (usage.get("cache_read_input_tokens") is not None
+            or usage.get("cache_creation_input_tokens") is not None):
+        hit = _coerce_int(usage.get("cache_read_input_tokens"))
+        miss = (_coerce_int(usage.get("input_tokens"))
+                + _coerce_int(usage.get("cache_creation_input_tokens")))
+        return max(0, hit), max(0, miss)
+
+    return 0, 0
 
 
 def _extract_prompt_cache_usage_from_buffer(raw_buffer: str) -> tuple[int, int]:
+    """Regex-fallback extractor when the SSE buffer wasn't parsed into a dict.
+
+    Mirrors the format coverage of `_extract_prompt_cache_usage`:
+    DeepSeek > OpenAI Responses (cached_tokens) > Anthropic.
+    """
     if not raw_buffer:
         return 0, 0
     tail = raw_buffer[-8000:] if len(raw_buffer) > 8000 else raw_buffer
-    hit = 0
-    miss = 0
-    m = re.search(r'"prompt_cache_hit_tokens"\s*:\s*(\d+)', tail)
-    if m:
-        try:
-            hit = int(m.group(1))
-        except (TypeError, ValueError):
-            hit = 0
-    m = re.search(r'"prompt_cache_miss_tokens"\s*:\s*(\d+)', tail)
-    if m:
-        try:
-            miss = int(m.group(1))
-        except (TypeError, ValueError):
-            miss = 0
-    return hit, miss
+
+    # DeepSeek wins when present (both fields explicit).
+    m_hit = re.search(r'"prompt_cache_hit_tokens"\s*:\s*(\d+)', tail)
+    m_miss = re.search(r'"prompt_cache_miss_tokens"\s*:\s*(\d+)', tail)
+    if m_hit or m_miss:
+        return (
+            int(m_hit.group(1)) if m_hit else 0,
+            int(m_miss.group(1)) if m_miss else 0,
+        )
+
+    # OpenAI Responses: cached_tokens + input_tokens.
+    m_cached = re.search(r'"cached_tokens"\s*:\s*(\d+)', tail)
+    if m_cached:
+        hit = int(m_cached.group(1))
+        m_in = re.search(r'"input_tokens"\s*:\s*(\d+)', tail)
+        total = int(m_in.group(1)) if m_in else hit
+        return hit, max(0, total - hit)
+
+    # Anthropic Messages: cache_read_input_tokens + cache_creation_input_tokens.
+    m_read = re.search(r'"cache_read_input_tokens"\s*:\s*(\d+)', tail)
+    m_create = re.search(r'"cache_creation_input_tokens"\s*:\s*(\d+)', tail)
+    if m_read or m_create:
+        hit = int(m_read.group(1)) if m_read else 0
+        m_in = re.search(r'"input_tokens"\s*:\s*(\d+)', tail)
+        miss = (int(m_in.group(1)) if m_in else 0) + (
+            int(m_create.group(1)) if m_create else 0)
+        return hit, miss
+
+    return 0, 0
 
 
 # ─── small counters used to populate RequestTrace transformation diffs ──

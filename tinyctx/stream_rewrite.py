@@ -1,6 +1,7 @@
 """Stream rewriting: intercept upstream `response.completed` and inject
-a synthetic `function_call` to advisor when soft_completion classifier
-returns PUNT with high confidence.
+a synthetic `function_call` when the soft_completion classifier
+returns PUNT with high confidence, so the agent resumes work instead
+of stopping prematurely.
 
 Why this exists
 ───────────────
@@ -10,26 +11,36 @@ twice in a row and kept emitting `plan-without-tool-call`. Loop.
 
 This module bypasses agent discipline by directly forging the SSE
 event sequence codex parses for a function_call. When the classifier
-says PUNT with p ≥ threshold, we hold the upstream's
-`response.completed` event, emit synthetic events for a function_call
-to the advisor MCP tool, then emit the held `response.completed`.
+says PUNT with p ≥ threshold, the proxy holds the upstream's
+`response.completed` event, emits synthetic events for a function_call
+that codex will actually dispatch (see `synthetic_continue.STRATEGIES`
+— `shell`/`local_shell`/`update_plan` no-ops), then emits the held
+`response.completed`.
+
+What about advisor? The original design tried to inject a synthetic
+`spawn_agent(role="advisor")` here. Binary analysis + 0 observed
+ADVISOR routes proved codex silently drops it (probable schema
+mismatch / origin validation). `synthetic_advisor_call_events` is
+kept for tests and future re-enable, but the live proxy uses
+`synthetic_continue.build_continue_injection` instead — those are
+codex builtins that DO get dispatched. Real advisor sub-agent calls
+happen only when the executor itself emits `model="tinyctx-frontier"`.
 
 Codex sees:
   <whatever the agent emitted>
-  + (synthetic) function_call to advisor with task=<reminder + plan summary>
+  + (synthetic) function_call to a codex builtin (shell true / update_plan / …)
   + response.completed
 
-→ codex routes to advisor sub-thread, gets the verdict, sends the
-function_call_output back as the next turn's first input. Agent gets
-its own "advisor said X" without user input.
+→ codex executes the builtin, returns the output to the model on
+the next turn. Agent resumes with new context instead of stopping.
 
 Risk profile
 ────────────
-Relies on codex parsing a function_call by name. If codex 0.128's
+Relies on codex parsing a function_call by name. If codex's
 namespace dispatcher returns "unsupported call" (the user's config.toml
-note), the rewrite surfaces as an error in codex chat. **Default OFF**
-in config — opt-in via `soft_completion_stream_rewrite_enabled = true`
-in `~/.tinyctx/config.toml [global]`. Easy rollback.
+note), the rewrite surfaces as an error in codex chat. Opt-in via
+`soft_completion_stream_rewrite_enabled = true` in
+`~/.tinyctx/config.toml [global]`. Easy rollback.
 """
 from __future__ import annotations
 

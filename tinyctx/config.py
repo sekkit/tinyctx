@@ -456,6 +456,21 @@ class Config:
     escalate_on_error_streak: int = 2       # repeated tool-failure -> frontier (kept; Anthropic "when stuck")
     image_prefer_frontier: bool = True      # route image-bearing prompts to frontier (vision support)
 
+    # When True, the proxy replaces image attachments in body.input with
+    # text captions from `mm cat <file> -m accurate` BEFORE the router
+    # sees the body. The route then stays on local because the body no
+    # longer contains image content items — saving the frontier price
+    # for image-only turns. Default OFF: lossy (caption != original
+    # image) and requires `mm` installed via `mm_bootstrap`. See
+    # `tinyctx/multimodal_preprocess.py`.
+    image_to_text_preprocess_enabled: bool = False
+    # Cap per-image processing time. mm `-m accurate` calls a VLM
+    # endpoint; on a slow caption backend this bounds the latency added
+    # per attachment.
+    image_to_text_timeout_s: float = 30.0
+    # SHA256-keyed caption cache directory. Empty -> ~/.tinyctx/cache/mm-captions.
+    image_to_text_cache_dir: str = ""
+
     # SmallCode-inspired adaptive model select: keep a rolling in-memory
     # health window for the local backend. If automatic requests have seen
     # enough recent local failures, route subsequent auto turns to frontier
@@ -816,6 +831,19 @@ class Config:
     # task being incomplete. Inspired by openai/symphony SPEC §7.1
     # `agent.max_turns`.
     max_continue_injections_per_session: int = 20
+
+    # Choice arbiter: when the soft_completion classifier detects an
+    # "asks user which option" pattern and the stream_rewrite would
+    # inject a noop continue, first run the choice arbiter pipeline:
+    #   1. Judge (local model): confirm this is a choice-ask, extract options
+    #   2. Advisor (frontier model): pick the best option
+    #   3. Store verdict in session_state
+    #   4. Next request: ChoiceArbiterGuard injects advisor's pick as
+    #      synthetic user message, so the model sees the decision and
+    #      continues without re-asking.
+    # Default ON — cost is one local + one frontier call per detected
+    # choice-ask (~1-2% of soft_punt events). See choice_arbiter.py.
+    choice_arbiter_enabled: bool = True
 
     # Empty-response guard: detect when the local backend returns
     # essentially nothing (completion_tokens < threshold + normal stop)

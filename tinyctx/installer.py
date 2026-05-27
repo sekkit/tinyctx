@@ -193,6 +193,50 @@ def _install_caveman() -> ComponentResult:
     return r
 
 
+def _install_mm() -> ComponentResult:
+    """mm (vlm-run multimodal CLI). Used by `multimodal_preprocess` to
+    convert image attachments to text captions so image-bearing turns
+    can stay on the local backend.
+
+    The install runs `curl | sh` → `uv tool install mm-ctx`, which can
+    download ~30MB on a cold machine. Synchronous install would block
+    the proxy startup hook for minutes, leaving codex unable to reach
+    the proxy. We spawn it in a daemon thread instead; the startup
+    completes immediately, the install lands in the background, and
+    the next proxy restart picks up the now-present binary."""
+    r = ComponentResult(component="mm")
+    from . import mm_bootstrap as mmb
+
+    state = mmb.detect_state()
+    if state.disabled:
+        return r
+    if state.mm_present:
+        return r
+
+    r.was_missing = True
+    if os.environ.get("TINYCTX_MM_SYNC_INSTALL") == "1":
+        # Test/diagnostic path — block until done so we can assert
+        # success in tests. Production startup never sets this.
+        result = mmb.install()
+        if result.get("installed"):
+            r.installed = True
+            r.actions.append("curl install.sh | sh (sync)")
+        elif result.get("error"):
+            r.error = str(result.get("error"))
+        return r
+
+    # Default: spawn in background so startup returns immediately.
+    import threading
+    t = threading.Thread(target=mmb.install, name="mm-install", daemon=True)
+    t.start()
+    r.actions.append("curl install.sh | sh (background daemon thread)")
+    # Not flipping `installed` — the next proxy restart will detect mm
+    # on PATH and skip _install_mm naturally. Existing semantics: this
+    # call returned without producing a binary yet, so leave both
+    # flags as-is for the auto_install event log.
+    return r
+
+
 # ──────────────────── config-only bootstraps ───────────────────────
 
 
@@ -292,6 +336,7 @@ _INSTALLERS = [
     _install_graphify,
     _install_serena,
     _install_caveman,
+    _install_mm,
 ]
 
 
@@ -359,6 +404,15 @@ def status_all() -> dict[str, dict[str, Any]]:
     results["caveman"] = {
         "installed": cs.caveman_shrink_present,
         "path": cs.caveman_shrink_path,
+    }
+
+    # mm (vlm-run multimodal CLI)
+    from . import mm_bootstrap as mmb
+    ms = mmb.detect_state()
+    results["mm"] = {
+        "installed": ms.mm_present,
+        "path": ms.mm_path,
+        "version": ms.version,
     }
 
     # codex profile (model_provider + profiles)

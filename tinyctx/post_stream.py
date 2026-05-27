@@ -290,6 +290,7 @@ class PostStreamAnalyzer:
                 short_text_threshold=cfg.soft_completion_short_text_threshold,
                 stop_text_threshold=cfg.soft_completion_stop_text_threshold,
                 conv_sid=ctx.conv_sid,
+                current_route=ctx.route,
             )
             if diag.result is not None:
                 self._log("soft_completion_classified",

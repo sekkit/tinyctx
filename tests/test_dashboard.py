@@ -46,7 +46,7 @@ def test_dashboard_html_renders(tmp_path: Path):
     assert "integration-table" in r.text
     assert "self-improvement-table" in r.text
     assert "request phase" in r.text
-    assert "integrations-raw" in r.text
+    assert "token-stats" in r.text
 
 
 def test_state_endpoint_returns_snapshot(tmp_path: Path):
