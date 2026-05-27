@@ -16,9 +16,14 @@ Env vars:
     TINYCTX_CODEX_PROFILE_DISABLE=1   bypass entirely
     TINYCTX_PROXY_URL=...             override base_url (default 127.0.0.1:4141)
     TINYCTX_PROFILE_MODEL=...         override profile model (default tinyctx-auto)
-    TINYCTX_PROFILE_CONTEXT=...       override model_context_window (default 400000)
-    TINYCTX_PROFILE_AUTO_COMPACT=...  override model_auto_compact_token_limit (default 64000)
+    TINYCTX_PROFILE_CONTEXT=...       override model_context_window
+    TINYCTX_PROFILE_AUTO_COMPACT=...  override model_auto_compact_token_limit
     TINYCTX_CODEX_CONFIG=PATH         override ~/.codex/config.toml path
+
+When env vars are unset, context_window and auto_compact_token_limit
+are derived from the [local] section of ~/.tinyctx/config.toml so
+switching the local model (deepseek ↔ qwen) adjusts the profile
+automatically.
 
 CLI:
     python -m tinyctx.codex_profile_bootstrap            # install blocks
@@ -50,8 +55,8 @@ _GOAL_PROFILE_MARKER = "[profiles.tinyctx-goal]"
 # Bump the version tag in a template's comment whenever the block content
 # changes so append_mcp_block can force-update existing installs.
 _PROVIDER_BLOCK_VERSION = "tinyctx-block-version: 1"
-_PROFILE_BLOCK_VERSION = "tinyctx-block-version: 2"
-_GOAL_PROFILE_BLOCK_VERSION = "tinyctx-block-version: 1"
+_PROFILE_BLOCK_VERSION = "tinyctx-block-version: 4"
+_GOAL_PROFILE_BLOCK_VERSION = "tinyctx-block-version: 2"
 
 _PROVIDER_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
@@ -70,13 +75,14 @@ stream_idle_timeout_ms = 300000
 
 _PROFILE_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
-# tinyctx-block-version: 2
+# tinyctx-block-version: 4
 # Activate with `codex --profile tinyctx`.
 {marker}
 model_provider = "tinyctx"
 model = "{model}"
 model_context_window = {ctx}
 model_auto_compact_token_limit = {auto_compact}
+model_reasoning_effort = "xhigh"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 features = {{ goals = true }}
@@ -84,15 +90,15 @@ features = {{ goals = true }}
 
 _GOAL_PROFILE_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
-# tinyctx-block-version: 1
+# tinyctx-block-version: 2
 # Long-running Codex goal profile. Activate with `codex --profile tinyctx-goal`.
 # This profile enables goal mode and bypasses approvals/sandboxing; use only
 # in project paths you explicitly trust.
 {marker}
 model_provider = "tinyctx"
 model = "{model}"
-model_context_window = 1050000
-model_auto_compact_token_limit = 997500
+model_context_window = {ctx}
+model_auto_compact_token_limit = {auto_compact}
 model_reasoning_effort = "high"
 plan_mode_reasoning_effort = "xhigh"
 approval_policy = "never"
@@ -112,6 +118,25 @@ def _log(msg: str) -> None:
         pass
 
 
+# Hardcoded fallbacks used when the tinyctx config file is absent / unreadable.
+_FALLBACK_CTX = 400000
+_FALLBACK_AUTO_COMPACT = 64000
+_FALLBACK_GOAL_AUTO_COMPACT = 997500
+
+
+def _local_model_config() -> tuple[int, float] | None:
+    """Return (context_window, context_safe_fraction) from [local] config,
+    or None when the config is unavailable or unconfigured."""
+    try:
+        from .config import load_config
+        cfg = load_config()
+        if cfg.local.context_window > 0:
+            return (cfg.local.context_window, cfg.local.context_safe_fraction)
+    except Exception:
+        pass
+    return None
+
+
 def _proxy_url() -> str:
     return os.environ.get("TINYCTX_PROXY_URL", "http://127.0.0.1:4141/v1")
 
@@ -121,19 +146,36 @@ def _profile_model() -> str:
 
 
 def _profile_context() -> int:
-    raw = os.environ.get("TINYCTX_PROFILE_CONTEXT", "400000")
-    try:
-        return int(raw)
-    except ValueError:
-        return 400000
+    raw = os.environ.get("TINYCTX_PROFILE_CONTEXT", "")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    lc = _local_model_config()
+    if lc is not None:
+        return lc[0]
+    return _FALLBACK_CTX
 
 
 def _profile_auto_compact() -> int:
-    raw = os.environ.get("TINYCTX_PROFILE_AUTO_COMPACT", "64000")
-    try:
-        return int(raw)
-    except ValueError:
-        return 64000
+    raw = os.environ.get("TINYCTX_PROFILE_AUTO_COMPACT", "")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    lc = _local_model_config()
+    if lc is not None:
+        return int(lc[0] * 0.5)
+    return _FALLBACK_AUTO_COMPACT
+
+
+def _goal_auto_compact() -> int:
+    lc = _local_model_config()
+    if lc is not None:
+        return int(lc[0] * lc[1])
+    return _FALLBACK_GOAL_AUTO_COMPACT
 
 
 @dataclass
@@ -181,6 +223,8 @@ def _build_goal_profile_block() -> str:
     return _GOAL_PROFILE_BLOCK_TEMPLATE.format(
         marker=_GOAL_PROFILE_MARKER,
         model=_profile_model(),
+        ctx=_profile_context(),
+        auto_compact=_goal_auto_compact(),
     )
 
 

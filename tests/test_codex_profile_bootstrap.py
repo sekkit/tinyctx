@@ -25,6 +25,7 @@ def isolated_home(monkeypatch):
         home = Path(td)
         monkeypatch.setattr(cpb, "TINYCTX_HOME", home)
         monkeypatch.setattr(cpb, "LOG_FILE", home / "logs" / "boot.log")
+        monkeypatch.setenv("TINYCTX_CONFIG", str(home / "nonexistent.toml"))
         codex = home / ".codex" / "config.toml"
         monkeypatch.setattr(cpb, "CODEX_CONFIG_DEFAULT", codex)
         yield home, codex
@@ -49,8 +50,11 @@ def test_bootstrap_writes_both_blocks(isolated_home):
     assert "[profiles.tinyctx-goal]" in content
     assert 'base_url = "http://127.0.0.1:4141/v1"' in content
     assert 'model_provider = "tinyctx"' in content
+    # Both profiles derive context_window from the same [local] config
+    # source; when config is unavailable both use the same fallback.
     assert "model_context_window = 400000" in content
-    assert "model_context_window = 1050000" in content
+    # Goal auto-compact uses the higher safe_fraction-based fallback.
+    assert "model_auto_compact_token_limit = 997500" in content
     assert "features = { goals = true }" in content
 
 
@@ -256,7 +260,7 @@ def test_bootstrap_updates_stale_profile_with_l1_fields(isolated_home):
     assert "approval_policy = \"never\"" in text
     assert "sandbox_mode = \"danger-full-access\"" in text
     assert "features = { goals = true }" in text
-    assert "tinyctx-block-version: 2" in text
+    assert "tinyctx-block-version: 4" in text
     # No duplicate markers
     assert text.count("[profiles.tinyctx]") == 1
     assert text.count("[model_providers.tinyctx]") == 1
