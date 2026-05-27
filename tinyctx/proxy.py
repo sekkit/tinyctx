@@ -2010,6 +2010,7 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                 retry_on_local_4xx_escalate_frontier=CFG.retry_on_local_4xx_escalate_frontier,
                 retry_on_frontier_4xx=CFG.retry_on_frontier_4xx,
                 retry_after_s=retry_after,
+                requested_model=(body.get("model", "") if isinstance(body, dict) else ""),
             )
             retry_state.last_action = action
             _record_adaptive_outcome(
@@ -2087,6 +2088,17 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     except Exception:  # noqa: BLE001 — escalation hint is next-turn optimization
                         pass
                 retry_state.record_escalation()
+            if action.decision == "retry_downgrade":
+                if isinstance(new_body, dict) and action.downgrade_model:
+                    new_body = dict(new_body)
+                    new_body["model"] = action.downgrade_model
+                    _log("model_downgraded",
+                         session=sid,
+                         from_model=cur_body.get("model") if isinstance(cur_body, dict) else "?",
+                         to_model=action.downgrade_model,
+                         reason=action.reason,
+                         attempt=retry_state.attempts_used,
+                         request_id=trace.request_id if trace is not None else "")
             if new_decision.route != cur_decision.route:
                 await client.aclose()
                 client = httpx.AsyncClient(
@@ -2210,6 +2222,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         translator = StreamTranslator(
             valid_tool_names=valid_names,
             flattened_tool_args=flattened_tool_args,
+            erg_key=erg_key,
         )
     else:
         translator = None

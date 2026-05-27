@@ -419,6 +419,19 @@ class StreamTranslator:
     # before codex sees it.
     flattened_tool_args: dict[str, set[str]] | None = None
     _pending_structured_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Session key for clearing force_frontier after advisor auto-pick.
+    erg_key: str = ""
+
+    def _clear_force_frontier(self) -> None:
+        """After advisor auto-selects, consume any pending force_frontier
+        flag so the guard pipeline doesn't re-trigger an infinite loop."""
+        if not self.erg_key:
+            return
+        try:
+            from . import empty_response_guard as _erg
+            _erg.consume_force_frontier(self.erg_key)
+        except Exception:
+            pass
 
     # ────────── public API ──────────
 
@@ -1465,6 +1478,7 @@ class ChatToResponsesTranslator:
         _text_choice = _try_auto_answer_text_choice(self._text_buf)
         if _text_choice is not None:
             self._text_buf += _text_choice
+            self._clear_force_frontier()
         else:
             # Layer 2/3 cascade: if the regex layers didn't catch this
             # message AND the model emitted no tool calls AND the text is
@@ -1504,6 +1518,7 @@ class ChatToResponsesTranslator:
                     _cont = _ask_advisor_for_continuation(self._text_buf, _opts)
                     if _cont is not None:
                         self._text_buf += _cont
+                        self._clear_force_frontier()
 
         yield self._sse("response.output_text.done", {
             "type": "response.output_text.done",

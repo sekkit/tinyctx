@@ -39,7 +39,12 @@ from typing import Literal
 # ─── Public types ─────────────────────────────────────────────────────────
 
 
-RetryDecision = Literal["retry_same", "retry_escalate", "propagate"]
+RetryDecision = Literal["retry_same", "retry_escalate", "retry_downgrade", "propagate"]
+
+# Frontier model fallback chain for capacity errors (503/502/504).
+# When the current model is at capacity, the proxy retries with the next
+# model in the list. gpt-5.3 is the last stop — no further fallback.
+_FRONTIER_DOWNGRADE_CHAIN = ["gpt-5.5", "gpt-5.4", "gpt-5.3"]
 
 
 @dataclass(frozen=True)
@@ -47,12 +52,12 @@ class RetryAction:
     """The classifier's verdict.
 
     decision:
-      retry_same     — retry the same backend (same url, same body).
-                       Increments `attempts_remaining_same`.
-      retry_escalate — switch to frontier on the next attempt.
-                       Should also set force_next_to_frontier so codex's
-                       subsequent retries land on frontier too.
-      propagate      — give up; surface the error to codex as-is.
+      retry_same      — retry the same backend (same url, same body).
+                        Increments `attempts_remaining_same`.
+      retry_escalate  — switch to frontier on the next attempt.
+      retry_downgrade — retry frontier with a lower-tier model (capacity
+                        fallback). `downgrade_model` carries the target.
+      propagate       — give up; surface the error to codex as-is.
 
     reason: short human-readable string, included in retry_attempted log
             event and forensics dump.
@@ -64,11 +69,15 @@ class RetryAction:
                           proxy passes to force_next_to_frontier(...) so
                           the NEXT turn from codex (not just this one)
                           also routes frontier-side.
+
+    downgrade_model: when decision == retry_downgrade, the model name to
+                     substitute in the request body before retrying.
     """
     decision: RetryDecision
     reason: str
     backoff_s: float = 0.0
     escalate_flag_reason: str = ""
+    downgrade_model: str = ""
 
 
 # ─── Classifier ───────────────────────────────────────────────────────────
@@ -86,6 +95,21 @@ _PERMANENT_FRONTIER_4XX = frozenset({401, 403, 404})
 _ESCALATABLE_LOCAL_4XX = frozenset({400, 422})
 
 
+# 5xx codes where retrying the same backend is pointless — escalate immediately.
+_LOCAL_IMMEDIATE_ESCALATE_5XX = frozenset({503, 502, 504})
+
+
+def _next_downgrade_model(current: str) -> str | None:
+    """Return the next model in the frontier downgrade chain, or None."""
+    try:
+        idx = _FRONTIER_DOWNGRADE_CHAIN.index(current)
+        if idx + 1 < len(_FRONTIER_DOWNGRADE_CHAIN):
+            return _FRONTIER_DOWNGRADE_CHAIN[idx + 1]
+    except ValueError:
+        pass
+    return None
+
+
 def classify_failure(
     *,
     route: str,
@@ -98,6 +122,7 @@ def classify_failure(
     retry_on_local_4xx_escalate_frontier: bool = True,
     retry_on_frontier_4xx: bool = False,
     retry_after_s: float = 0.0,
+    requested_model: str = "",
 ) -> RetryAction:
     """Pure classifier — returns the next action for this failure.
 
@@ -176,6 +201,10 @@ def classify_failure(
                                    escalate_flag_reason=f"retry_escalate_4xx_{s}")
             return RetryAction("propagate", f"local_{s}_escalation_disabled")
         if 500 <= s < 600:
+            if s in _LOCAL_IMMEDIATE_ESCALATE_5XX:
+                return RetryAction("retry_escalate",
+                                   f"local_{s}_immediate_escalate_frontier",
+                                   escalate_flag_reason=f"retry_escalate_immediate_{s}")
             if attempts_used <= upstream_retry_count:
                 return RetryAction("retry_same",
                                    f"local_{s}_retry_same")
@@ -226,6 +255,14 @@ def classify_failure(
             escalate_flag_reason=f"retry_force_next_frontier_4xx_{s}",
         )
     if 500 <= s < 600:
+        # Capacity / unavailable: downgrade model in the frontier chain.
+        if s in (503, 502, 504) and requested_model:
+            next_model = _next_downgrade_model(requested_model)
+            if next_model:
+                return RetryAction(
+                    "retry_downgrade",
+                    f"frontier_{s}_downgrade_{requested_model}_to_{next_model}",
+                    downgrade_model=next_model)
         if attempts_used <= upstream_retry_count:
             return RetryAction("retry_same",
                                f"frontier_{s}_retry_same")
