@@ -47,8 +47,15 @@ _PROVIDER_MARKER = "[model_providers.tinyctx]"
 _PROFILE_MARKER = "[profiles.tinyctx]"
 _GOAL_PROFILE_MARKER = "[profiles.tinyctx-goal]"
 
+# Bump the version tag in a template's comment whenever the block content
+# changes so append_mcp_block can force-update existing installs.
+_PROVIDER_BLOCK_VERSION = "tinyctx-block-version: 1"
+_PROFILE_BLOCK_VERSION = "tinyctx-block-version: 2"
+_GOAL_PROFILE_BLOCK_VERSION = "tinyctx-block-version: 1"
+
 _PROVIDER_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
+# tinyctx-block-version: 1
 # Tells codex how to reach the local-first routing proxy. The proxy
 # itself is started by `scripts/start.sh` (or `tinyctx-up start`).
 {marker}
@@ -63,6 +70,7 @@ stream_idle_timeout_ms = 300000
 
 _PROFILE_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
+# tinyctx-block-version: 2
 # Activate with `codex --profile tinyctx`.
 {marker}
 model_provider = "tinyctx"
@@ -76,6 +84,7 @@ features = {{ goals = true }}
 
 _GOAL_PROFILE_BLOCK_TEMPLATE = """
 # Added by tinyctx (codex_profile_bootstrap). Safe to delete or edit.
+# tinyctx-block-version: 1
 # Long-running Codex goal profile. Activate with `codex --profile tinyctx-goal`.
 # This profile enables goal mode and bypasses approvals/sandboxing; use only
 # in project paths you explicitly trust.
@@ -184,21 +193,24 @@ def patch_codex_config(*, config_path: Path = CODEX_CONFIG_DEFAULT,
 
     ok1, msg1 = append_mcp_block(
         config_path, _PROVIDER_MARKER,
-        _build_provider_block(), dry_run=dry_run)
+        _build_provider_block(), dry_run=dry_run,
+        version_tag=_PROVIDER_BLOCK_VERSION)
     msgs.append(f"provider: {msg1}")
     if not ok1:
         overall_ok = False
 
     ok2, msg2 = append_mcp_block(
         config_path, _PROFILE_MARKER,
-        _build_profile_block(), dry_run=dry_run)
+        _build_profile_block(), dry_run=dry_run,
+        version_tag=_PROFILE_BLOCK_VERSION)
     msgs.append(f"profile: {msg2}")
     if not ok2:
         overall_ok = False
 
     ok3, msg3 = append_mcp_block(
         config_path, _GOAL_PROFILE_MARKER,
-        _build_goal_profile_block(), dry_run=dry_run)
+        _build_goal_profile_block(), dry_run=dry_run,
+        version_tag=_GOAL_PROFILE_BLOCK_VERSION)
     msgs.append(f"goal profile: {msg3}")
     if not ok3:
         overall_ok = False

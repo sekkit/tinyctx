@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 
 from tinyctx._codex_toml import (
     _marker_present,
+    _version_present,
     append_mcp_block,
     has_mcp_block,
     strip_mcp_block,
@@ -185,6 +186,141 @@ def test_strip_block_at_eof():
     out = strip_mcp_block(text, "[mcp_servers.last]")
     assert "[mcp_servers.last]" not in out
     assert "[mcp_servers.advisor]" in out
+
+
+# ─────────── version detection ───────────
+
+
+def test_version_present_found():
+    text = (
+        "[mcp_servers.foo]\n"
+        "# tinyctx-block-version: 2\n"
+        'type = "stdio"\n'
+    )
+    assert _version_present(text, "[mcp_servers.foo]",
+                            "tinyctx-block-version: 2") is True
+
+
+def test_version_present_not_found_when_tag_absent():
+    text = (
+        "[mcp_servers.foo]\n"
+        'type = "stdio"\n'
+    )
+    assert _version_present(text, "[mcp_servers.foo]",
+                            "tinyctx-block-version: 2") is False
+
+
+def test_version_present_different_version():
+    text = (
+        "[mcp_servers.foo]\n"
+        "# tinyctx-block-version: 1\n"
+        "type = \"stdio\"\n"
+    )
+    assert _version_present(text, "[mcp_servers.foo]",
+                            "tinyctx-block-version: 2") is False
+
+
+def test_version_present_stops_at_next_section():
+    text = (
+        "[mcp_servers.foo]\n"
+        'type = "stdio"\n'
+        "[mcp_servers.bar]\n"
+        "# tinyctx-block-version: 2\n"
+        'cmd = "x"\n'
+    )
+    assert _version_present(text, "[mcp_servers.foo]",
+                            "tinyctx-block-version: 2") is False
+
+
+def test_version_present_at_eof():
+    text = (
+        "[mcp_servers.foo]\n"
+        "# tinyctx-block-version: 2\n"
+        'type = "stdio"\n'
+    )
+    assert _version_present(text, "[mcp_servers.foo]",
+                            "tinyctx-block-version: 2") is True
+
+
+# ─────────── append with version_tag ───────────
+
+
+def test_append_version_updates_stale_block(tmp_path):
+    """Old block without version tag → replaced with current."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "[mcp_servers.foo]\n"
+        'type = "old"\n'
+        "\n"
+        "[mcp_servers.bar]\n"
+        'cmd = "keep"\n'
+    )
+    new_block = (
+        "\n# tinyctx-block-version: 2\n"
+        "[mcp_servers.foo]\n"
+        'type = "new"\n'
+    )
+    ok, msg = append_mcp_block(
+        p, "[mcp_servers.foo]", new_block,
+        version_tag="tinyctx-block-version: 2")
+    assert ok
+    assert "updated" in msg
+    text = p.read_text()
+    assert 'type = "new"' in text
+    assert 'type = "old"' not in text
+    assert 'tinyctx-block-version: 2' in text
+    assert "[mcp_servers.bar]" in text
+    # No duplicate
+    assert text.count("[mcp_servers.foo]") == 1
+
+
+def test_append_version_preserves_current_block(tmp_path):
+    """Current version tag present → left alone."""
+    p = tmp_path / "config.toml"
+    original = (
+        "[mcp_servers.foo]\n"
+        "# tinyctx-block-version: 2\n"
+        'type = "customized"\n'
+    )
+    p.write_text(original)
+    new_block = (
+        "\n# tinyctx-block-version: 2\n"
+        "[mcp_servers.foo]\n"
+        'type = "factory"\n'
+    )
+    ok, msg = append_mcp_block(
+        p, "[mcp_servers.foo]", new_block,
+        version_tag="tinyctx-block-version: 2")
+    assert ok
+    assert "already configured" in msg
+    assert p.read_text() == original
+
+
+def test_append_version_dry_run_update(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[mcp_servers.foo]\ntype = \"old\"\n")
+    ok, msg = append_mcp_block(
+        p, "[mcp_servers.foo]", "block",
+        version_tag="tinyctx-block-version: 2",
+        dry_run=True)
+    assert ok
+    assert "DRY-RUN" in msg
+    assert "update" in msg.lower()
+    # File unchanged
+    assert p.read_text() == "[mcp_servers.foo]\ntype = \"old\"\n"
+
+
+def test_append_without_version_tag_backward_compat(tmp_path):
+    """version_tag=None preserves old behavior: marker present → skip."""
+    p = tmp_path / "config.toml"
+    p.write_text("[mcp_servers.foo]\ntype = \"old\"\n")
+    snap = p.read_text()
+    ok, msg = append_mcp_block(
+        p, "[mcp_servers.foo]",
+        "[mcp_servers.foo]\ntype = \"new\"\n")
+    assert ok
+    assert "already configured" in msg
+    assert p.read_text() == snap
 
 
 if __name__ == "__main__":

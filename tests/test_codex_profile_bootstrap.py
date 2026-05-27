@@ -150,7 +150,9 @@ def test_uninstall_preserves_other_blocks(isolated_home):
 def test_partial_existing_only_provider(isolated_home):
     """If the user already has [model_providers.tinyctx] (e.g. they once
     pasted manually) but is missing [profiles.tinyctx], the bootstrap
-    should add only the missing one."""
+    should add the missing one. Because the existing provider block
+    carries no version tag it is force-updated to the current template
+    (idempotent — the new block is functionally equivalent)."""
     _, codex = isolated_home
     codex.parent.mkdir(parents=True, exist_ok=True)
     codex.write_text(
@@ -162,8 +164,9 @@ def test_partial_existing_only_provider(isolated_home):
     text = codex.read_text()
     assert text.count("[model_providers.tinyctx]") == 1
     assert text.count("[profiles.tinyctx]") == 1
-    # Existing block is preserved verbatim
-    assert 'name = "manually pasted"' in text
+    # Old unversioned block is replaced with current (version tag present).
+    assert "tinyctx-block-version: 1" in text
+    assert "wire_api = \"responses\"" in text
 
 
 def test_main_install_then_status(isolated_home, capsys):
@@ -226,3 +229,34 @@ def test_default_profile_ships_with_l1_features(isolated_home):
     assert default["features"]["goals"] is True
     assert default["approval_policy"] == "never"
     assert default["sandbox_mode"] == "danger-full-access"
+
+
+def test_bootstrap_updates_stale_profile_with_l1_fields(isolated_home):
+    """Existing [profiles.tinyctx] without L1 fields (v1 or unversioned)
+    is force-updated to include features.goals, approval_policy, and
+    sandbox_mode — so existing installs pick up goal mode automatically."""
+    _, codex = isolated_home
+    codex.parent.mkdir(parents=True, exist_ok=True)
+    # Simulate a v1 install: marker present, no version tag, no L1 fields
+    codex.write_text(
+        "[model_providers.tinyctx]\n"
+        'name = "tinyctx local-first router"\n'
+        'base_url = "http://127.0.0.1:4141/v1"\n'
+        'wire_api = "responses"\n'
+        "\n"
+        "[profiles.tinyctx]\n"
+        'model_provider = "tinyctx"\n'
+        'model = "tinyctx-auto"\n'
+        "model_context_window = 400000\n"
+        "model_auto_compact_token_limit = 64000\n"
+    )
+    report = cpb.bootstrap(codex_config=codex)
+    assert report.success
+    text = codex.read_text()
+    assert "approval_policy = \"never\"" in text
+    assert "sandbox_mode = \"danger-full-access\"" in text
+    assert "features = { goals = true }" in text
+    assert "tinyctx-block-version: 2" in text
+    # No duplicate markers
+    assert text.count("[profiles.tinyctx]") == 1
+    assert text.count("[model_providers.tinyctx]") == 1

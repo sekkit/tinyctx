@@ -77,14 +77,46 @@ def _marker_present(text: str, marker: str) -> bool:
     return False
 
 
+def _version_present(text: str, marker: str, version_tag: str) -> bool:
+    """Check if `version_tag` appears in the block headed by `marker`.
+
+    Scans both the comment lines above the marker (where tinyctx places
+    the version tag) and the content lines below until the next
+    `[section]` header or EOF."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == marker:
+            # Scan backward through comment lines above the marker.
+            j = i - 1
+            while j >= 0 and lines[j].lstrip().startswith("#"):
+                if version_tag in lines[j]:
+                    return True
+                j -= 1
+            # Scan forward through content until next section or EOF.
+            for k in range(i + 1, len(lines)):
+                stripped = lines[k].strip()
+                if stripped.startswith("[") and "]" in stripped:
+                    return False
+                if version_tag in lines[k]:
+                    return True
+            return False
+    return False
+
+
 def append_mcp_block(
     path: Path,
     marker: str,
     block: str,
     *,
     dry_run: bool = False,
+    version_tag: str | None = None,
 ) -> tuple[bool, str]:
     """Idempotently append `block` to `path` when `marker` is absent.
+
+    When `version_tag` is provided and the marker is already present,
+    checks whether the installed block carries the expected version tag.
+    If it doesn't, the old block is stripped and the new one appended
+    — so template changes ship automatically to existing installs.
 
     Holds an exclusive POSIX file lock on `<path>.tinyctx-lock` for the
     full check-then-write sequence so concurrent bootstrap processes
@@ -94,18 +126,30 @@ def append_mcp_block(
     try:
         with _file_lock(path):
             existed = path.is_file()
+            action = "appended"
             if existed:
                 text = path.read_text(encoding="utf-8", errors="replace")
                 if _marker_present(text, marker):
-                    return True, "already configured"
+                    if version_tag is None:
+                        return True, "already configured"
+                    if _version_present(text, marker, version_tag):
+                        return True, "already configured"
+                    action = "updated"
             if dry_run:
+                if action == "updated":
+                    return True, f"DRY-RUN would update block to {version_tag}"
                 return True, f"DRY-RUN would append to {path}"
             path.parent.mkdir(parents=True, exist_ok=True)
             if existed:
                 current = path.read_text(encoding="utf-8", errors="replace")
                 # Re-check after lock — in case another process snuck in.
                 if _marker_present(current, marker):
-                    return True, "already configured (after-lock recheck)"
+                    if version_tag is None:
+                        return True, "already configured (after-lock recheck)"
+                    if _version_present(current, marker, version_tag):
+                        return True, "already configured (after-lock recheck)"
+                    current = strip_mcp_block(current, marker)
+                    action = "updated"
                 if not current.endswith("\n"):
                     current += "\n"
                 path.write_text(current + block, encoding="utf-8")
@@ -113,7 +157,7 @@ def append_mcp_block(
                 path.write_text(block.lstrip(), encoding="utf-8")
     except OSError as e:
         return False, f"write failed: {e}"
-    return True, f"appended block to {path}"
+    return True, f"{action} block to {path}"
 
 
 def strip_mcp_block(text: str, marker: str) -> str:
