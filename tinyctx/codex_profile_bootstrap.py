@@ -69,6 +69,9 @@ model_provider = "tinyctx"
 model = "{model}"
 model_context_window = {ctx}
 model_auto_compact_token_limit = {auto_compact}
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+features = {{ goals = true }}
 """
 
 _GOAL_PROFILE_BLOCK_TEMPLATE = """

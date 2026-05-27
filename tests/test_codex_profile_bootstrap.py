@@ -203,3 +203,26 @@ def test_install_then_codex_can_resolve_profile(isolated_home):
     assert goal_profile["model_provider"] == "tinyctx"
     assert goal_profile["features"]["goals"] is True
     assert parsed["model_providers"]["tinyctx"]["wire_api"] == "responses"
+
+
+def test_default_profile_ships_with_l1_features(isolated_home):
+    """The default [profiles.tinyctx] block ships with the same L1 fields
+    as tinyctx-goal: features.goals=true + approval_policy="never" +
+    sandbox_mode="danger-full-access".
+
+    Why: tinyctx is operated as an autonomous local-first agent runner.
+    Approval prompts and sandbox restrictions would break the
+    self-classify / advisor escalation flow. Users who need guards
+    should override these fields in a derived profile.
+    """
+    _, codex = isolated_home
+    cpb.bootstrap(codex_config=codex)
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore[import-not-found]
+    parsed = tomllib.loads(codex.read_text())
+    default = parsed["profiles"]["tinyctx"]
+    assert default["features"]["goals"] is True
+    assert default["approval_policy"] == "never"
+    assert default["sandbox_mode"] == "danger-full-access"
