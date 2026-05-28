@@ -850,6 +850,20 @@ _CHOICE_OPTION_LINE_RE = re.compile(
 )
 
 
+_CONTINUE_KEYWORDS = frozenset([
+    "继续", "continue", "proceed", "keep", "yes", "是", "确认", "go", "start",
+])
+
+
+def _pick_continue_option(options: list[str]) -> str | None:
+    """Return the first option that semantically means 'continue', or None."""
+    for opt in options:
+        low = opt.lower()
+        if any(kw in low for kw in _CONTINUE_KEYWORDS):
+            return opt
+    return None
+
+
 def _detect_text_choice_prompt(text: str) -> dict[str, list[str]] | None:
     """Detect a multi-choice prompt at the END of an assistant message
     (model wrote 'pick A or B' as plain text instead of calling
@@ -1070,11 +1084,12 @@ def _ask_advisor_for_continuation(text: str, options: list[str]) -> str | None:
                      + text[-2000:]),
         )
     except Exception:  # noqa: BLE001 — advisor is optional
-        # Why: advisor call failed (timeout, network, frontier outage).
-        # Returning None lets the original stream pass through unmodified.
-        return None
+        result = {}
     if result.get("error") or not result.get("text"):
-        return None
+        # Advisor unavailable — auto-select rather than leaving model stuck.
+        chosen = _pick_continue_option(options) or (options[0] if options else "继续")
+        return (f"\n\n[auto-decision — advisor unavailable, defaulted to continue]\n"
+                f"Chosen: {chosen}\n")
     advice = result["text"].strip()
     return f"\n\n[advisor auto-decision — classifier-detected]\n{advice}\n"
 
@@ -1187,11 +1202,17 @@ def _try_auto_answer_user_input(arguments_json: str) -> str | None:
                     "instead of bubbling up to Codex.app's UI.",
         )
     except Exception:  # noqa: BLE001 — advisor is optional
-        # Why: advisor unavailable — fall back to letting codex emit
-        # the UI prompt for the user to click.
-        return None
+        result = {}
     if result.get("error") or not result.get("text"):
-        return None
+        # Advisor unavailable — auto-select rather than bubbling up to user.
+        # Priority: pick any "继续/continue/proceed/yes" option, else first.
+        all_opts = []
+        for q in questions:
+            if isinstance(q, dict):
+                all_opts.extend(q.get("options") or [])
+        chosen = _pick_continue_option(all_opts) or (all_opts[0] if all_opts else "继续")
+        return (f"\n\n[auto-decision — advisor unavailable, defaulted to continue]\n"
+                f"Chosen: {chosen}\n")
     advice = result["text"].strip()
     return f"\n\n[advisor auto-decision — TINYCTX_AUTO_USER_INPUT=1]\n{advice}\n"
 

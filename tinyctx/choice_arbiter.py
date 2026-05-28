@@ -1,6 +1,6 @@
 """Choice Arbiter: when the model asks the user "A or B?", intercept and
-auto-decide via advisor, then inject advisor's choice as a synthetic user
-reply on the next request.
+auto-decide via multi-agent debate, then inject the verdict as a synthetic
+user reply on the next request.
 
 Why this exists
 ───────────────
@@ -11,24 +11,29 @@ know which option was picked, so it asks again. Loop.
 
 The choice arbiter closes the loop:
   1. Judge (local model): "is this a choice-ask? extract the options."
-  2. Advisor (frontier model): "given these options + context, pick one."
-  3. Store verdict in session_state.
-  4. Next request: ChoiceArbiterGuard injects advisor's pick as a
+  2. Debate (3 local model personas in parallel): each role advocates for
+     one option from a different angle (pragmatist / analyst / skeptic).
+  3. Synthesis judge (local model): reads all 3 drafts, picks the winner.
+  4. Store verdict in session_state.
+  5. Next request: ChoiceArbiterGuard injects the chosen option as a
      synthetic user message at the tail of body.input.
 
-The model sees the user "reply" with the advisor's decision and continues
+The model sees the user "reply" with the consensus decision and continues
 without re-asking. The judge step uses a model (not hardcoded keywords)
 so it's language- and phrasing-agnostic.
 
 Cost
 ────
-Judge: one local-model call (~300 tokens, ~200ms). Advisor: one frontier
-call (~500-1000 tokens, ~2-5s). Both only fire when the soft_completion
-classifier already returned high-confidence PUNT — roughly 1-2% of turns.
+Judge: one local call (~300 tokens, ~200ms).
+Debate: 3 parallel local calls (~80 tokens each, ~250ms total).
+Synthesis: one local call (~100 tokens, ~150ms).
+Total: ~600ms — much faster than the former single-frontier path.
+Falls back to single frontier advisor_decide if all local calls fail.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -52,26 +57,31 @@ session_state.register_compaction_reset(_NS, [_K_VERDICT])
 
 # ─── Judge: local model determines "is this a choice-ask?" ───────────────
 
-_JUDGE_SYSTEM_PROMPT = """You are a conversation pattern detector inside an agent gateway. Analyze the assistant's final response and determine whether the assistant is asking the user to CHOOSE BETWEEN SPECIFIC OPTIONS.
+_JUDGE_SYSTEM_PROMPT = """You are a conversation pattern detector inside an agent gateway. Analyze the assistant's final response and determine whether it requires the user to make a decision before work can continue.
 
-An "option ask" means the assistant explicitly presents 2+ concrete alternatives and asks the user to pick one. Examples:
-- "Should I use approach A or approach B?"
-- "Which library: X, Y, or Z?"
-- "Do you want me to continue with the refactor, or stop here and deploy?"
-- "Option 1: ... Option 2: ... Which do you prefer?"
+Detect TWO patterns — both require auto-decision:
 
-NOT option asks (is_choice_ask: false):
-- "What would you like to work on next?" (open-ended, no options listed)
-- "Let me know if you have questions" (not a choice)
-- "Is that OK?" (vague, no specific alternatives)
-- Single yes/no confirmations for safety-critical operations (hard block)
-- "Here are a few approaches we could take..." without asking the user to pick
-- Ambiguous intent — the assistant might continue on its own
+1. EXPLICIT CHOICE: The assistant presents 2+ concrete alternatives and asks the user to pick one.
+   Examples: "Should I use approach A or B?" / "Option 1: ... Option 2: ... Which do you prefer?"
+
+2. CONTINUATION CONFIRMATION: The assistant pauses and asks whether to continue the current task,
+   resume a previous plan, or proceed with the next step. Any form of:
+   - "请问你是想继续这个任务，还是有别的事情..." / "是否继续？" / "继续还是停止？"
+   - "Shall I proceed?" / "Do you want me to continue?" / "Should I keep going?"
+   - "Want me to start on X?" / "Ready to move to the next step?"
+   For these, generate standard options: ["继续当前任务", "停止"]
+
+NOT decision points (is_choice_ask: false):
+- "Let me know if you have questions" — not asking for a decision
+- "Is that OK?" where the agent clearly continues anyway
+- Open-ended "What would you like?" with no listed options and no prior task context
+- Ambiguous — the assistant might continue on its own without input
 
 Output EXACTLY one JSON object on a single line. No prose, no markdown:
-{"is_choice_ask": true|false, "question": "<the question being asked, verbatim or close>", "options": ["<option 1>", "<option 2>", ...], "context_summary": "<1-sentence summary of the situation>"}
+{"is_choice_ask": true|false, "question": "<the question being asked>", "options": ["<option 1>", "<option 2>", ...], "context_summary": "<1-sentence summary>"}
 
-For non-choice-asks, use: {"is_choice_ask": false, "question": "", "options": [], "context_summary": ""}"""
+For continuation confirmations, always set options to ["继续当前任务", "停止"].
+For non-choice-asks: {"is_choice_ask": false, "question": "", "options": [], "context_summary": ""}"""
 
 
 @dataclass
@@ -278,6 +288,178 @@ async def advisor_decide(
         return None
 
 
+# ─── Multi-agent debate: 3 personas + synthesis judge ───────────────────
+
+_DEBATE_PERSONAS: list[tuple[str, str]] = [
+    (
+        "pragmatist",
+        "You are the Pragmatist in a quick 3-way option debate. "
+        "Pick the option that moves the current task forward the fastest. "
+        "Bias: action over deliberation, fewest steps to goal. "
+        "Reply in EXACTLY this format:\nPICK: <option verbatim>\nREASON: <≤10 words>",
+    ),
+    (
+        "analyst",
+        "You are the Analyst in a quick 3-way option debate. "
+        "Pick the option that best matches the user's stated goal and task context. "
+        "Bias: intent alignment, what the user actually wanted when they started. "
+        "Reply in EXACTLY this format:\nPICK: <option verbatim>\nREASON: <≤10 words>",
+    ),
+    (
+        "skeptic",
+        "You are the Skeptic in a quick 3-way option debate. "
+        "Pick the safest and most reversible option. "
+        "Bias: caution, prefer options that preserve future choices. "
+        "Reply in EXACTLY this format:\nPICK: <option verbatim>\nREASON: <≤10 words>",
+    ),
+]
+
+_SYNTHESIS_SYSTEM = (
+    "You are the final judge in a 3-persona debate about which option to choose. "
+    "Rules: if 2+ agree → pick that option. If all disagree → pick Analyst's pick. "
+    "Output ONLY one line: CHOSEN: <option verbatim from the options list>"
+)
+
+_PICK_RE = re.compile(r"PICK:\s*(.+)", re.IGNORECASE)
+_CHOSEN_RE = re.compile(r"CHOSEN:\s*(.+)", re.IGNORECASE)
+
+
+async def _local_role_call(
+    client: httpx.AsyncClient,
+    local_base_url: str,
+    local_model: str,
+    api_key: str | None,
+    persona_name: str,
+    system_prompt: str,
+    question: str,
+    options: list[str],
+    context: str,
+) -> tuple[str, str]:
+    """Single local-model persona call. Returns (persona_name, pick_text)."""
+    options_text = "\n".join(f"  {i+1}. {o}" for i, o in enumerate(options))
+    user_msg = (
+        f"Question: {question}\n"
+        f"Context: {context}\n"
+        f"Options:\n{options_text}"
+    )
+    payload = {
+        "model": local_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 80,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = local_base_url.rstrip("/") + "/chat/completions"
+    try:
+        r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        text = (r.json().get("choices", [{}])[0]
+                .get("message", {}).get("content", "") or "")
+        return persona_name, text.strip()
+    except Exception:
+        return persona_name, ""
+
+
+async def debate_decide(
+    judge_result: JudgeResult,
+    *,
+    local_base_url: str,
+    local_model: str,
+    local_api_key: str | None = None,
+    debate_timeout_s: float = 15.0,
+    synthesis_timeout_s: float = 10.0,
+) -> str | None:
+    """Run 3 local-model personas in parallel, then a synthesis judge.
+    Returns the chosen option text, or None if all calls fail."""
+    if not judge_result.options:
+        return None
+    question = judge_result.question or "Which option should be chosen?"
+    context = judge_result.context_summary or ""
+    options = judge_result.options
+
+    # Phase 1: 3 personas in parallel
+    async with httpx.AsyncClient(
+            timeout=httpx.Timeout(debate_timeout_s)) as client:
+        tasks = [
+            _local_role_call(
+                client, local_base_url, local_model, local_api_key,
+                name, prompt, question, options, context,
+            )
+            for name, prompt in _DEBATE_PERSONAS
+        ]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    picks: dict[str, str] = {}  # persona_name → full response text
+    for res in raw_results:
+        if isinstance(res, Exception) or not res:
+            continue
+        pname, text = res
+        if text:
+            picks[pname] = text
+
+    if not picks:
+        return None
+
+    # Phase 2: synthesis judge reads all 3 picks
+    options_text = "\n".join(f"  {i+1}. {o}" for i, o in enumerate(options))
+    debate_summary = "".join(
+        f"[{n.upper()}]\n{t}\n\n" for n, t in picks.items()
+    )
+    synthesis_user = (
+        f"Original question: {question}\n"
+        f"Options:\n{options_text}\n\n"
+        f"Debate:\n{debate_summary}"
+    )
+    payload = {
+        "model": local_model,
+        "messages": [
+            {"role": "system", "content": _SYNTHESIS_SYSTEM},
+            {"role": "user", "content": synthesis_user},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 60,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if local_api_key:
+        headers["Authorization"] = f"Bearer {local_api_key}"
+    url = local_base_url.rstrip("/") + "/chat/completions"
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(synthesis_timeout_s)) as client:
+            r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        text = (r.json().get("choices", [{}])[0]
+                .get("message", {}).get("content", "") or "")
+        m = _CHOSEN_RE.search(text)
+        if m:
+            return m.group(1).strip()
+        return text.strip() or None
+    except Exception:
+        # Synthesis failed — fall back to majority vote from persona picks
+        option_votes: dict[str, int] = {}
+        for text in picks.values():
+            m = _PICK_RE.search(text)
+            if m:
+                pick = m.group(1).strip()
+                option_votes[pick] = option_votes.get(pick, 0) + 1
+        if option_votes:
+            return max(option_votes, key=lambda k: option_votes[k])
+        # Last resort: return analyst's pick or first option
+        for preferred in ("analyst", "pragmatist", "skeptic"):
+            if preferred in picks:
+                m = _PICK_RE.search(picks[preferred])
+                if m:
+                    return m.group(1).strip()
+        return options[0] if options else None
+
+
 # ─── Verdict storage (session_state) ────────────────────────────────────
 
 @dataclass
@@ -374,13 +556,22 @@ async def intercept(
     if not judge.options or len(judge.options) < 2:
         return None
 
-    choice = await advisor_decide(
+    # Primary: 3-persona debate (local models, parallel, ~600ms)
+    choice = await debate_decide(
         judge,
-        frontier_base_url=frontier_base_url,
-        frontier_model=frontier_model,
-        api_key=frontier_api_key,
-        timeout_s=advisor_timeout_s,
+        local_base_url=local_base_url,
+        local_model=local_model,
+        local_api_key=local_api_key,
     )
+    # Fallback: single frontier advisor
+    if not choice:
+        choice = await advisor_decide(
+            judge,
+            frontier_base_url=frontier_base_url,
+            frontier_model=frontier_model,
+            api_key=frontier_api_key,
+            timeout_s=advisor_timeout_s,
+        )
     if not choice:
         return None
 

@@ -435,20 +435,23 @@ def test_auto_answer_calls_advisor_when_enabled():
         _adv.call_advisor = saved_adv
 
 
-def test_auto_answer_returns_none_on_advisor_failure():
+def test_auto_answer_defaults_to_continue_on_advisor_failure():
+    """When the advisor fails, _try_auto_answer_user_input must NOT return None
+    (which would bubble the choice up to the user). It must auto-select an option
+    so the task continues without human intervention."""
     import os as _os
     import tinyctx.advisor as _adv
     import tinyctx.tool_call_translator as _tct
     saved_env = _os.environ.get("TINYCTX_AUTO_USER_INPUT")
     saved_adv = _adv.call_advisor
     _os.environ["TINYCTX_AUTO_USER_INPUT"] = "1"
-    _adv.call_advisor = lambda **kw: {"text": "", "usage": None,
-                                      "error": "network"}
+    _adv.call_advisor = lambda **kw: {"text": "", "usage": None, "error": "network"}
     try:
         out = _tct._try_auto_answer_user_input(json.dumps({
-            "questions": [{"header": "x", "options": ["a"]}]
+            "questions": [{"header": "x", "options": ["继续当前任务", "停止"]}]
         }))
-        assert out is None
+        assert out is not None, "must auto-decide, not return None"
+        assert "继续" in out, f"should pick continue option, got: {out!r}"
     finally:
         if saved_env is None:
             _os.environ.pop("TINYCTX_AUTO_USER_INPUT", None)
