@@ -124,10 +124,9 @@ def test_router_uses_classifier_when_present():
             "input": [{"role": "user", "content": "tiny request"}],
         }
         d = router_mod.decide(body, cfg)
-        # heuristic alone would say local; classifier now recommends advisor only.
-        assert d.route == "local"
+        # heuristic alone would say local; classifier escalates to frontier by default.
+        assert d.route == "frontier"
         assert "classifier" in d.reason
-        assert "advisor-only" in d.reason
     finally:
         if backup is None:
             mp.unlink()
@@ -137,11 +136,11 @@ def test_router_uses_classifier_when_present():
         router_mod._CLASSIFIER_LOADED = False
 
 
-def test_config_self_classify_full_turn_frontier_default_off():
-    """The optional trained classifier is advisor-only unless legacy mode is set."""
+def test_config_self_classify_full_turn_frontier_default_on():
+    """The optional trained classifier escalates to frontier by default."""
     from tinyctx.config import Config
     cfg = Config()
-    assert cfg.self_classify_escalates_to_frontier is False
+    assert cfg.self_classify_escalates_to_frontier is True
 
 
 # ---------------------------------------------------------------------------

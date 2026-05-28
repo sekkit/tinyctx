@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import unittest.mock as mock
+
 from tinyctx.advisor_continuation import (
     PendingWork,
     consume_pending_work,
@@ -65,7 +68,7 @@ def test_guard_injects_and_consumes_pending_work():
 
 def test_extract_pending_work_from_outgoing_sse_requires_advisor_markers():
     text = 'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"output":"1. Do A\\n2. Do B"}}\n\n'
-    assert extract_pending_work_from_outgoing_sse(text) == ""
+    assert asyncio.run(extract_pending_work_from_outgoing_sse(text)) == ""
 
 
 def test_extract_pending_work_from_outgoing_sse_parses_observed_shape():
@@ -74,6 +77,18 @@ def test_extract_pending_work_from_outgoing_sse_parses_observed_shape():
         'data: {"type":"response.output_item.done","item":{"name":"ask_advisor","namespace":"mcp__advisor__",'
         '"output":"1. Read official-like-compose-xr\\n2. Port native commit path\\nRisks: keep GLB uncompressed"}}\n\n'
     )
-    got = extract_pending_work_from_outgoing_sse(text)
+    mock_resp = mock.MagicMock()
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.json.return_value = {"choices": [{"message": {"content": "YES"}}]}
+    mock_client = mock.AsyncMock()
+    mock_client.post = mock.AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = mock.AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = mock.AsyncMock(return_value=None)
+    with mock.patch("httpx.AsyncClient", return_value=mock_client):
+        got = asyncio.run(extract_pending_work_from_outgoing_sse(
+            text,
+            local_base_url="http://localhost:1234",
+            local_model="test-model",
+        ))
     assert "official-like-compose-xr" in got
     assert "Port native commit path" in got

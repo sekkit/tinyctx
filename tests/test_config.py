@@ -211,7 +211,7 @@ def test_config_self_classify_defaults() -> None:
     cfg = Config()
     assert cfg.self_classify_enabled is True
     assert cfg.self_classify_threshold == 0.7
-    assert cfg.self_classify_escalates_to_frontier is False
+    assert cfg.self_classify_escalates_to_frontier is True
     assert cfg.self_classify_timeout_s == 30.0
 
 

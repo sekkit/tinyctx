@@ -33,6 +33,11 @@ file is added.
 
 - **Codex configuration patching** — TOML marker handling, profile/provider install blocks, hook registration, idempotence, dry-run, uninstall, and concurrent appends. Covered by `tests/test_codex_toml.py`, `tests/test_codex_profile_bootstrap.py`, `tests/test_scout_hook_bootstrap.py`.
 - **Advisor integration** — Advisor MCP schema, JSON-RPC handling, auth resolution, SSE accumulation, HTTP/network error surfacing, advisor bootstrap install/uninstall/status, and dynamic agent-rule injection. Covered by `tests/test_advisor.py`, `tests/test_advisor_bootstrap.py`, `tests/test_agent_rules.py`.
+- **Advisor continuation** — pending work extraction from advisor SSE output, LLM judge verdict pipeline, work injection into request body, guard firing/consuming logic, and forensics regression fixtures. Covered by `tests/test_advisor_continuation.py`, `tests/test_advisor_continuation_regression.py`.
+- **Choice arbiter** — text/thinking stripping, YES/NO verdict parsing, salvage fallback, and guard integration with stored verdict. Covered by `tests/test_choice_arbiter.py`, `tests/test_choice_arbiter_integration.py`.
+- **Multimodal preprocessing** — image-to-caption pipeline, binary detection/bootstrap, cache hits, remote-URL passthrough, and MM failure fallback. Covered by `tests/test_multimodal_preprocess.py`, `tests/test_mm_bootstrap.py`.
+- **Pydoc MCP server** — package resolution, symbol documentation, depth control, output truncation, JSON-RPC dispatch, stdio serve loop, and bootstrap install/detect. Covered by `tests/test_pydoc_mcp.py`, `tests/test_pydoc_mcp_bootstrap.py`.
+- **Response verifier** — LLM-as-verifier pipeline, background verification tasks, integration with proxy stream output, and end-to-end pipeline shape. Covered by `tests/test_verifier.py`, `tests/test_verifier_integration.py`, `tests/test_verifier_pipeline.py`.
 - **External MCP/bootstrap tooling** — graphify, serena, gitnexus, caveman, and MCP registry install/detect/config behavior. Covered by `tests/test_graphify_bootstrap.py`, `tests/test_graphify_adapter.py`, `tests/test_serena_bootstrap.py`, `tests/test_gitnexus_bootstrap.py`, `tests/test_caveman_bootstrap.py`, `tests/test_mcp_registry.py`.
 - **Tool-call translation** — XML function-call parsing, chat-to-responses rebuilds, stream translator state, unknown-tool protection, advisor auto-answer, text-choice interception, and deterministic Responses fixture replay. Covered by `tests/test_tool_call_translator.py`, `tests/test_responses_fixture_replay.py`.
 - **Orchestration and task guidance** — dynamic skill validation/rendering, orchestration injection/runtime, orchestrator config, task planning, and task supervision. Covered by `tests/test_dynamic_skill.py`, `tests/test_orchestration_injector.py`, `tests/test_orchestration_runtime.py`, `tests/test_orchestrator_config.py`, `tests/test_task_orchestrator.py`, `tests/test_task_supervisor.py`.
@@ -43,6 +48,7 @@ file is added.
 
 ## Observability and Operations
 
+- **Prompt cache extraction** — provider-specific prompt-cache token field extraction across DeepSeek, OpenAI Responses, OpenAI Chat, and Anthropic wire shapes. Covered by `tests/test_prompt_cache_extract.py`.
 - **Trace and stats** — JSONL trace emission, filters, compact/verbose rendering, quality scoring, route aggregates, and no-data behavior. Covered by `tests/test_trace.py`, `tests/test_stats.py`.
 - **Dashboard surfaces** — HTML dashboard, JSON state, aggregate rollups, recent events, manual escalation API, request-phase state, and visual configuration center APIs. Covered by `tests/test_dashboard.py`, `tests/test_dashboard_api.py`, `tests/test_dashboard_config_api.py`.
 - **Forensics capture** — request/response dumps for empty responses, punts, upstream errors, retention limits, and redaction/shape guarantees. Covered by `tests/test_forensics.py`.

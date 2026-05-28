@@ -197,7 +197,7 @@ def test_three_roles_run_in_parallel_and_judge_merges():
             ]
         }
         backend = _backend(port)
-        summary, telemetry, structured = asyncio.get_event_loop().run_until_complete(
+        summary, telemetry, structured = asyncio.new_event_loop().run_until_complete(
             compact_with_debate(body, backend)
         )
         # 3 role calls + 1 judge call

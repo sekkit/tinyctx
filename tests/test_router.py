@@ -484,12 +484,11 @@ def test_router_capacity_rule_disabled_when_safe_fraction_zero():
 
 
 def test_router_classify_rule_is_advisor_only_by_default():
-    """classify_p >= threshold recommends advisor but keeps local route."""
+    """classify_p >= threshold escalates to frontier by default (escalates_to_frontier=True)."""
     from tinyctx.router import Router
     r = Router(_make_router_cfg(self_classify_threshold=0.7))
     d = r.decide(_ctx(classify_p=0.85, classify_reason="needs strategy"))
-    assert d.route == "local"
-    assert "advisor-only" in d.reason
+    assert d.route == "frontier"
     assert "0.85" in d.reason or "self-classify" in d.reason.lower()
 
 
