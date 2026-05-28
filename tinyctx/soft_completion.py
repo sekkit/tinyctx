@@ -706,6 +706,16 @@ async def classify_at_stream_end_diag(
 
     text = _extract_text_from_buffer(raw)
     diag.extracted_text_chars = len(text)
+    # Choice-arbiter protocol short-circuit: the text-choice interceptor
+    # (tool_call_translator) embeds a structured JSON control response of
+    # the form {"await_user": true|false, "options": [...]} in the stream.
+    # This is a machine-to-machine protocol token, never a soft punt.
+    # Classify it as such so we don't trigger spurious stream rewrites that
+    # produce a feedback loop (model outputs await_user → classified as punt
+    # → synthetic continue injected → model outputs await_user again…).
+    if text.lstrip().startswith('{"await_user"'):
+        diag.skipped_reason = "await_user_protocol"
+        return diag
     # Short-text short-circuit. Two thresholds because finish=stop and
     # finish=length/incomplete have different signal density:
     #   - finish=stop: agent decided to end the turn. Even very short

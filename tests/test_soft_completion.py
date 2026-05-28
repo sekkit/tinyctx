@@ -1044,6 +1044,38 @@ def test_session_state_stores_soft_completion_under_namespace():
     assert soft_completion.get_flag("sid-int") is not None
 
 
+def test_classify_short_circuits_await_user_protocol_without_llm():
+    """choice-arbiter JSON response ({"await_user":...}) must never be
+    classified as a soft punt — it is a machine-to-machine protocol token,
+    not a natural-language statement of intent.  Regression for the loop
+    where the model repeatedly emitted await_user:false and the classifier
+    kept triggering stream rewrites (forensics: 20260528-144*-punt_via_*).
+    """
+    from tinyctx import soft_completion
+    soft_completion.reset_state()
+    # Use Chat-Completions SSE format with properly JSON-escaped content so
+    # _TEXT_DELTA_RE can extract the delta and reconstruct the await_user text.
+    # Raw inner quotes must be escaped (\" inside the JSON string value).
+    sse = (
+        'data: {"choices":[{"delta":{"content":'
+        '"{\\\"await_user\\\": false, \\\"options\\\": []}"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+    )
+    soft_completion.accumulate_chunk("p1", sse.encode())
+
+    # Pass an unreachable URL — LLM must NOT be called.
+    diag = asyncio.new_event_loop().run_until_complete(
+        soft_completion.classify_at_stream_end_diag(
+            "p1",
+            local_base_url="http://127.0.0.1:1/v1",
+            local_model="fake",
+            timeout_s=0.5,
+            threshold=0.7))
+    assert diag.result is None
+    assert diag.skipped_reason == "await_user_protocol"
+    assert diag.backend_error == ""
+
+
 def test_soft_completion_output_buffer_clears_on_compaction():
     """P3: output_buffer is registered for compaction reset — a stream
     fragment from before the compaction boundary is no longer relevant
