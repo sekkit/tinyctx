@@ -28,6 +28,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
@@ -104,7 +105,22 @@ from .workspace import safe_id
 
 
 CFG: Config = load_config()
-APP = FastAPI(title="tinyctx", version="0.1.0")
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    """Consolidated startup/shutdown (replaces deprecated on_event)."""
+    # ── startup ──────────────────────────────────────────────────────
+    await _start_stall_watchdog()
+    _auto_register_mcp_servers()
+    _auto_install_missing()
+    _auto_open_dashboard()
+    yield
+    # ── shutdown ─────────────────────────────────────────────────────
+    await _stop_stall_watchdog()
+
+
+APP = FastAPI(title="tinyctx", version="0.1.0", lifespan=_app_lifespan)
 
 # Mount the live dashboard at /dashboard. Five endpoints; vanilla HTML+JS;
 # zero new deps. See tinyctx/dashboard.py.
@@ -684,8 +700,7 @@ def _conversation_session_key(proj_sid: str, body: dict[str, Any]) -> str:
 _STALL_WATCHDOG_TASK: asyncio.Task | None = None
 
 
-@APP.on_event("startup")
-async def _start_stall_watchdog_on_startup() -> None:
+async def _start_stall_watchdog() -> None:
     """Spawn the mid-stream stall watchdog. On stall: set the phase,
     cancel the in-flight relay producer task (if registered), flag the
     next request to escalate to frontier, and record a forensic event.
@@ -768,8 +783,7 @@ async def _start_stall_watchdog_on_startup() -> None:
     )
 
 
-@APP.on_event("shutdown")
-async def _stop_stall_watchdog_on_shutdown() -> None:
+async def _stop_stall_watchdog() -> None:
     global _STALL_WATCHDOG_TASK
     task = _STALL_WATCHDOG_TASK
     _STALL_WATCHDOG_TASK = None
@@ -786,8 +800,7 @@ async def _stop_stall_watchdog_on_shutdown() -> None:
         pass
 
 
-@APP.on_event("startup")
-def _auto_register_mcp_servers_on_startup() -> None:
+def _auto_register_mcp_servers() -> None:
     """One-shot: detect graphify/gitnexus, register them into
     ~/.codex/config.toml. Idempotent across restarts. See mcp_registry
     module for the full contract. Toggle off via
@@ -802,8 +815,7 @@ def _auto_register_mcp_servers_on_startup() -> None:
         _log("mcp_registry_bootstrap_failed", error=str(e))
 
 
-@APP.on_event("startup")
-def _auto_install_missing_on_startup() -> None:
+def _auto_install_missing() -> None:
     """Auto-install missing components on proxy startup. Idempotent — each
     component's bootstrap skips if already installed. Toggle off via
     CFG.auto_install_missing_components = False."""
@@ -824,7 +836,6 @@ def _auto_install_missing_on_startup() -> None:
         _log("auto_install_missing_failed", error=str(e))
 
 
-@APP.on_event("startup")
 def _auto_open_dashboard() -> None:
     """Open the dashboard in the default browser on startup.
     Delayed 1.5s to let uvicorn bind the port first."""
@@ -988,6 +999,7 @@ async def responses(request: Request) -> Any:
             SelfImprovementGuard,
             SoftCompletionGate,
             StuckLoopGuard,
+            VerifierGate,
             trace_guard_results,
         )
         cwd_hdr = request.headers.get("x-codex-cwd") or ""
@@ -1007,6 +1019,8 @@ async def responses(request: Request) -> Any:
                 turn_trigger=CFG.stuck_loop_turn_trigger,
                 turn_gap=CFG.stuck_loop_turn_gap,
                 advisor_grace_s=CFG.stuck_loop_advisor_grace_s))
+        if getattr(CFG, "verifier_enabled", True):
+            active_guards.append(VerifierGate())
         if CFG.soft_completion_gate_enabled:
             active_guards.append(SoftCompletionGate())
         if getattr(CFG, "choice_arbiter_enabled", True):
@@ -1063,6 +1077,15 @@ async def responses(request: Request) -> Any:
                           proj_sid=proj_sid, turn_count=turns)
                 elif gr.additional_log.get("exception_type"):
                     _log("stuck_loop_error", session=sid, error=gr.reason)
+            elif gr.guard_name == "verifier_gate":
+                if gr.fired:
+                    _log("verifier_gate_fired", session=sid,
+                         proj_sid=proj_sid,
+                         total=gr.additional_log.get("total"),
+                         reason=gr.additional_log.get("reason"))
+                elif gr.additional_log.get("exception_type"):
+                    _log("verifier_gate_error", session=sid,
+                         error=gr.reason)
             elif gr.guard_name == "budget_reminder":
                 if gr.fired:
                     _log("budget_exhausted_reminder_injected",
@@ -1242,6 +1265,19 @@ async def responses(request: Request) -> Any:
     )
     router = Router(CFG).with_codex_auth(request.headers.get("authorization"))
     decision = router.decide(route_ctx)
+    # Downgrade to local when frontier is in cooldown (connection failures).
+    if decision.route == "frontier":
+        try:
+            from . import frontier_health as _fh
+            if _fh.is_unreachable():
+                snap = _fh.snapshot()
+                decision.route = "local"
+                decision.reason = (
+                    decision.reason
+                    + f" | frontier cooldown {snap['cooldown_remaining_s']:.0f}s"
+                    + f" ({snap['consecutive_failures']} fails)")
+        except Exception:  # noqa: BLE001
+            pass
     backend = _select_backend(decision)
 
     trace.route = decision.route
@@ -1983,7 +2019,6 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     cur_decision, ok=True, status=r.status_code,
                     session=sid)
                 _SESSION_ERROR_STREAK[sid] = 0
-                # Frontier succeeded — clear unreachable flag
                 if cur_decision.route == "frontier":
                     try:
                         from . import frontier_health as _fh
@@ -1991,6 +2026,16 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                     except Exception:  # noqa: BLE001
                         pass
                 break  # success — fall through to payload handling
+            # Frontier connection failure — track for cooldown.
+            if conn_error and cur_decision.route == "frontier":
+                try:
+                    from . import frontier_health as _fh
+                    _fh.mark_unreachable(
+                        error=str(exc),
+                        proxy=getattr(
+                            _select_backend(cur_decision), "proxy", ""))
+                except Exception:  # noqa: BLE001
+                    pass
             # Failure path — classify and decide next action.
             retry_after = 0.0
             if r is not None:
@@ -2039,7 +2084,10 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
                                    "type": "tinyctx_upstream"}},
                         status_code=502)
                 assert r is not None  # mypy/type narrowing
-                if action.escalate_flag_reason:
+                # Only escalate to frontier on server/connection errors.
+                # 4xx means the request was malformed — forcing frontier
+                # on the next turn would just propagate the bad request.
+                if action.escalate_flag_reason and not (400 <= r.status_code < 500):
                     try:
                         from . import empty_response_guard as _erg
                         _erg.force_next_to_frontier(

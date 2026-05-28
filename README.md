@@ -23,7 +23,7 @@ codex --profile tinyctx   # uses the proxy as model_provider
 
 **Request lifecycle:** pre-flight pipeline (snapshot → ctx-pack → rules → historian) → router decision (95% local, 5% frontier) → SSE relay with tool translation → post-stream safety guards (stall, empty response, stuck loop, choice arbiter) → compaction intercept (3-role debate, never hits frontier).
 
-Codex talks directly to auto-installed MCP servers in parallel: gitnexus · graphify · serena · caveman-shrink · context-mode.
+Codex talks directly to auto-installed MCP servers in parallel: gitnexus · graphify · serena · caveman-shrink · context-mode · pydoc-mcp (offline local Python docs).
 
 ## Quick start
 

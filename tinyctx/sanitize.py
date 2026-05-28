@@ -834,7 +834,7 @@ def normalize_for_chat(body: dict[str, Any], *, strip_tools: bool = False) -> di
         "stream": body.get("stream", False),
     }
     # carry over a few common knobs if present
-    for k in ("temperature", "top_p", "max_tokens", "stop"):
+    for k in ("temperature", "top_p", "max_tokens", "stop", "features"):
         if k in body:
             out[k] = body[k]
     # tool_choice and tools: only forward when strip_tools is False.

@@ -240,6 +240,29 @@ def _install_mm() -> ComponentResult:
 # ──────────────────── config-only bootstraps ───────────────────────
 
 
+def _register_pydoc_mcp() -> ComponentResult:
+    """Write [mcp_servers.pydoc] to codex config. Idempotent.
+
+    No binary install — pydoc-mcp ships in-tree (tinyctx.pydoc_mcp) so
+    registration is the only step needed."""
+    r = ComponentResult(component="pydoc-mcp")
+    from . import pydoc_mcp_bootstrap as pmb
+
+    state = pmb.detect_state()
+    if state.codex_config_has_pydoc:
+        return r
+
+    r.was_missing = True
+    report = pmb.bootstrap(dry_run=False)
+    if report.success:
+        r.installed = True
+    if report.actions:
+        r.actions = list(report.actions)
+    if not report.success:
+        r.error = "register failed (see bootstrap log for details)"
+    return r
+
+
 def _register_context_mode_config() -> ComponentResult:
     """Write [mcp_servers.context-mode] to codex config. Idempotent."""
     r = ComponentResult(component="context-mode-config")
@@ -329,6 +352,7 @@ def _register_scout_hook() -> ComponentResult:
 _INSTALLERS = [
     _install_context_mode,
     _register_context_mode_config,
+    _register_pydoc_mcp,
     _register_codex_profile,
     _register_advisor,
     _register_scout_hook,
@@ -449,6 +473,14 @@ def status_all() -> dict[str, dict[str, Any]]:
     cms = cmb.detect_state()
     results["context-mode-config"] = {
         "installed": cms.codex_config_has_context_mode,
+    }
+
+    # pydoc-mcp (offline local Python docs)
+    from . import pydoc_mcp_bootstrap as pmb
+    pms = pmb.detect_state()
+    results["pydoc-mcp"] = {
+        "installed": pms.codex_config_has_pydoc,
+        "python": pms.python_path,
     }
 
     return results

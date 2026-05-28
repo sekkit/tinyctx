@@ -791,6 +791,22 @@ class Config:
     soft_completion_short_text_threshold: int = 50
     soft_completion_stop_text_threshold: int = 1
 
+    # Output-quality verifier: post-stream LLM-as-a-Verifier quality
+    # check on LOCAL-routed responses. Scores 3 criteria (task_completion,
+    # output_quality, execution_evidence) 1–5 each. If total < threshold,
+    # the next request for this session is forced to frontier.
+    #
+    # Only applies to local-route responses (frontier self-verification
+    # would waste a second expensive call for marginal gain).
+    verifier_enabled: bool = True
+    # Total score threshold (max 15). Default 8/15 ≈ 53 % — catches
+    # clearly-deficient outputs without flagging every slightly-above-
+    # mediocre response.
+    verifier_threshold: int = 8
+    # Time budget for the verifier LLM call. Same backend as
+    # self_classify, so reuses the self_classify_timeout_s default.
+    verifier_timeout_s: float = 30.0
+
     # Stream rewriting: when soft_completion classifier returns PUNT
     # with confidence ≥ rewrite_threshold, intercept the upstream's
     # `response.completed` event, run the classifier synchronously,

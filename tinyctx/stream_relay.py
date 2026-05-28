@@ -224,11 +224,23 @@ class StreamProducer:
                                     await chunk_q.put((None, chunk))
                                 self._record_adaptive_outcome(
                                     ok=True, status=r.status_code)
+                                if self._attempt_decision.route == "frontier":
+                                    try:
+                                        from . import frontier_health as _fh
+                                        _fh.mark_reachable()
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 await chunk_q.put((_SENTINEL, None))
                                 return
                 except Exception as e:  # noqa: BLE001
                     conn_error = True
                     exc_caught = e
+                    if self._attempt_decision.route == "frontier":
+                        try:
+                            from . import frontier_health as _fh
+                            _fh.mark_unreachable(error=str(e))
+                        except Exception:  # noqa: BLE001
+                            pass
                 # Failure path.
                 if produced_chunk:
                     if exc_caught is not None:

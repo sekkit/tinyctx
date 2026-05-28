@@ -172,6 +172,8 @@ class PostStreamContext:
     started: float
     url: str
     route: str = ""
+    user_goal: str = ""  # extracted from original body before preprocessing
+    tool_summary: str = ""  # extracted from original body before preprocessing
 
 
 class PostStreamAnalyzer:
@@ -200,6 +202,7 @@ class PostStreamAnalyzer:
         classifier runs as a fire-and-forget background task."""
         self._maybe_run_self_improvement(ctx)
         self._maybe_spawn_classifier(ctx)
+        self._maybe_spawn_verifier(ctx)
         self._maybe_run_empty_response_guard(ctx)
 
     # -- self-improvement recording (synchronous) --------------------
@@ -375,6 +378,100 @@ class PostStreamAnalyzer:
         except Exception as e:  # noqa: BLE001
             self._log("soft_completion_classify_error",
                       session=ctx.proj_sid, error=str(e))
+
+    # -- output-quality verifier (background) --------------------------
+
+    def _maybe_spawn_verifier(self, ctx: PostStreamContext) -> None:
+        """Spawn the output-quality verifier as a background task.
+
+        Only runs on LOCAL-routed responses that completed successfully.
+        Frontier self-verification would waste a second expensive call for
+        marginal gain. Never raises — silent fallback on error."""
+        cfg = self._cfg
+        if not getattr(cfg, "verifier_enabled", True):
+            return
+        if ctx.route != "local":
+            return
+        if ctx.status != 200 or ctx.bytes_out <= 0 or ctx.upstream_failed:
+            return
+        try:
+            api_key = (os.environ.get(cfg.local.api_key_env)
+                       if cfg.local.api_key_env else None)
+            buffer_snapshot = _sc._OUTPUT_BUFFER.get(ctx.proj_sid, "")
+            # Body may have been translated from Responses-API "input" to
+            # Chat-Completions "messages" by the preprocessing pipeline.
+            # Check both shapes so context extraction works regardless.
+            body_items = None
+            if isinstance(ctx.body, dict):
+                body_items = (ctx.body.get("input")
+                              or ctx.body.get("messages"))
+            user_goal_snapshot = _sc.extract_user_goal(body_items)
+            tool_summary_snapshot = _sc.extract_tool_summary(body_items)
+            asyncio.create_task(
+                self._bg_verify(
+                    ctx=ctx,
+                    api_key=api_key,
+                    buffer_snapshot=buffer_snapshot,
+                    user_goal=user_goal_snapshot,
+                    tool_summary=tool_summary_snapshot,
+                ))
+        except Exception as e:  # noqa: BLE001
+            self._log("verifier_spawn_error",
+                      session=ctx.proj_sid, error=str(e))
+
+    async def _bg_verify(self, *, ctx: PostStreamContext,
+                          api_key: str | None,
+                          buffer_snapshot: str,
+                          user_goal: str,
+                          tool_summary: str) -> None:
+        cfg = self._cfg
+        self._log("verifier_started", session=ctx.proj_sid,
+                  buffer_chars_at_spawn=len(buffer_snapshot),
+                  user_goal_chars=len(user_goal),
+                  tool_summary=tool_summary[:120])
+        try:
+            from . import verifier as _vr
+            diag = await _vr.verify_at_stream_end(
+                ctx.proj_sid,
+                local_base_url=cfg.local.base_url,
+                local_model=cfg.local.model,
+                api_key=api_key,
+                timeout_s=getattr(cfg, "verifier_timeout_s", 30.0),
+                threshold=getattr(cfg, "verifier_threshold", 8),
+                raw_buffer=buffer_snapshot,
+                user_goal=user_goal,
+                tool_summary=tool_summary,
+                conv_sid=ctx.conv_sid,
+                current_route=ctx.route,
+            )
+            if diag.result is not None:
+                self._log("verifier_completed",
+                          session=ctx.proj_sid,
+                          total=diag.result.criteria.total,
+                          task_completion=diag.result.criteria.task_completion,
+                          output_quality=diag.result.criteria.output_quality,
+                          execution_evidence=(
+                              diag.result.criteria.execution_evidence),
+                          passed=diag.result.passed,
+                          reason=diag.result.reason,
+                          extracted_text_chars=diag.extracted_text_chars)
+            elif diag.skipped_reason:
+                self._log("verifier_skipped",
+                          session=ctx.proj_sid,
+                          reason=diag.skipped_reason,
+                          extracted_text_chars=diag.extracted_text_chars)
+            elif diag.backend_error:
+                self._log("verifier_backend_error",
+                          session=ctx.proj_sid,
+                          error=diag.backend_error,
+                          status=diag.backend_status)
+            else:
+                self._log("verifier_parse_failed",
+                          session=ctx.proj_sid,
+                          status=diag.backend_status,
+                          raw_preview=diag.raw_response_preview)
+        except Exception as e:  # noqa: BLE001
+            self._log("verifier_error", session=ctx.proj_sid, error=str(e))
 
     # -- empty-response guard ---------------------------------------
 

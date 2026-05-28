@@ -34,6 +34,7 @@ tinyctx-caveman = "tinyctx.caveman_bootstrap:main"
 tinyctx-scout-hook = "tinyctx.scout_hook_bootstrap:main"
 tinyctx-lingua = "tinyctx.lingua:main"
 tinyctx-context-mode = "tinyctx.context_mode_bootstrap:main"
+tinyctx-pydoc-mcp = "tinyctx.pydoc_mcp_bootstrap:main"
 tinyctx-codex-profile = "tinyctx.codex_profile_bootstrap:main"
 tinyctx-advisor-bootstrap = "tinyctx.advisor_bootstrap:main"
 

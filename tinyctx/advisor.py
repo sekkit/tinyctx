@@ -77,7 +77,9 @@ ADVISOR_BASE_URL = (
 )
 ADVISOR_MODEL = os.environ.get("TINYCTX_ADVISOR_MODEL", "tinyctx-frontier")
 ADVISOR_API_KEY = os.environ.get("TINYCTX_ADVISOR_API_KEY", "")
-ADVISOR_TIMEOUT_S = float(os.environ.get("TINYCTX_ADVISOR_TIMEOUT_S", "180"))
+ADVISOR_TIMEOUT_S = float(os.environ.get("TINYCTX_ADVISOR_TIMEOUT_S", "45"))
+ADVISOR_MAX_RETRIES = int(os.environ.get("TINYCTX_ADVISOR_MAX_RETRIES", "2"))
+ADVISOR_RETRY_DELAY_S = float(os.environ.get("TINYCTX_ADVISOR_RETRY_DELAY_S", "2.0"))
 CODEX_AUTH_PATH = os.environ.get(
     "TINYCTX_ADVISOR_CODEX_AUTH",
     os.path.expanduser("~/.codex/auth.json"),
@@ -204,10 +206,11 @@ _ADVISOR_SYSTEM_PROMPT = (
 
 def call_advisor(question: str, context: str = "",
                  previous_attempts: str = "") -> dict[str, Any]:
-    """Synchronous frontier consultation. Returns dict with `text`, `usage`,
-    `error` (None on success)."""
+    """Synchronous frontier consultation with retry. Returns dict with
+    `text`, `usage`, `error` (None on success), `attempts`."""
     if not question.strip():
-        return {"text": "[ask_advisor: empty question]", "usage": None, "error": "empty_question"}
+        return {"text": "[ask_advisor: empty question]", "usage": None,
+                "error": "empty_question", "attempts": 0}
 
     user_parts = [f"## Question\n{question.strip()}"]
     if context.strip():
@@ -216,13 +219,6 @@ def call_advisor(question: str, context: str = "",
         user_parts.append(f"\n## Previous attempts\n{previous_attempts.strip()}")
     user_prompt = "\n".join(user_parts)
 
-    # Use Responses API — tinyctx proxy speaks it natively, and going
-    # through tinyctx means we get the per-request trace log entry too.
-    # codex's chatgpt backend requires both `store=false` AND `stream=true`,
-    # and also REJECTS `max_output_tokens`. The system prompt does the
-    # length bounding ("under 100 words, enumerated steps" per Anthropic's
-    # official Advisor Strategy guidance) instead. Other Responses
-    # backends (LMStudio, vLLM) also accept this minimal shape.
     payload: dict[str, Any] = {
         "model": ADVISOR_MODEL,
         "stream": True,
@@ -244,38 +240,71 @@ def call_advisor(question: str, context: str = "",
         )
 
     url = ADVISOR_BASE_URL.rstrip("/") + "/responses"
-    started = time.time()
-    try:
-        with httpx.Client(timeout=ADVISOR_TIMEOUT_S) as client:
-            with client.stream("POST", url, json=payload, headers=headers) as r:
-                if r.status_code >= 400:
-                    body_bytes = r.read()
-                    body_text = body_bytes.decode("utf-8", "replace")[:300]
-                    return {
-                        "text": f"[advisor HTTP {r.status_code}: {body_text}]",
-                        "usage": None, "error": f"http_{r.status_code}",
-                        "elapsed_s": time.time() - started,
-                    }
-                text, usage, stream_err = _consume_responses_stream(r.iter_lines())
-        elapsed = time.time() - started
-        if stream_err is not None:
-            return {
-                "text": f"[advisor stream error: {stream_err}]",
-                "usage": usage, "error": "stream_error",
+    last_error: dict[str, Any] | None = None
+
+    for attempt in range(ADVISOR_MAX_RETRIES + 1):
+        started = time.time()
+        try:
+            with httpx.Client(timeout=ADVISOR_TIMEOUT_S) as client:
+                with client.stream("POST", url, json=payload, headers=headers) as r:
+                    if r.status_code >= 500:
+                        # Server errors are transient — retry.
+                        body_bytes = r.read()
+                        body_text = body_bytes.decode("utf-8", "replace")[:300]
+                        last_error = {
+                            "text": f"[advisor HTTP {r.status_code}: {body_text}]",
+                            "usage": None, "error": f"http_{r.status_code}",
+                            "elapsed_s": time.time() - started,
+                        }
+                        continue
+                    if r.status_code >= 400:
+                        # Client errors (4xx) are not retryable.
+                        body_bytes = r.read()
+                        body_text = body_bytes.decode("utf-8", "replace")[:300]
+                        result: dict[str, Any] = {
+                            "text": f"[advisor HTTP {r.status_code}: {body_text}]",
+                            "usage": None, "error": f"http_{r.status_code}",
+                            "elapsed_s": time.time() - started,
+                            "attempts": attempt + 1,
+                        }
+                        return result
+                    text, usage, stream_err = _consume_responses_stream(r.iter_lines())
+            elapsed = time.time() - started
+            if stream_err is not None:
+                last_error = {
+                    "text": f"[advisor stream error: {stream_err}]",
+                    "usage": usage, "error": "stream_error",
+                    "elapsed_s": elapsed,
+                }
+                time.sleep(ADVISOR_RETRY_DELAY_S)
+                continue
+            result = {
+                "text": text or "[advisor returned no output_text]",
+                "usage": usage,
+                "error": None,
                 "elapsed_s": elapsed,
+                "attempts": attempt + 1,
             }
-        return {
-            "text": text or "[advisor returned no output_text]",
-            "usage": usage,
-            "error": None,
-            "elapsed_s": elapsed,
-        }
-    except httpx.HTTPError as e:
-        return {"text": f"[advisor network error: {e}]", "usage": None,
-                "error": "network", "elapsed_s": time.time() - started}
-    except Exception as e:  # noqa: BLE001
-        return {"text": f"[advisor unexpected error: {e}]", "usage": None,
-                "error": "unexpected", "elapsed_s": time.time() - started}
+            return result
+        except httpx.HTTPError as e:
+            last_error = {
+                "text": f"[advisor network error: {e}]", "usage": None,
+                "error": "network", "elapsed_s": time.time() - started,
+            }
+            time.sleep(ADVISOR_RETRY_DELAY_S)
+            continue
+        except Exception as e:  # noqa: BLE001
+            last_error = {
+                "text": f"[advisor unexpected error: {e}]", "usage": None,
+                "error": "unexpected", "elapsed_s": time.time() - started,
+            }
+            time.sleep(ADVISOR_RETRY_DELAY_S)
+            continue
+
+    # All retries exhausted.
+    assert last_error is not None
+    last_error["attempts"] = ADVISOR_MAX_RETRIES + 1
+    return last_error
 
 
 def _consume_responses_stream(lines) -> tuple[str, dict | None, str | None]:

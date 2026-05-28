@@ -59,10 +59,15 @@ class _FakeClient:
     def __exit__(self, *a):
         return False
 
+    next_exception_always: Exception | None = None
+    # When set, raise this on EVERY stream() call (for retry tests).
+
     def stream(self, method, url, json=None, headers=None):  # noqa: A002
         type(self).last_url = url
         type(self).last_payload = json
         type(self).last_headers = headers
+        if type(self).next_exception_always is not None:
+            raise type(self).next_exception_always
         if type(self).next_exception is not None:
             exc = type(self).next_exception
             type(self).next_exception = None
@@ -88,6 +93,7 @@ def _patched_httpx():
         _FakeClient.last_headers = None
         _FakeClient.next_response = None
         _FakeClient.next_exception = None
+        _FakeClient.next_exception_always = None
 
 
 # ─────────────────────────── schema tests ────────────────────────
@@ -177,16 +183,18 @@ def test_call_advisor_http_error_surfaced():
         out = adv.call_advisor("hi", context="x")
         assert out["error"] == "http_500"
         assert "kaboom" in out["text"]
+        assert out["attempts"] == 3  # 5xx is retryable, exhausted all
 
 
 def test_call_advisor_network_error():
     import httpx
 
     with _patched_httpx() as fc:
-        fc.next_exception = httpx.ConnectError("no route")
+        fc.next_exception_always = httpx.ConnectError("no route")
         out = adv.call_advisor("hi")
         assert out["error"] == "network"
         assert "no route" in out["text"]
+        assert out["attempts"] == 3  # 2 retries + 1 initial = 3 total
 
 
 def test_call_advisor_empty_stream_returns_placeholder():
@@ -211,6 +219,7 @@ def test_call_advisor_proxy_sse_error_bubbles_up():
         out = adv.call_advisor("q")
         assert out["error"] == "stream_error"
         assert "Unsupported parameter" in out["text"]
+        assert out["attempts"] == 3  # stream error is retryable
 
 
 def test_call_advisor_payload_omits_max_output_tokens():

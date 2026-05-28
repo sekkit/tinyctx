@@ -73,6 +73,13 @@ echo "  - bootstrapping caveman-shrink (output compression MCP)"
 "$ROOT/.venv/bin/python" -m tinyctx.caveman_bootstrap install --quiet \
   || echo "    (caveman bootstrap had warnings — run tinyctx-caveman status)"
 
+# --- 3h. pydoc-mcp: in-tree, zero-network Python docs MCP server.
+#       Offline alternative to hosted doc services (context7 / DeepWiki):
+#       wraps importlib.metadata + pydoc + inspect. No npm, no API key.
+echo "  - registering pydoc-mcp (offline local Python docs MCP)"
+"$ROOT/.venv/bin/python" -m tinyctx.pydoc_mcp_bootstrap install --quiet \
+  || echo "    (pydoc-mcp bootstrap had warnings — run tinyctx-pydoc-mcp status)"
+
 # --- 3g. advisor: built-in frontier-consultation MCP (Anthropic Advisor Strategy).
 echo "  - registering advisor MCP in ~/.codex/config.toml"
 "$ROOT/.venv/bin/python" -m tinyctx.advisor_bootstrap install --quiet \
@@ -125,6 +132,7 @@ Disable any of the auto-wiring at install time:
     TINYCTX_CODEX_PROFILE_DISABLE=1   # don't write tinyctx provider/profile blocks
     TINYCTX_ADVISOR_DISABLE=1         # don't register [mcp_servers.advisor]
     TINYCTX_GITNEXUS_DISABLE=1        # don't install/register gitnexus
+    TINYCTX_PYDOC_MCP_DISABLE=1       # don't register pydoc-mcp
     TINYCTX_SCOUT_HOOK_DISABLE=1      # don't register scout SessionStart hook
     (see each tinyctx/*_bootstrap.py for the full list)
 

@@ -300,6 +300,16 @@ class ForceFrontierGuard:
             _erg.reset_state(ctx.proj_sid)
         if info is None:
             return GuardResult(guard_name=self.name, fired=False)
+        # Don't force frontier when it's in cooldown — the request
+        # would just fail and the flag would re-arm, creating a loop.
+        try:
+            from . import frontier_health as _fh
+            if _fh.is_unreachable():
+                return GuardResult(
+                    guard_name=self.name, fired=False,
+                    reason="frontier cooldown active — deferring force")
+        except Exception:  # noqa: BLE001
+            pass
         ctx.force_route = "frontier"
         return GuardResult(
             guard_name=self.name,
@@ -446,6 +456,49 @@ class StuckLoopGuard:
             body_mutated=True,
             reason=f"stuck at turn={ctx.turn_count}",
             additional_log={"turn_count": ctx.turn_count},
+        )
+
+
+class VerifierGate:
+    """Consume the output-quality verifier's force-frontier flag.
+
+    When the verifier scored the previous LOCAL response below the
+    quality threshold, force the next request to frontier so the
+    higher-quality model can correct the output.
+
+    Priority 35 -- between StuckLoopGuard (30) and SoftCompletionGate
+    (40). Quality issues should escalate before soft-completion logic
+    injects its own reminders, but after behavioral guards (stuck-loop,
+    budget) have had their say.
+    """
+
+    name = "verifier_gate"
+    priority = 35
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: compaction or forced model")
+        if ctx.force_route is not None:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason=f"skipped: force_route already={ctx.force_route}")
+        from . import verifier
+        flag = verifier.consume_flag(ctx.proj_sid)
+        if flag is None:
+            return GuardResult(guard_name=self.name, fired=False)
+        ctx.force_route = "frontier"
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            force_route="frontier",
+            reason=f"verifier: total={flag.get('total')}/15 "
+                   f"({str(flag.get('reason', '?'))[:60]})",
+            additional_log={
+                "total": flag.get("total"),
+                "reason": flag.get("reason"),
+            },
         )
 
 
