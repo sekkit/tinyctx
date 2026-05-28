@@ -1076,6 +1076,41 @@ def test_classify_short_circuits_await_user_protocol_without_llm():
     assert diag.backend_error == ""
 
 
+def test_classify_short_circuits_when_user_goal_is_await_user_protocol():
+    """When the last user message is an await_user protocol token, the model
+    is responding to a machine-generated prompt — never a soft punt.
+    Covers await_user:true (model presenting options) and await_user:false
+    (model continuing after proxy-injected resume). Regression for forensics
+    20260528-1459-punt_via_stream_rewrite-7228d718 where await_user:true in
+    the user goal triggered a false punt verdict."""
+    from tinyctx import soft_completion
+    for goal in [
+        '{"await_user": true, "options": ["继续之前的任务", "开始其他工作"]}',
+        '{"await_user": false, "options": []}',
+    ]:
+        soft_completion.reset_state()
+        # Model responds with substantive text (>50 chars) to the protocol prompt.
+        response_text = "好的，我现在继续执行之前的 PlayCover 任务，从第一步开始。"
+        sse = (
+            'data: {"choices":[{"delta":{"content":"' + response_text + '"},'
+            '"finish_reason":null}]}\n\n'
+            'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+        )
+        soft_completion.accumulate_chunk("p1", sse.encode())
+        diag = asyncio.new_event_loop().run_until_complete(
+            soft_completion.classify_at_stream_end_diag(
+                "p1",
+                local_base_url="http://127.0.0.1:1/v1",
+                local_model="fake",
+                timeout_s=0.5,
+                threshold=0.7,
+                user_goal=goal))
+        assert diag.skipped_reason == "await_user_protocol", (
+            f"expected await_user_protocol skip for user_goal={goal!r}, "
+            f"got skipped_reason={diag.skipped_reason!r}")
+        assert diag.backend_error == ""
+
+
 def test_soft_completion_output_buffer_clears_on_compaction():
     """P3: output_buffer is registered for compaction reset — a stream
     fragment from before the compaction boundary is no longer relevant

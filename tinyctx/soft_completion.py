@@ -707,13 +707,20 @@ async def classify_at_stream_end_diag(
     text = _extract_text_from_buffer(raw)
     diag.extracted_text_chars = len(text)
     # Choice-arbiter protocol short-circuit: the text-choice interceptor
-    # (tool_call_translator) embeds a structured JSON control response of
-    # the form {"await_user": true|false, "options": [...]} in the stream.
-    # This is a machine-to-machine protocol token, never a soft punt.
-    # Classify it as such so we don't trigger spurious stream rewrites that
-    # produce a feedback loop (model outputs await_user → classified as punt
-    # → synthetic continue injected → model outputs await_user again…).
-    if text.lstrip().startswith('{"await_user"'):
+    # (tool_call_translator) embeds structured JSON control tokens of the
+    # form {"await_user": true|false, "options": [...]} in both the user
+    # message and the model's response stream. Two cases:
+    #
+    #  (A) Model's response IS the await_user JSON: the model is echoing
+    #      the protocol token — never a soft punt.
+    #  (B) User's last message IS an await_user JSON: the model is
+    #      responding to a protocol prompt (await_user=false → continue,
+    #      await_user=true → present options). The model's response in
+    #      this context is a protocol response, not a natural-language
+    #      punt to the user.
+    #
+    # Classify either case as "await_user_protocol" and skip the LLM call.
+    if text.lstrip().startswith('{"await_user"') or user_goal.lstrip().startswith('{"await_user"'):
         diag.skipped_reason = "await_user_protocol"
         return diag
     # Short-text short-circuit. Two thresholds because finish=stop and
