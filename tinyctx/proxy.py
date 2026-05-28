@@ -2453,8 +2453,9 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     buffer_snapshot = _sc._OUTPUT_BUFFER.get(proj_sid, "")
                     text_excerpt = _sc._extract_text_from_buffer(
                         buffer_snapshot)
-                    body_input = (body.get("input")
-                                   if isinstance(body, dict) else None)
+                    body_input = (
+                        (body.get("input") or body.get("messages"))
+                        if isinstance(body, dict) else None)
                     user_goal = _sc.extract_user_goal(body_input)
                     tracker = _sc.extract_progress_tracker(body_input)
                     tool_summary = _sc.extract_tool_summary(body_input)

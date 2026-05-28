@@ -1147,6 +1147,23 @@ def test_classify_short_circuits_when_user_goal_is_await_user_protocol():
         assert diag.backend_error == ""
 
 
+def test_extract_user_goal_from_chat_completions_messages():
+    """extract_user_goal handles Chat Completions messages list (role/content dicts).
+    Regression: proxy.py extracted body.get("input") which is None for Chat Completions,
+    so await_user JSON in body["messages"] was invisible and the await_user_protocol
+    short-circuit never fired — causing false punt verdicts on await_user responses."""
+    from tinyctx.soft_completion import extract_user_goal
+    messages = [
+        {"role": "system", "content": "You are a helper."},
+        {"role": "user", "content": "first task"},
+        {"role": "assistant", "content": "doing it"},
+        {"role": "user", "content": '{"await_user": true, "options": ["安装路径", "直接用 Xcode"]}'},
+    ]
+    goal = extract_user_goal(messages)
+    assert goal.startswith('{"await_user":'), (
+        f"expected await_user JSON, got {goal!r}")
+
+
 def test_soft_completion_output_buffer_clears_on_compaction():
     """P3: output_buffer is registered for compaction reset — a stream
     fragment from before the compaction boundary is no longer relevant
