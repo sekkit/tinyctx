@@ -122,6 +122,42 @@ def test_extract_text_no_match_returns_tail():
     assert len(text) <= 4000
 
 
+def test_extract_text_skips_function_call_argument_deltas():
+    """Responses API function_call_arguments.delta events use the same
+    "delta" field shape as output_text.delta but carry tool arguments.
+    They must be excluded to prevent garbage from polluting extracted text.
+
+    Regression for the forensics pattern where function-call-heavy streams
+    produced 35-55 chars of mixed arg fragments, misclassified as
+    'asks user which option' (20260528-150* and 20260528-151* dumps).
+    """
+    from tinyctx.soft_completion import _extract_text_from_buffer
+    buf = (
+        'data: {"type":"response.function_call_arguments.delta","delta":"FUNC_ARG_1"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"REAL_TEXT"}\n\n'
+        'data: {"type":"response.function_call_arguments.delta","delta":"FUNC_ARG_2"}\n\n'
+    )
+    text = _extract_text_from_buffer(buf)
+    assert "REAL_TEXT" in text
+    assert "FUNC_ARG_1" not in text
+    assert "FUNC_ARG_2" not in text
+
+
+def test_extract_text_function_call_only_stream_returns_empty_not_args():
+    """A function-call-only Responses API stream (no text deltas) must
+    return empty string rather than polluting the classifier with arg fragments
+    like single chars (+, n, {, }) that get mislabeled as punt indicators."""
+    from tinyctx.soft_completion import _extract_text_from_buffer
+    buf = (
+        'data: {"type":"response.function_call_arguments.delta","delta":"{"}\n\n'
+        'data: {"type":"response.function_call_arguments.delta","delta":"\\"key\\""}\n\n'
+        'data: {"type":"response.function_call_arguments.delta","delta":"}"}\n\n'
+        'data: {"type":"response.output_item.done","item":{"type":"function_call"}}\n\n'
+    )
+    text = _extract_text_from_buffer(buf)
+    assert text == ""
+
+
 # ─── accumulator ──────────────────────────────────────────────────────────
 
 

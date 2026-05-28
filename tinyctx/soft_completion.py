@@ -376,44 +376,75 @@ def _extract_finish_reason(buf: str) -> str | None:
 
 
 # ─── delta extraction from SSE-wrapped buffer ──────────────────────────────
-# Both Responses-API ({"type":"response.output_text.delta","delta":"..."})
-# and Chat-Completions ({"choices":[{"delta":{"content":"..."}}]}) emit
-# the same JSON-string-escaped content via a `delta`/`content` field.
-# Regex matches the simplest envelope; reasoning-content / tool-call
-# events are skipped (they don't carry the same field shape).
-
-_TEXT_DELTA_RE = re.compile(
-    r'"(?:delta|content)"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
-
+# Supports two SSE formats:
+#   Responses API: data: {"type":"response.output_text.delta","delta":"..."}
+#   Chat Completions: data: {"choices":[{"delta":{"content":"..."}}]}
+#
+# IMPORTANT: Responses API also uses "delta":"..." in
+# response.function_call_arguments.delta events (tool argument streaming).
+# Those must be excluded — they carry JSON fragments, not assistant text.
+# Parsing per event-type is the only reliable way to distinguish them.
 
 def _extract_text_from_buffer(buf: str) -> str:
     """Pull the assistant's text content out of an SSE-wrapped raw
-    response buffer. Handles JSON string escapes (\\n, \\", \\\\).
-    Falls back to returning the raw buffer if no delta fields match
-    (e.g. the upstream wasn't streaming JSON-shaped events)."""
+    response buffer. Parses events by type to avoid confusing
+    function_call_arguments.delta content with text output.
+    Falls back to the raw buffer tail for non-SSE content."""
     if not buf:
         return ""
-    matches = _TEXT_DELTA_RE.findall(buf)
-    if not matches:
-        # Probably non-SSE / non-JSON content. Hand it to the LLM raw —
-        # it can read SSE-wrapped or plain text.
-        return buf[-4000:]
-    pieces: list[str] = []
-    for raw in matches:
+    text_pieces: list[str] = []   # Responses API output_text.delta
+    other_pieces: list[str] = []  # Chat Completions content deltas / bare delta
+    has_responses_api = False     # saw any response.* event
+
+    for line in buf.split('\n'):
+        line = line.strip()
+        if not line.startswith('data: '):
+            continue
+        data = line[6:]
+        if not data or data == '[DONE]':
+            continue
         try:
-            # Decode JSON string escapes inside the delta.
-            decoded = json.loads(f'"{raw}"')
-            if isinstance(decoded, str):
-                pieces.append(decoded)
+            obj = json.loads(data)
         except (json.JSONDecodeError, ValueError):
-            pieces.append(raw)
-    text = "".join(pieces)
-    # Last 4KB — soft-punt signals are in the closing portion of the
-    # response, not the body. The configured local backends (DeepSeek
-    # 1M, qwen3 256K+ builds) all comfortably fit this plus the
-    # classifier system prompt; we don't optimize for tiny-context
-    # builds.
-    return text[-4000:]
+            continue
+
+        obj_type = obj.get('type', '')
+        if obj_type == 'response.output_text.delta':
+            # Responses API text delta — the only event type that carries
+            # assistant-visible text in this wire format.
+            has_responses_api = True
+            delta = obj.get('delta', '')
+            if isinstance(delta, str):
+                text_pieces.append(delta)
+        elif obj_type.startswith('response.'):
+            # All other Responses API events (function_call_arguments.delta,
+            # reasoning.delta, output_item events, etc.) — skip their content.
+            has_responses_api = True
+        else:
+            # Chat Completions format: content inside choices[].delta.content
+            for choice in obj.get('choices', []):
+                d = choice.get('delta', {})
+                if isinstance(d, dict):
+                    content = d.get('content')
+                    if isinstance(content, str):
+                        other_pieces.append(content)
+            # Bare-delta objects (no type, no choices) — non-standard but
+            # used in some test fixtures and edge-case endpoints.
+            if not obj.get('choices'):
+                delta = obj.get('delta')
+                if isinstance(delta, str):
+                    other_pieces.append(delta)
+
+    result = text_pieces or other_pieces
+    if result:
+        # Last 4KB — soft-punt signals are in the closing portion.
+        return "".join(result)[-4000:]
+    if has_responses_api:
+        # Saw Responses API events but no output_text.delta — the stream is
+        # function-call-only or reasoning-only; there is no text to classify.
+        return ""
+    # Non-SSE / unparseable content: hand the raw tail to the LLM.
+    return buf[-4000:]
 
 
 # ─── context extraction (user goal / progress tracker / tool summary) ─────
