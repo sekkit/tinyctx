@@ -52,6 +52,9 @@ secrets/
 # per-developer artifact so it stays out of the repo.
 /AGENTS.md
 
+# graphify output (generated reports and graph artifacts)
+graphify-out/
+
 # serena writes per-project state (project.yml, memories/, cache/) when
 # launched with --project-from-cwd. These are per-developer artifacts —
 # every clone should start fresh; serena auto-bootstraps them on first
