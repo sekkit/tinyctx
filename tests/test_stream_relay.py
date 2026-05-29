@@ -30,6 +30,7 @@ import httpx
 import pytest
 
 from tinyctx import stream_relay as sr
+from tinyctx import soft_completion as _sc
 from tinyctx import stall_watchdog as _sw
 
 
@@ -550,6 +551,25 @@ class TestStreamConsumer:
         assert consumer.bytes_out == len(b"hello ") + len(b"world")
         assert consumer.status == 200
         assert not consumer.upstream_failed
+
+    @pytest.mark.asyncio
+    async def test_keeps_raw_buffer_snapshot_for_post_stream(self):
+        class _SoftCfg(_FakeCfg):
+            soft_completion_gate_enabled = True
+
+        _sc.reset_state()
+        q: asyncio.Queue = asyncio.Queue()
+        await q.put((sr._STATUS, (200, None)))
+        await q.put((None, b"data: one"))
+        await q.put((None, b" two"))
+        await q.put((sr._SENTINEL, None))
+        consumer = _make_consumer(
+            chunk_q=q, keepalive_interval=10.0, cfg=_SoftCfg())
+
+        async for _ in consumer.yield_to_client():
+            pass
+
+        assert consumer.raw_buffer_snapshot == "data: one two"
 
     @pytest.mark.asyncio
     async def test_idle_keepalive_fires_when_queue_silent(self):

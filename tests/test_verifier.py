@@ -13,6 +13,7 @@ import pytest
 
 from tinyctx.verifier import (
     VerdictCriteria,
+    decide_verification_action,
     VerifyDiag,
     VerifyResult,
     _clamp,
@@ -110,6 +111,49 @@ class TestVerdictCriteria:
     def test_total_zero(self):
         c = VerdictCriteria(task_completion=0, output_quality=0, execution_evidence=0)
         assert c.total == 0
+
+
+class TestVerificationAction:
+    def test_execution_evidence_low_requests_continue_verify(self):
+        action = decide_verification_action(
+            VerdictCriteria(
+                task_completion=4,
+                output_quality=4,
+                execution_evidence=1,
+            )
+        )
+        assert action.action == "continue_verify"
+
+    def test_task_completion_low_routes_frontier_next(self):
+        action = decide_verification_action(
+            VerdictCriteria(
+                task_completion=1,
+                output_quality=4,
+                execution_evidence=4,
+            )
+        )
+        assert action.action == "frontier_next"
+
+    def test_output_quality_low_rewrites_locally_first(self):
+        action = decide_verification_action(
+            VerdictCriteria(
+                task_completion=4,
+                output_quality=1,
+                execution_evidence=4,
+            )
+        )
+        assert action.action == "local_rewrite"
+
+    def test_output_quality_repeated_low_routes_frontier(self):
+        action = decide_verification_action(
+            VerdictCriteria(
+                task_completion=4,
+                output_quality=1,
+                execution_evidence=4,
+            ),
+            previous_failures=1,
+        )
+        assert action.action == "frontier_next"
 
 
 # ── _clamp tests ─────────────────────────────────────────────────────────────
@@ -294,6 +338,26 @@ class TestVerifyAtStreamEnd:
             assert f is not None
             assert f["active"] is True
             assert f["total"] == 4
+        finally:
+            httpd.shutdown()
+
+    def test_repeated_low_output_quality_routes_frontier_second_failure(self):
+        resp = '{"task_completion": 4, "output_quality": 1, "execution_evidence": 4, "reason": "weak answer"}'
+        httpd, port = _spawn_fake_backend(resp)
+        buf = _make_sse_buffer(_LONG_TEXT)
+        try:
+            diag = _run_verify(buf, port, threshold=10)
+            assert diag.result is not None
+            first = get_flag("test_proj")
+            assert first is not None
+            assert first["action"] == "local_rewrite"
+            consume_flag("test_proj")
+
+            diag = _run_verify(buf, port, threshold=10)
+            assert diag.result is not None
+            second = get_flag("test_proj")
+            assert second is not None
+            assert second["action"] == "frontier_next"
         finally:
             httpd.shutdown()
 

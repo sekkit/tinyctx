@@ -234,7 +234,7 @@ You will receive structured context:
   - `assistant_text` — the visible text of the agent's final response.
 
 Output EXACTLY one JSON object on a single line. No prose, no markdown:
-{"soft_punt": true|false, "p": 0.0-1.0, "reason": "<≤10 words>"}
+{"soft_punt": true|false, "p": 0.0-1.0, "interrupt_kind": "none|self_answerable|choice|secret_input|external_action|human_judgement", "reason": "<≤10 words>"}
 
 ═══ Quick short-circuits (no semantic analysis needed) ═══
 
@@ -253,10 +253,11 @@ Compare the agent's claimed completion vs. what the user asked for:
   • **Implicit de-scope** — declares partial completion while saying remaining work is "follow-up / for later / when needed / can be done if you want / optional / left as exercise". Agent is unilaterally trimming scope without the user's agreement.
   • Soft hand-back — "let me know if you want me to ...", "happy to expand on ...", "feel free to ask if ..." — these signal "I'm done, you decide" without explicit "what next?" framing.
   • Natural-stopping framing — "I think we're at a good stopping point", "this seems like a reasonable place to pause" — agent self-deciding to stop.
+  • Needs user-provided secret — password / API key / token / credential required and work can continue once it is collected. Use interrupt_kind:"secret_input".
 
 **NOT SOFT-PUNT (false, p ≥ 0.7)** — the agent stopped legitimately:
   • Deliverable IS the response — user asked a question, agent answered substantively. No further work implied.
-  • Hard failure with a specific blocker — build failed / missing credential / ambiguous spec — and the agent reports concretely what the user must do.
+  • Hard failure with a specific blocker — build failed / missing external resource / ambiguous spec — and the agent reports concretely what the user must do.
   • Load-bearing clarification — the question genuinely cannot be answered from the executor's own scope (irreversible-action confirmation, conflicting requirements).
   • All progress_tracker items are completed-with-evidence (commits / test pass / build success), AND user-stated verification was executed.
   • Mid-progress status note — short text between tool calls, agent is clearly going to keep working.
@@ -286,6 +287,7 @@ class ClassifyResult:
     soft_punt: bool
     p: float
     reason: str
+    interrupt_kind: str = "none"
 
 
 _JSON_RE = re.compile(
@@ -293,6 +295,15 @@ _JSON_RE = re.compile(
 _PUNT_RE = re.compile(r'"soft_punt"\s*:\s*(true|false)')
 _P_RE = re.compile(r'"p"\s*:\s*(-?\d+(?:\.\d+)?)')
 _REASON_RE = re.compile(r'"reason"\s*:\s*"([^"]*)"')
+_INTERRUPT_KIND_RE = re.compile(r'"interrupt_kind"\s*:\s*"([^"]*)"')
+_INTERRUPT_KINDS = {
+    "none",
+    "self_answerable",
+    "choice",
+    "secret_input",
+    "external_action",
+    "human_judgement",
+}
 # Some reasoning-class local models leak <think>…</think> into content.
 # Same handling as self_classify._strip_thinking.
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -302,6 +313,46 @@ def _strip_thinking(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
     return _THINK_RE.sub("", text)
+
+
+def _normalize_interrupt_kind(
+    value: object,
+    *,
+    soft_punt: bool,
+    reason: str,
+) -> str:
+    kind = str(value or "").strip().lower()
+    if kind == "secret_input":
+        return "secret_input"
+    if not soft_punt:
+        return "none"
+    if kind in _INTERRUPT_KINDS and kind != "none":
+        return kind
+    r = (reason or "").lower()
+    if any(s in r for s in ("password", "secret", "api key", "token", "credential")):
+        return "secret_input"
+    if any(s in r for s in ("which option", "choose", "choice", "select option")):
+        return "choice"
+    if any(s in r for s in ("external action", "outside", "manual step")):
+        return "external_action"
+    if any(s in r for s in ("human judgement", "irreversible", "confirm")):
+        return "human_judgement"
+    return "self_answerable"
+
+
+def interrupt_action(interrupt_kind: str) -> str:
+    kind = str(interrupt_kind or "").strip().lower()
+    if kind == "choice":
+        return "choice"
+    if kind == "secret_input":
+        return "collect_input"
+    if kind in ("external_action", "human_judgement"):
+        return "interrupt"
+    return "continue"
+
+
+def should_continue_after_interrupt(action: str) -> bool:
+    return action in ("continue", "choice")
 
 
 def _parse_response(text: str) -> ClassifyResult | None:
@@ -318,18 +369,28 @@ def _parse_response(text: str) -> ClassifyResult | None:
             d = None
         if isinstance(d, dict):
             sp = bool(d.get("soft_punt"))
+            raw_interrupt_kind = d.get("interrupt_kind")
+            if str(raw_interrupt_kind or "").strip().lower() == "secret_input":
+                sp = True
             try:
                 p = float(d.get("p", 0.5))
             except (ValueError, TypeError):
                 p = 0.5
             p = max(0.0, min(1.0, p))
             reason = str(d.get("reason", ""))[:200]
-            return ClassifyResult(soft_punt=sp, p=p, reason=reason)
+            interrupt_kind = _normalize_interrupt_kind(
+                raw_interrupt_kind, soft_punt=sp, reason=reason)
+            return ClassifyResult(
+                soft_punt=sp, p=p, reason=reason,
+                interrupt_kind=interrupt_kind)
     # Fallback: salvage from possibly-truncated text
     m_sp = _PUNT_RE.search(text)
     if not m_sp:
         return None
     sp = m_sp.group(1) == "true"
+    m_kind = _INTERRUPT_KIND_RE.search(text)
+    if m_kind and m_kind.group(1).strip().lower() == "secret_input":
+        sp = True
     m_p = _P_RE.search(text)
     p = 0.5
     if m_p:
@@ -342,7 +403,14 @@ def _parse_response(text: str) -> ClassifyResult | None:
             pass
     m_r = _REASON_RE.search(text)
     reason = (m_r.group(1) if m_r else "[salvaged]")[:200]
-    return ClassifyResult(soft_punt=sp, p=p, reason=reason)
+    interrupt_kind = _normalize_interrupt_kind(
+        m_kind.group(1) if m_kind else None,
+        soft_punt=sp,
+        reason=reason,
+    )
+    return ClassifyResult(
+        soft_punt=sp, p=p, reason=reason,
+        interrupt_kind=interrupt_kind)
 
 
 # ─── finish_reason extraction ──────────────────────────────────────────────
@@ -384,6 +452,184 @@ def _extract_finish_reason(buf: str) -> str | None:
 # response.function_call_arguments.delta events (tool argument streaming).
 # Those must be excluded — they carry JSON fragments, not assistant text.
 # Parsing per event-type is the only reliable way to distinguish them.
+
+def _content_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") in ("text", "input_text", "output_text"):
+            txt = c.get("text") or ""
+            if isinstance(txt, str):
+                parts.append(txt)
+    return "\n".join(p for p in parts if p)
+
+
+def _extract_visible_text_from_buffer(buf: str) -> str:
+    """Pull only user-visible assistant text from an SSE buffer.
+
+    Unlike _extract_text_from_buffer, this helper never falls back to raw
+    chunks. It is used for control-flow decisions where reasoning-only
+    streams must count as empty visible output, not as raw text.
+    """
+    if not buf:
+        return ""
+    delta_pieces: list[str] = []
+    chat_pieces: list[str] = []
+    final_texts: list[str] = []
+
+    for line in buf.split('\n'):
+        line = line.strip()
+        if not line.startswith('data: '):
+            continue
+        data = line[6:]
+        if not data or data == '[DONE]':
+            continue
+        try:
+            obj = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        obj_type = obj.get('type', '')
+        if obj_type == 'response.output_text.delta':
+            delta = obj.get('delta', '')
+            if isinstance(delta, str):
+                delta_pieces.append(delta)
+        elif obj_type == 'response.output_text.done':
+            text = obj.get('text')
+            if isinstance(text, str):
+                final_texts.append(text)
+        elif obj_type == 'response.content_part.done':
+            part = obj.get('part')
+            if isinstance(part, dict) and part.get('type') == 'output_text':
+                text = part.get('text')
+                if isinstance(text, str):
+                    final_texts.append(text)
+        elif obj_type == 'response.output_item.done':
+            item = obj.get('item')
+            if isinstance(item, dict) and item.get('type') == 'message':
+                final_texts.append(_content_text(item))
+        elif obj_type == 'response.completed':
+            response = obj.get('response') or {}
+            output = response.get('output') if isinstance(response, dict) else None
+            if isinstance(output, list):
+                for item in output:
+                    if isinstance(item, dict) and item.get('type') == 'message':
+                        final_texts.append(_content_text(item))
+        else:
+            for choice in obj.get('choices', []):
+                d = choice.get('delta', {})
+                if isinstance(d, dict):
+                    content = d.get('content')
+                    if isinstance(content, str):
+                        chat_pieces.append(content)
+                msg = choice.get('message', {})
+                if isinstance(msg, dict):
+                    content = msg.get('content')
+                    if isinstance(content, str):
+                        final_texts.append(content)
+
+    for text in reversed(final_texts):
+        if text.strip():
+            return text[-4000:]
+    result = delta_pieces or chat_pieces
+    if result:
+        return "".join(result)[-4000:]
+    return ""
+
+
+def is_reasoning_only_empty_visible_response(buf: str) -> bool:
+    """True when a terminal stream has reasoning but no visible answer.
+
+    This is the same-stream auto-continue trigger. It intentionally requires
+    reasoning activity and rejects any function/tool-call signal so we do not
+    nudge legitimate tool turns or truly blank transport glitches.
+    """
+    if not buf:
+        return False
+    if _extract_visible_text_from_buffer(buf).strip():
+        return False
+
+    saw_reasoning = False
+    saw_terminal = False
+    saw_tool_call = False
+
+    for line in buf.split('\n'):
+        line = line.strip()
+        if not line.startswith('data: '):
+            continue
+        data = line[6:]
+        if data == '[DONE]':
+            saw_terminal = True
+            continue
+        if not data:
+            continue
+        try:
+            obj = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        obj_type = obj.get('type', '')
+        if obj_type == 'response.completed':
+            saw_terminal = True
+            response = obj.get('response') or {}
+            if isinstance(response, dict):
+                status = response.get('status')
+                if status in ('completed', 'incomplete'):
+                    saw_terminal = True
+                output = response.get('output')
+                if isinstance(output, list):
+                    for item in output:
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get('type')
+                        if item_type == 'reasoning':
+                            saw_reasoning = True
+                        elif item_type == 'function_call':
+                            saw_tool_call = True
+        elif obj_type.startswith('response.reasoning'):
+            saw_reasoning = True
+        elif obj_type in ('response.function_call_arguments.delta',
+                          'response.function_call_arguments.done'):
+            saw_tool_call = True
+        elif obj_type in ('response.output_item.added',
+                          'response.output_item.done'):
+            item = obj.get('item')
+            if isinstance(item, dict):
+                item_type = item.get('type')
+                if item_type == 'reasoning':
+                    saw_reasoning = True
+                elif item_type == 'function_call':
+                    saw_tool_call = True
+
+        for choice in obj.get('choices', []):
+            finish = choice.get('finish_reason')
+            if finish:
+                saw_terminal = True
+                if finish == 'tool_calls':
+                    saw_tool_call = True
+            delta = choice.get('delta', {})
+            if isinstance(delta, dict):
+                reasoning = delta.get('reasoning_content')
+                if isinstance(reasoning, str) and reasoning:
+                    saw_reasoning = True
+                if delta.get('tool_calls'):
+                    saw_tool_call = True
+            message = choice.get('message', {})
+            if isinstance(message, dict):
+                reasoning = message.get('reasoning_content')
+                if isinstance(reasoning, str) and reasoning:
+                    saw_reasoning = True
+                if message.get('tool_calls'):
+                    saw_tool_call = True
+
+    return saw_terminal and saw_reasoning and not saw_tool_call
+
 
 def _extract_text_from_buffer(buf: str) -> str:
     """Pull the assistant's text content out of an SSE-wrapped raw
@@ -910,7 +1156,7 @@ Your previous turn ended without taking action (classifier verdict: `{pattern}`)
 
 → Execute ALL the steps in sequence NOW, this turn. Use tools/commands directly.
 → Do NOT re-state the plan. Do NOT split it across more turns. Do NOT ask the user "should I proceed?".
-→ If a step genuinely cannot be executed (missing credential, ambiguous spec), STOP at that step and report which one and why — but only after you've done every step that CAN be done.
+→ If a step genuinely cannot be executed (missing external prerequisite, ambiguous spec), STOP at that step and report which one and why — but only after you've done every step that CAN be done.
 
 ═══ PATH B — your previous turn ASKED THE USER A META-QUESTION ═══
 ("what would you like next" / "options:" / "shall I continue" / equivalents)

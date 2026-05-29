@@ -179,7 +179,7 @@ CLI `tinyctx-recall`：
 
 两半：
 - **update half**：异步后台。每过 `min_new_turns` 轮触发一次，对 `items[:-recent_keep]` 调本地 LLM 压成 markdown digest + structured 侧车，落盘到 `cache/<repo>/sessions/<sid>/historian-N.md`。无副作用，可常开。
-- **apply half**（`apply_to_body`）：同步，把 body 的老 items 替换成单条 `<tinyctx-historian-digest>` system 消息。改 history 字节，**默认关闭**，需要 `historian_substitute=true` + cache-aware 门控放行。
+- **apply half**（`apply_to_body`）：同步，把 body 的老 items 替换成单条 `<tinyctx-historian-digest>` system 消息。改 history 字节，默认开启，但仍受 cache-aware 门控约束；显式 `historian_substitute=false` 可关闭。
 - 幂等：检测前 5 条里有 `_DIGEST_TAG` 就直接返回原 body
 - `spawn_update`：fire-and-forget Task，强引用计数避免 GC
 

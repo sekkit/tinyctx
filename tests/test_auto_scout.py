@@ -283,7 +283,7 @@ def test_auto_scout_defaults_to_enabled():
     from tinyctx.config import Config
     cfg = Config()
     assert cfg.auto_scout is True
-    # auto-install pipx is intrusive; default off
+    # Normal request handling must not install external packages by default.
     assert cfg.auto_scout_install_graphify is False
 
 

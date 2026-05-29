@@ -171,6 +171,77 @@ def test_parse_response_handles_missing_optional_fields():
     assert r.reason == ""
 
 
+# ─── action signature self-consistency ─────────────────────────────────────
+
+
+def test_parse_action_signature_extracts_clean_json():
+    from tinyctx.self_classify import _parse_action_signature
+    r = _parse_action_signature(
+        '{"action":"edit","target":"tinyctx/router.py",'
+        '"confidence":0.82,"reason":"route rule"}'
+    )
+    assert r is not None
+    assert r.action == "edit"
+    assert r.target == "tinyctx/router.py"
+    assert r.confidence == 0.82
+    assert r.reason == "route rule"
+
+
+def test_parse_action_signature_normalizes_unknown_action():
+    from tinyctx.self_classify import _parse_action_signature
+    r = _parse_action_signature(
+        '{"action":"PATCH","target":"","confidence":9}'
+    )
+    assert r is not None
+    assert r.action == "unknown"
+    assert r.target == "general"
+    assert r.confidence == 1.0
+
+
+def test_summarize_consistency_agrees_on_majority():
+    from tinyctx.self_classify import ActionSignature, summarize_consistency
+    result = summarize_consistency([
+        ActionSignature("edit", "tinyctx/router.py", 0.8),
+        ActionSignature("edit", "tinyctx/router.py", 0.7),
+        ActionSignature("run", "pytest", 0.6),
+    ])
+    assert result is not None
+    assert result.agreed is True
+    assert "agree edit:tinyctx/router.py 2/3" in result.reason
+
+
+def test_summarize_consistency_disagrees_without_majority():
+    from tinyctx.self_classify import ActionSignature, summarize_consistency
+    result = summarize_consistency([
+        ActionSignature("edit", "tinyctx/router.py", 0.8),
+        ActionSignature("inspect", "tinyctx/proxy.py", 0.7),
+        ActionSignature("run", "pytest", 0.6),
+    ])
+    assert result is not None
+    assert result.agreed is False
+    assert result.reason.startswith("disagree ")
+
+
+def test_summarize_consistency_ignores_unknown_general_majority():
+    from tinyctx.self_classify import ActionSignature, summarize_consistency
+    result = summarize_consistency([
+        ActionSignature("unknown", "general", 0.9),
+        ActionSignature("unknown", "general", 0.8),
+        ActionSignature("edit", "tinyctx/router.py", 0.8),
+    ])
+    assert result is None
+
+
+def test_summarize_consistency_ignores_low_confidence_majority():
+    from tinyctx.self_classify import ActionSignature, summarize_consistency
+    result = summarize_consistency([
+        ActionSignature("edit", "tinyctx/router.py", 0.2),
+        ActionSignature("edit", "tinyctx/router.py", 0.3),
+        ActionSignature("run", "pytest", 0.8),
+    ])
+    assert result is None
+
+
 # ─── _cache_key ─────────────────────────────────────────────────────────────
 
 

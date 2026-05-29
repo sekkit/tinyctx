@@ -71,6 +71,52 @@ def test_parse_salvage_fallback():
     assert r.options == ["opt1", "opt2"]
 
 
+def test_debate_personas_are_fixed_parliament_roles():
+    from tinyctx.choice_arbiter import _DEBATE_PERSONAS
+
+    assert [name for name, _ in _DEBATE_PERSONAS] == [
+        "proposer",
+        "critic",
+        "verifier",
+    ]
+
+
+def test_majority_pick_returns_none_on_parliament_stalemate():
+    from tinyctx.choice_arbiter import _majority_pick
+
+    picks = {
+        "proposer": "PICK: A\nREASON: fastest",
+        "critic": "PICK: B\nREASON: safer",
+        "verifier": "PICK: C\nREASON: testable",
+    }
+
+    assert _majority_pick(picks, ["A", "B", "C"]) is None
+
+
+def test_majority_pick_returns_consensus():
+    from tinyctx.choice_arbiter import _majority_pick
+
+    picks = {
+        "proposer": "PICK: A\nREASON: fastest",
+        "critic": "PICK: A\nREASON: safer",
+        "verifier": "PICK: B\nREASON: testable",
+    }
+
+    assert _majority_pick(picks, ["A", "B"]) == "A"
+
+
+def test_majority_pick_ignores_invalid_options():
+    from tinyctx.choice_arbiter import _majority_pick
+
+    picks = {
+        "proposer": "PICK: not an option\nREASON: no",
+        "critic": "PICK: A\nREASON: ok",
+        "verifier": "PICK: B\nREASON: ok",
+    }
+
+    assert _majority_pick(picks, ["A", "B"]) is None
+
+
 # ─── verdict store / consume ────────────────────────────────────────────
 
 def test_store_and_consume():
@@ -115,6 +161,19 @@ def test_inject_into_body_with_input():
     last = items[-1]
     assert last["role"] == "user"
     assert "pick A" in last["content"][0]["text"]
+
+
+def test_inject_into_body_with_chat_messages():
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    v = Verdict("pick A", "A or B?", ["A", "B"], 1.0)
+    new_body, ok = inject_verdict_into_body(body, v)
+
+    assert ok is True
+    assert new_body is not body
+    messages = new_body["messages"]
+    assert len(messages) == 2
+    assert messages[-1]["role"] == "user"
+    assert "pick A" in messages[-1]["content"]
 
 
 def test_inject_into_body_no_input():

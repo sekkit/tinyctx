@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -39,6 +40,56 @@ from uuid import uuid4
 # triggers, we look up the LAST request for that session and pair it
 # with the response. Bounded so memory doesn't grow unbounded.
 _REQUEST_RING: dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
+
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|secret|password|credential|authorization|private[_-]?key|"
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|bearer[_-]?token)",
+    re.IGNORECASE,
+)
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"sk-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{8,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+)
+_SENSITIVE_LINE_RE = re.compile(
+    r"(?im)^(\s*[\w.-]*(?:api[_-]?key|secret|password|credential|authorization|"
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|bearer[_-]?token)"
+    r"[\w.-]*\s*[:=]\s*)(.+)$"
+)
+_PENDING_INPUT_MARKER = "[tinyctx pending input supplied"
+_PENDING_VALUES_RE = re.compile(r"(?is)(\nValues:\n).*")
+
+
+def _redact_string(value: str) -> str:
+    out = value
+    if _PENDING_INPUT_MARKER in out.lower():
+        out = _PENDING_VALUES_RE.sub(r"\1<redacted: pending input values>", out)
+    out = _SENSITIVE_LINE_RE.sub(r"\1<redacted>", out)
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub("<redacted: secret>", out)
+    return out
+
+
+def _redact_sensitive(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return _redact_string(obj)
+    if isinstance(obj, list):
+        return [_redact_sensitive(v) for v in obj]
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            key = str(k)
+            if _SENSITIVE_KEY_RE.search(key) or key.lower() == "token":
+                out[k] = "<redacted>"
+            else:
+                out[k] = _redact_sensitive(v)
+        return out
+    return obj
 
 
 def capture_request_snapshot(
@@ -72,7 +123,9 @@ def get_recent_request(proj_sid: str) -> dict[str, Any] | None:
 def _summarize_body(body: Any) -> dict[str, Any]:
     """Capture the body in a form useful for post-mortem WITHOUT
     blowing up disk. Cap text fields, count list items, keep first
-    + last input items in full so we can see context-window contents."""
+    + last input items in full so we can see context-window contents.
+    Sensitive values are redacted before any first/last items are kept."""
+    body = _redact_sensitive(body)
     if not isinstance(body, dict):
         return {"raw": str(body)[:1000]}
     out: dict[str, Any] = {}

@@ -138,6 +138,8 @@ class RoutingView(_NSView):
       self_classify_escalates_to_frontier: Legacy mode: convert that
         cutoff into a full-turn frontier route instead of advisor-only
         telemetry. Default false to keep frontier as short consultation.
+      self_consistency_enabled: Run local action-signature samples on
+        self-classify boundary turns.
     """
 
     _FIELD_MAP = {
@@ -152,6 +154,11 @@ class RoutingView(_NSView):
         "adaptive_model_sample_size": "adaptive_model_sample_size",
         "self_classify_threshold": "self_classify_threshold",
         "self_classify_escalates_to_frontier": "self_classify_escalates_to_frontier",
+        "self_consistency_enabled": "self_consistency_enabled",
+        "self_consistency_boundary_low": "self_consistency_boundary_low",
+        "self_consistency_boundary_high": "self_consistency_boundary_high",
+        "self_consistency_sample_count": "self_consistency_sample_count",
+        "self_consistency_timeout_s": "self_consistency_timeout_s",
         "image_prefer_frontier": "image_prefer_frontier",
     }
 
@@ -456,14 +463,13 @@ class Config:
     escalate_on_error_streak: int = 2       # repeated tool-failure -> frontier (kept; Anthropic "when stuck")
     image_prefer_frontier: bool = True      # route image-bearing prompts to frontier (vision support)
 
-    # When True, the proxy replaces image attachments in body.input with
-    # text captions from `mm cat <file> -m accurate` BEFORE the router
-    # sees the body. The route then stays on local because the body no
-    # longer contains image content items — saving the frontier price
-    # for image-only turns. Default OFF: lossy (caption != original
-    # image) and requires `mm` installed via `mm_bootstrap`. See
-    # `tinyctx/multimodal_preprocess.py`.
-    image_to_text_preprocess_enabled: bool = False
+    # When True, low-risk image-to-text tasks (OCR, describe, summarize)
+    # are replaced with captions from `mm cat <file> -m accurate` BEFORE
+    # routing. Accuracy-sensitive or ambiguous image tasks keep the
+    # original image and still hit image→frontier. If `mm` is absent or
+    # captioning fails, preprocessing is a passthrough.
+    # See `tinyctx/multimodal_preprocess.py`.
+    image_to_text_preprocess_enabled: bool = True
     # Cap per-image processing time. mm `-m accurate` calls a VLM
     # endpoint; on a slow caption backend this bounds the latency added
     # per attachment.
@@ -512,13 +518,14 @@ class Config:
     #   historian_enabled     — run async update() after each turn that
     #                           crosses the threshold; persists a digest
     #                           sidecar but does NOT change what codex sees.
-    #                           Safe to leave on. Costs 1 local LLM call
-    #                           every `historian_min_new_turns` turns.
+    #                           Default ON. Costs 1 local LLM call every
+    #                           `historian_min_new_turns` turns.
     #   historian_substitute  — when fire-time mutation gate opens, replace
     #                           older turns in the body with the digest.
-    #                           Mutates history bytes → opt-in only.
-    historian_enabled: bool = False
-    historian_substitute: bool = False
+    #                           Mutates history bytes, but is guarded by
+    #                           CacheAwareMutator to preserve hot cache.
+    historian_enabled: bool = True
+    historian_substitute: bool = True
     historian_min_new_turns: int = 5
     historian_recent_keep: int = 4
 
@@ -552,8 +559,8 @@ class Config:
     # CacheAwareMutator (sanitize.py) gates them so they fire only when the
     # prompt cache is likely stale anyway, preserving cache hits in the
     # common case. Inspired by cortexkit/magic-context.
-    dedup_tool_calls: bool = False
-    purge_failed_tool_inputs: bool = False
+    dedup_tool_calls: bool = True
+    purge_failed_tool_inputs: bool = True
     failed_input_after_turns: int = 4
     # Result-level shrink: after a large tool result has sat in history for
     # N+ assistant turns, replace the bulky payload with a deterministic
@@ -658,15 +665,12 @@ class Config:
     # (b) we don't want to surprise the local model by silently dropping
     # tools mid-conversation.
     #
-    # 2026-05-10: DEFAULT FLIPPED TO FALSE per user directive ("不要 trim
-    # tools, 所有 tools 都保留"). Background: even with the
-    # spawn_agent/wait_agent essentials fix, trimming creates a class of
-    # rare-tool-starvation bugs (any tool not in `essentials` AND not in
-    # the recent window is silently invisible). User accepts the
-    # ~10k-token-per-request cost in exchange for full tool availability.
-    # To re-enable trimming, set `frontier_trim_tools = true` under
+    # 2026-05-28: DEFAULT FLIPPED TO TRUE per user directive: features
+    # should auto-enable when not configured. Essentials below keep
+    # sub-agent and user-input primitives available even before first use.
+    # To disable trimming, set `frontier_trim_tools = false` under
     # `[server]` in ~/.tinyctx/config.toml.
-    frontier_trim_tools: bool = False
+    frontier_trim_tools: bool = True
     frontier_tools_recent_window: int = 30  # how many recent input items to scan
     frontier_tools_essentials: tuple[str, ...] = (
         "shell", "apply_patch", "container.exec",
@@ -725,13 +729,22 @@ class Config:
     # truly slow ones. If your local model is non-reasoning, you can drop
     # this to 5s without losing accuracy.
     self_classify_timeout_s: float = 30.0
+    # Boundary-turn self-consistency: when the advisor classifier lands in
+    # this probability band, sample local next-action signatures. Agreement
+    # keeps the executor local; disagreement is the measured signal that
+    # justifies a frontier route.
+    self_consistency_enabled: bool = True
+    self_consistency_boundary_low: float = 0.55
+    self_consistency_boundary_high: float = 0.85
+    self_consistency_sample_count: int = 3
+    self_consistency_timeout_s: float = 20.0
 
     # Self-improvement: performance regression watchdog. Tracks per-request
     # metrics (route, status, latency, bytes) and periodically evaluates
     # against historical baselines. When degradation is detected (error rate
     # 2x baseline, latency 1.5x baseline), the SelfImprovementGuard escalates
-    # the next request to frontier. Default OFF. See tinyctx/self_improvement.py.
-    self_improvement_enabled: bool = False
+    # the next request to frontier. Default ON. See tinyctx/self_improvement.py.
+    self_improvement_enabled: bool = True
     self_improvement_eval_interval: int = 50
     self_improvement_stats_window: int = 50
 
@@ -819,7 +832,8 @@ class Config:
     # event. If codex's namespace dispatcher rejects the call (e.g.
     # the codex 0.128 "unsupported call" issue noted in
     # ~/.codex/config.toml), the rewrite would surface as an error in
-    # codex chat. Default OFF until validated against live codex.
+    # codex chat. Default ON; explicit config can disable if a codex
+    # version rejects the synthetic event shape.
     soft_completion_stream_rewrite_enabled: bool = True
     # Confidence required for the synthetic function_call rewrite.
     # Higher than the gate threshold (0.7) since the rewrite is more
@@ -1131,10 +1145,9 @@ class Config:
     # body.tools). This is the biggest per-tool token cost in the system
     # prompt — caveman rules cut verbosity while preserving code/paths/URLs.
     caveman_compress_tool_descriptions: bool = True
-    # Compress body.instructions (the system prompt). Instructions are
-    # cache-critical so this only fires when CacheAwareMutator gate is
-    # already open for this request.
-    caveman_compress_instructions: bool = False
+    # Compress body.instructions (the system prompt). Deterministic, so
+    # unconfigured installs get the shorter byte-stable prompt by default.
+    caveman_compress_instructions: bool = True
 
     # When frontier is unreachable, the proxy auto-falls-back to local
     # and injects a <system-reminder> so the model tells the user.
@@ -1150,10 +1163,9 @@ class Config:
     # tinyctx/auto_scout.py for the full pipeline.
     auto_scout: bool = True
     # When True AND `graphify` is missing on PATH, attempt a one-shot
-    # `pipx install graphifyy` during the first project bootstrap. False
-    # by default — auto-installing OS-level packages is intrusive even
-    # if the user opted into "transparent" mode. The fallback in-tree
-    # scanner works without this.
+    # `pipx install graphifyy` during the first project bootstrap. Default
+    # OFF: normal request handling must not install external packages. The
+    # fallback in-tree scanner works without graphify.
     auto_scout_install_graphify: bool = False
 
     # ctx-pack: preemptively inject top-K project files (ranked by
@@ -1184,15 +1196,11 @@ class Config:
     # result payloads before forwarding to the frontier model. Empirically
     # 2-5× compression on long contexts with no quality loss on coding/QA.
     #
-    # Default OFF because:
-    #   1. Heavy first-load (downloads ~hundreds of MB of model weights)
-    #   2. Mutates wire bytes — must be cache-aware-gated like
-    #      dedup/purge/read_delta to preserve prompt-cache hits
-    #   3. Requires `pip install 'tinyctx[compress]'` (optional dep)
-    #
-    # Opt-in path: install dep + flip this flag in config.toml. The hook
-    # will lazy-import llmlingua and gracefully no-op if missing.
-    frontier_lingua_enabled: bool = False
+    # Default ON for zero-config installs. The hook first checks whether
+    # the optional `llmlingua` package is importable; when absent it is a
+    # no-op. Compression still runs behind the same cache-aware gate as
+    # dedup/purge/read_delta.
+    frontier_lingua_enabled: bool = True
     # Compression aggressiveness. 0.5 = keep ~50% of tokens. Conservative
     # 0.6-0.7 gives 1.5-2× shrink without quality loss. Below 0.4 starts
     # losing detail.

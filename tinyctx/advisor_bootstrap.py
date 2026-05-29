@@ -97,7 +97,7 @@ _ADVISOR_AGENT_FILE_TEMPLATE = '''# Advisor agent — codex-native implementatio
 # `spawn_agent` system (multi_agent feature, stable+true) is the supported
 # path: the executor calls `spawn_agent(role="advisor", task=...)`, codex
 # starts a sub-thread bound to this config, the sub-thread runs against
-# tinyctx's frontier route, and the result is awaited via wait_agent.
+# the frontier model, and the result is awaited via wait_agent.
 #
 # Routing: model="tinyctx-frontier" is a tinyctx-recognised id that
 # bypasses the cheap-or-frontier router entirely and goes straight to the
@@ -246,7 +246,22 @@ def write_agent_file(*, config_path: Path = CODEX_CONFIG_DEFAULT,
                      dry_run: bool = False) -> tuple[bool, str]:
     path = _agent_path_for_config(config_path)
     if path.is_file():
-        return True, "advisor agent file already present"
+        try:
+            existing = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            existing = ""
+        # Migrate stale files that used the public model alias. In tinyctx
+        # routing, `gpt-5.5` is a local-first alias for main-thread traffic;
+        # advisor subthreads must use the explicit in-band frontier route.
+        if 'model = "gpt-5.5"' not in existing:
+            return True, "advisor agent file already present"
+        if dry_run:
+            return True, f"DRY-RUN would update stale advisor agent file at {path}"
+        try:
+            path.write_text(_ADVISOR_AGENT_FILE_TEMPLATE, encoding="utf-8")
+        except OSError as e:
+            return False, f"update advisor agent file failed: {e}"
+        return True, f"updated stale advisor agent file at {path} (gpt-5.5 → tinyctx-frontier)"
     if dry_run:
         return True, f"DRY-RUN would write advisor agent file to {path}"
     try:

@@ -122,6 +122,8 @@ class RouteContext:
     is_compaction: bool = False
     classify_p: float = 0.0
     classify_reason: str = ""
+    self_consistency_agreed: bool | None = None
+    self_consistency_reason: str = ""
     has_image: bool = False                # set by proxy from body scan
 
 
@@ -415,6 +417,7 @@ class Router:
             self._error_streak_rule,
             self._adaptive_model_rule,
             self._capacity_rule,
+            self._self_consistency_rule,
             self._classify_rule,
             self._default_rule,
         ):
@@ -525,9 +528,10 @@ class Router:
         """3. Client-requested model id → honor verbatim.
 
         `model=tinyctx-local` / `tinyctx-frontier` is the in-band route
-        override codex.app / advisor agents use. Beats capacity and
-        classify so the client's explicit decision is respected even on
-        a small request."""
+        override codex.app / advisor agents use. Public model ids such
+        as `gpt-5.5` remain routing aliases and must still go through
+        local-first policy. Beats capacity and classify so the client's
+        explicit tinyctx decision is respected even on a small request."""
         m = (ctx.requested_model or "").lower()
         if m == "tinyctx-local":
             return self._make_local_decision(
@@ -631,6 +635,20 @@ class Router:
             return self._make_frontier_decision(
                 ctx, f"est_tokens={ctx.est_tokens} >= {legacy}")
         return None
+
+    def _self_consistency_rule(self, ctx: RouteContext) -> Decision | None:
+        """8.5. Boundary self-classify disagreement gate."""
+        if ctx.self_consistency_agreed is None:
+            return None
+        tail = (
+            f": {ctx.self_consistency_reason}"
+            if ctx.self_consistency_reason else ""
+        )
+        if ctx.self_consistency_agreed:
+            return self._make_local_decision(
+                ctx, f"self-consistency agreed{tail}")
+        return self._make_frontier_decision(
+            ctx, f"self-consistency disagreed{tail}")
 
     def _classify_rule(self, ctx: RouteContext) -> Decision | None:
         """9. Self-classify advisor recommendation.

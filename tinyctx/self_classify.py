@@ -36,6 +36,7 @@ Reference research (full discussion in PR description):
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import re
 import time
@@ -130,8 +131,44 @@ class ClassifyResult:
     cached: bool = False
 
 
+@dataclass
+class ActionSignature:
+    action: str
+    target: str
+    confidence: float
+    reason: str = ""
+
+
+@dataclass
+class ConsistencyResult:
+    samples: list[ActionSignature]
+    agreed: bool
+    reason: str
+
+
 _CACHE: dict[str, tuple[float, "ClassifyResult"]] = {}
 _CACHE_TTL_S = 60.0
+
+
+_ACTION_SYSTEM_PROMPT = """You are an action-signature sampler inside an LLM gateway. Given the current turn, predict the local executor's NEXT decisive action, not the final answer.
+
+Output EXACTLY one JSON object on a single line. No prose:
+{"action":"answer|inspect|edit|run|ask_user|plan|unknown","target":"<file/tool/domain/general>","confidence":0.0-1.0,"reason":"<≤8 words>"}
+
+Rules:
+- action=inspect when the next step is reading/searching code, logs, docs, or files.
+- action=edit when the next step is patching files.
+- action=run when the next step is tests, build, shell verification, or a command.
+- action=ask_user only when human input is genuinely required.
+- action=answer when the deliverable is a direct response.
+- target should be the main file path, tool name, command family, or domain. Use "general" if unclear.
+- Keep reason short. Do not solve the task."""
+
+_ACTION_JSON_RE = re.compile(r'\{[^{}]*"action"\s*:\s*"[^"]+"[^{}]*\}', re.DOTALL)
+_ACTION_RE = re.compile(r'"action"\s*:\s*"([^"]*)"')
+_TARGET_RE = re.compile(r'"target"\s*:\s*"([^"]*)"')
+_CONF_RE = re.compile(r'"confidence"\s*:\s*(-?\d+(?:\.\d+)?)')
+_ACTION_ALLOWED = {"answer", "inspect", "edit", "run", "ask_user", "plan", "unknown"}
 
 
 def _cache_key(body: dict[str, Any], scope: str) -> str:
@@ -298,6 +335,163 @@ def _parse_response(text: str) -> ClassifyResult | None:
         # we salvaged from a partial response.
         reason = "[salvaged from truncated classifier response]"
     return ClassifyResult(escalate=esc, p=p, reason=reason)
+
+
+def _normalize_signature_part(value: str, *, default: str) -> str:
+    value = (value or "").strip().lower()
+    if not value:
+        return default
+    value = re.sub(r"\s+", " ", value)
+    return value[:120]
+
+
+def _parse_action_signature(text: str) -> ActionSignature | None:
+    if not isinstance(text, str) or not text:
+        return None
+    text = _strip_thinking(text)
+    if not text:
+        return None
+    data: dict[str, Any] | None = None
+    m = _ACTION_JSON_RE.search(text)
+    if m:
+        try:
+            raw = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            raw = None
+        if isinstance(raw, dict):
+            data = raw
+    if data is None:
+        m_action = _ACTION_RE.search(text)
+        if not m_action:
+            return None
+        data = {
+            "action": m_action.group(1),
+            "target": (_TARGET_RE.search(text).group(1)
+                       if _TARGET_RE.search(text) else "general"),
+            "confidence": (_CONF_RE.search(text).group(1)
+                           if _CONF_RE.search(text) else 0.5),
+        }
+
+    action = _normalize_signature_part(str(data.get("action", "")),
+                                       default="unknown")
+    if action not in _ACTION_ALLOWED:
+        action = "unknown"
+    target = _normalize_signature_part(str(data.get("target", "")),
+                                       default="general")
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    reason = str(data.get("reason", ""))[:120]
+    return ActionSignature(
+        action=action,
+        target=target,
+        confidence=confidence,
+        reason=reason,
+    )
+
+
+def summarize_consistency(
+    samples: list[ActionSignature],
+) -> ConsistencyResult | None:
+    valid_samples = [
+        sample for sample in samples
+        if sample.confidence >= 0.5
+        and sample.action != "unknown"
+    ]
+    if len(valid_samples) < 2:
+        return None
+    counts: dict[tuple[str, str], int] = {}
+    for sample in valid_samples:
+        key = (sample.action, sample.target)
+        counts[key] = counts.get(key, 0) + 1
+    best_key, best_count = max(counts.items(), key=lambda item: item[1])
+    agreed = best_count > (len(valid_samples) / 2)
+    if agreed:
+        reason = f"agree {best_key[0]}:{best_key[1]} {best_count}/{len(valid_samples)}"
+    else:
+        parts = [
+            f"{action}:{target}={count}"
+            for (action, target), count in sorted(counts.items())
+        ]
+        reason = f"disagree {';'.join(parts)}"
+    return ConsistencyResult(
+        samples=valid_samples, agreed=agreed, reason=reason[:240])
+
+
+async def _action_signature_call(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+) -> ActionSignature | None:
+    try:
+        r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        msg = data.get("choices", [{}])[0].get("message", {})
+        text = msg.get("content", "") or msg.get("reasoning_content", "") or ""
+        return _parse_action_signature(text)
+    except Exception:
+        return None
+
+
+async def sample_action_signatures(
+    body: dict[str, Any],
+    local_base_url: str,
+    local_model: str,
+    *,
+    api_key: str | None = None,
+    timeout_s: float = 20.0,
+    sample_count: int = 3,
+) -> ConsistencyResult | None:
+    """Sample local next-action signatures and return majority agreement.
+
+    This is intentionally local-only and only meant for self-classify
+    boundary turns. It never raises; parse/backend failures return None
+    so callers can keep existing routing behavior.
+    """
+    if sample_count <= 1:
+        return None
+    if not looks_like_user_query(body):
+        return None
+    user_prompt = _extract_input_tail(body)
+    if not user_prompt:
+        return None
+
+    payload = {
+        "model": local_model,
+        "messages": [
+            {"role": "system", "content": _ACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 256,
+        "reasoning_effort": "low",
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = local_base_url.rstrip("/") + "/chat/completions"
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+        tasks = [
+            _action_signature_call(
+                client, url=url, payload=payload, headers=headers)
+            for _ in range(sample_count)
+        ]
+        raw_samples = await asyncio.gather(*tasks, return_exceptions=True)
+
+    samples = [
+        sample for sample in raw_samples
+        if isinstance(sample, ActionSignature)
+    ]
+    if len(samples) < 2:
+        return None
+    return summarize_consistency(samples)
 
 
 async def classify(body: dict[str, Any],

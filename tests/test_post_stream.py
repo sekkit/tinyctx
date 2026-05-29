@@ -126,6 +126,33 @@ class TestPostStreamAnalyzerHappyPath:
         assert _erg.peek_force_frontier("sid-A") is None
 
     @pytest.mark.asyncio
+    async def test_classifier_uses_context_buffer_snapshot(self, tmp_path: Path):
+        cfg = _mk_cfg(log_dir=tmp_path)
+        _sc._OUTPUT_BUFFER["sid-A"] = ""
+        snapshot = (
+            'event: response.completed\n'
+            'data: {"usage":{"completion_tokens":50,"finish_reason":"stop"}}\n\n'
+        )
+        analyzer = ps.PostStreamAnalyzer(cfg=cfg, log=lambda *a, **k: None)
+        from tinyctx.soft_completion import ClassifyDiag, ClassifyResult
+        ok_diag = ClassifyDiag(
+            result=ClassifyResult(soft_punt=False, p=0.1, reason="ok"),
+        )
+        with patch.object(_sc, "classify_at_stream_end_diag",
+                          return_value=ok_diag) as m:
+            ctx = ps.PostStreamContext(
+                proj_sid="sid-A", conv_sid="sid-A", erg_key="sid-A",
+                request_id="rid-1", body={}, cwd="",
+                bytes_out=200, status=200, upstream_failed=False,
+                keepalives_emitted=0, elapsed=0.2, started=time.time(),
+                url="http://x", response_buffer_snapshot=snapshot,
+            )
+            await analyzer.analyze(ctx)
+            await asyncio.sleep(0.05)
+
+        assert m.call_args.kwargs["raw_buffer"] == snapshot
+
+    @pytest.mark.asyncio
     async def test_zero_bytes_skips_classifier(self, tmp_path: Path):
         """When bytes_out=0 we MUST NOT spawn the classifier (it would
         try to read an empty buffer and log noise)."""

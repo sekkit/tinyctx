@@ -500,6 +500,16 @@ def _upstream_retry_count() -> int:
         return 1
 
 
+def _should_run_lingua(
+    *,
+    route: str,
+    enabled: bool,
+    available: bool,
+    mutation_fired: bool,
+) -> bool:
+    return route == "frontier" and enabled and available and mutation_fired
+
+
 def _record_token_tracker(trace, decision) -> None:
     """Feed one request's token stats into the in-memory and persistent trackers."""
     if trace is None:
@@ -914,7 +924,7 @@ async def responses(request: Request) -> Any:
     streak = _SESSION_ERROR_STREAK[proj_sid]
     _phase_set(proj_sid, RequestPhase.classifying, trace.request_id)
 
-    # ─── Multimodal preprocess (gated, default OFF) ──────────────────
+    # ─── Multimodal preprocess (gated, default ON) ───────────────────
     # Replace image attachments with mm-generated captions BEFORE any
     # body-derived signal is computed. Doing it here means est_tokens,
     # _detect_images, and every downstream stage see the SAME shrunk
@@ -924,15 +934,19 @@ async def responses(request: Request) -> Any:
     if getattr(CFG, "image_to_text_preprocess_enabled", False):
         try:
             from . import multimodal_preprocess as _mmp
-            body, _mm_stats = _mmp.preprocess(
-                body,
-                enabled=True,
-                timeout_s=getattr(CFG, "image_to_text_timeout_s", 30.0),
-                log=_log,
-            )
-            if _mm_stats.get("images_captioned"):
-                _log("multimodal_preprocess_applied",
-                     session=proj_sid, **_mm_stats)
+            if _mmp.should_caption_images_locally(body):
+                body, _mm_stats = _mmp.preprocess(
+                    body,
+                    enabled=True,
+                    timeout_s=getattr(CFG, "image_to_text_timeout_s", 30.0),
+                    log=_log,
+                )
+                if _mm_stats.get("images_captioned"):
+                    _log("multimodal_preprocess_applied",
+                         session=proj_sid, **_mm_stats)
+            else:
+                _log("multimodal_preprocess_skipped",
+                     session=proj_sid, reason="accuracy_gate")
         except Exception as _mmp_e:  # noqa: BLE001 — never block routing
             _log("multimodal_preprocess_error",
                  session=proj_sid, error=str(_mmp_e))
@@ -995,6 +1009,7 @@ async def responses(request: Request) -> Any:
             ForceFrontierGuard,
             GuardContext,
             GuardPipeline,
+            PendingInputGuard,
             PlanPersistenceInjector,
             SelfImprovementGuard,
             SoftCompletionGate,
@@ -1025,6 +1040,7 @@ async def responses(request: Request) -> Any:
             active_guards.append(SoftCompletionGate())
         if getattr(CFG, "choice_arbiter_enabled", True):
             active_guards.append(ChoiceArbiterGuard())
+        active_guards.append(PendingInputGuard())
         try:
             from .guards import AdvisorContinuationGuard
         except ImportError:
@@ -1173,6 +1189,8 @@ async def responses(request: Request) -> Any:
     # Failures are silent.
     classify_p = 0.0
     classify_reason = ""
+    self_consistency_agreed: bool | None = None
+    self_consistency_reason = ""
     # Skip the classifier when another router rule will already escalate
     # to frontier (or pin to local), to avoid the ~200ms classifier RTT
     # whose result would be discarded. Mirrors the original pre-refactor
@@ -1230,6 +1248,46 @@ async def responses(request: Request) -> Any:
                 trace.self_classify_p = sc.p
                 trace.self_classify_reason = sc.reason
                 trace.self_classify_cached = sc.cached
+                lo = getattr(CFG, "self_consistency_boundary_low", 0.55)
+                hi = getattr(CFG, "self_consistency_boundary_high", 0.85)
+                sample_count = getattr(CFG, "self_consistency_sample_count", 3)
+                if (getattr(CFG, "self_consistency_enabled", False)
+                        and lo <= sc.p <= hi
+                        and sample_count > 1):
+                    consistency = await self_classify.sample_action_signatures(
+                        body,
+                        local_base_url=CFG.local.base_url,
+                        local_model=CFG.local.model,
+                        api_key=api_key,
+                        timeout_s=getattr(CFG, "self_consistency_timeout_s", 20.0),
+                        sample_count=int(sample_count),
+                    )
+                    if consistency is not None:
+                        self_consistency_agreed = consistency.agreed
+                        self_consistency_reason = consistency.reason
+                        trace.self_consistency_agreed = consistency.agreed
+                        trace.self_consistency_reason = consistency.reason
+                        trace.self_consistency_samples = len(consistency.samples)
+                        _log("self_consistency_sampled",
+                             session=sid,
+                             proj_sid=proj_sid,
+                             agreed=consistency.agreed,
+                             reason=consistency.reason,
+                             samples=len(consistency.samples))
+                        if consistency.agreed is False:
+                            try:
+                                from . import retrieval_fanout as _rf
+                                root = Path(cwd_hdr) if cwd_hdr else Path.cwd()
+                                body, retrieval_injected = _rf.inject_for_disagreement(
+                                    body, root=root)
+                                if retrieval_injected:
+                                    _log("retrieval_fanout_injected",
+                                         session=sid,
+                                         proj_sid=proj_sid,
+                                         reason="self_consistency_disagreement")
+                            except Exception as _rf_e:  # noqa: BLE001
+                                _log("retrieval_fanout_error",
+                                     session=sid, error=str(_rf_e))
                 if sc.escalate and sc.p >= CFG.self_classify_threshold:
                     classify_p = sc.p
                     classify_reason = sc.reason
@@ -1261,6 +1319,8 @@ async def responses(request: Request) -> Any:
         is_compaction=is_compaction,
         classify_p=classify_p,
         classify_reason=classify_reason,
+        self_consistency_agreed=self_consistency_agreed,
+        self_consistency_reason=self_consistency_reason,
         has_image=has_image,
     )
     router = Router(CFG).with_codex_auth(request.headers.get("authorization"))
@@ -1712,30 +1772,30 @@ async def responses(request: Request) -> Any:
             body = _cc.compress_instructions(body)
 
     # Frontier-only: LLMLingua-2 pre-escalation compression of bulky
-    # tool-result payloads. Default off; gated by `frontier_lingua_enabled`.
+    # tool-result payloads. Default on; no-op unless llmlingua is installed.
     # Targets only function_call_output / tool_result items (skips
     # instructions / tools / user / assistant messages — all cache-critical).
     # Cache-aware: only fires when CacheAwareMutator already opened the gate
     # for THIS request (we reuse the same `fire` decision computed earlier).
-    if (decision.route == "frontier"
-            and CFG.frontier_lingua_enabled
-            and lingua.is_available()):
-        lingua_fire = trace.mutation_fired or want_mutation
-        if lingua_fire:
-            body, lg_info = lingua.compress_for_frontier(
-                body,
-                ratio=CFG.frontier_lingua_ratio,
-                model_name=lingua.DEFAULT_MODEL,
-            )
-            trace.lingua_applied = lg_info["applied"]
-            trace.lingua_items_compressed = lg_info["items_compressed"]
-            trace.lingua_chars_before = lg_info["chars_before"]
-            trace.lingua_chars_after = lg_info["chars_after"]
-            if lg_info["applied"]:
-                _log("lingua", session=sid,
-                     items=lg_info["items_compressed"],
-                     bytes_before=lg_info["chars_before"],
-                     bytes_after=lg_info["chars_after"])
+    if _should_run_lingua(
+            route=decision.route,
+            enabled=CFG.frontier_lingua_enabled,
+            available=lingua.is_available(),
+            mutation_fired=trace.mutation_fired):
+        body, lg_info = lingua.compress_for_frontier(
+            body,
+            ratio=CFG.frontier_lingua_ratio,
+            model_name=lingua.DEFAULT_MODEL,
+        )
+        trace.lingua_applied = lg_info["applied"]
+        trace.lingua_items_compressed = lg_info["items_compressed"]
+        trace.lingua_chars_before = lg_info["chars_before"]
+        trace.lingua_chars_after = lg_info["chars_after"]
+        if lg_info["applied"]:
+            _log("lingua", session=sid,
+                 items=lg_info["items_compressed"],
+                 bytes_before=lg_info["chars_before"],
+                 bytes_after=lg_info["chars_after"])
 
     # Frontier-only: trim the tools array to what was actually used in
     # the recent window + an essentials allowlist. Codex sends ~50 tools
@@ -2233,6 +2293,22 @@ async def _forward(url: str, headers: dict[str, str], body: dict[str, Any],
         await client.aclose()
 
 
+def _stream_rewrite_forensics_extra(
+    *,
+    strategy: dict[str, Any] | None,
+    outgoing_capture: bytearray,
+) -> dict[str, Any]:
+    strategy = strategy or {}
+    return {
+        "strategy": str(strategy.get("label") or ""),
+        "tool_name": str(strategy.get("tool_name") or ""),
+        "outgoing_to_codex_chars": len(outgoing_capture),
+        "outgoing_to_codex_tail": (
+            bytes(outgoing_capture[-4000:]).decode("utf-8", "replace")
+            if outgoing_capture else ""),
+    }
+
+
 async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         proj_sid: str, decision: Decision,
                         timeout: httpx.Timeout,
@@ -2265,6 +2341,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
         translator = ChatToResponsesTranslator(
             valid_tool_names=valid_names,
             flattened_tool_args=flattened_tool_args,
+            erg_key=erg_key,
         )
     elif translate_tool_calls or auto_user_input_enabled:
         translator = StreamTranslator(
@@ -2293,6 +2370,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
     # (lines starting with `:`) are ignored by spec-compliant clients.
     keepalive_interval = CFG.stream_keepalive_interval_s
     keepalives_emitted = 0
+    stream_buffer_snapshot = ""
 
     # Soft-completion sniffer state. Reset the per-session output buffer
     # at start of this stream so we match within THIS turn only. The
@@ -2436,6 +2514,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
             keepalives_emitted = consumer.keepalives_emitted
             upstream_failed = consumer.upstream_failed
             upstream_failure_msg = consumer.upstream_failure_msg
+            stream_buffer_snapshot = consumer.raw_buffer_snapshot
             if not upstream_failed and status == 200:
                 _SESSION_ERROR_STREAK[proj_sid] = 0
             # ─── stream-rewrite synthesis ──────────────────────────
@@ -2463,7 +2542,44 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                     # end, no other bytes flowing. Bounded by
                     # self_classify_timeout_s (default 30s).
                     diag = None
-                    if (text_excerpt.strip()
+                    empty_visible_continue_handled = False
+                    rewrite_strategy: dict[str, Any] | None = None
+                    if _sc.is_reasoning_only_empty_visible_response(
+                            buffer_snapshot):
+                        from . import synthetic_continue as _syn
+                        inj_events, strategy = _syn.build_continue_injection(
+                            erg_key,
+                            max_injections=CFG.max_continue_injections_per_session,
+                        )
+                        rewrite_strategy = strategy
+                        empty_visible_continue_handled = True
+                        if strategy["label"] == "budget_exhausted":
+                            from . import empty_response_guard as _erg_budget
+                            _erg_budget.force_next_to_frontier(
+                                erg_key, "empty_visible_response_budget_exhausted")
+                            _log("soft_completion_stream_rewrite_budget_exhausted",
+                                 session=proj_sid,
+                                 p=1.0,
+                                 reason="empty_visible_response",
+                                 injection_count=_syn.injection_count(erg_key),
+                                 max_injections=CFG.max_continue_injections_per_session)
+                        else:
+                            for evt in inj_events:
+                                yield _capture_outgoing(evt)
+                            _log("soft_completion_continue_injected",
+                                 session=proj_sid,
+                                 kind="noop_continue",
+                                 p=1.0,
+                                 reason="empty_visible_response",
+                                 strategy=strategy["label"],
+                                 tool_name=strategy["tool_name"],
+                                 task_chars=0,
+                                 injection_count=_syn.injection_count(erg_key))
+                        if trace is not None:
+                            trace.soft_completion_gate_injected = True
+                            trace.soft_completion_gate_pattern = (
+                                "stream-rewrite: empty_visible_response")
+                    elif (text_excerpt.strip()
                             and ('"delta"' in buffer_snapshot
                                  or '"content"' in buffer_snapshot)):
                         diag = await _sc.classify_at_stream_end_diag(
@@ -2484,7 +2600,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             short_text_threshold=CFG.soft_completion_short_text_threshold,
                             stop_text_threshold=CFG.soft_completion_stop_text_threshold,
                         )
-                    if (diag is not None
+                    if (not empty_visible_continue_handled
+                            and diag is not None
                             and diag.result is not None
                             and diag.result.soft_punt
                             and diag.result.p >= CFG.soft_completion_stream_rewrite_threshold):
@@ -2492,6 +2609,39 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             text_excerpt,
                             diag.result.reason,
                             diag.result.p)
+                        interrupt_action = _sc.interrupt_action(
+                            getattr(diag.result, "interrupt_kind", "self_answerable"))
+                        if interrupt_action == "collect_input":
+                            try:
+                                from . import pending_input as _pi
+                                pending = _pi.create_request(
+                                    erg_key,
+                                    fields=[{
+                                        "name": "secret",
+                                        "type": "password",
+                                        "label": "Secret value",
+                                    }],
+                                    prompt=text_excerpt[:500],
+                                    ttl_s=300.0,
+                                    resume_mode="park_resume",
+                                    cwd=cwd,
+                                )
+                                _log("pending_input_created",
+                                     session=proj_sid,
+                                     request_id=pending.get("request_id"),
+                                     interrupt_kind=getattr(
+                                         diag.result, "interrupt_kind", ""),
+                                     fields=[f.get("name") for f in pending.get("fields", [])])
+                            except Exception as _pi_e:  # noqa: BLE001
+                                _log("pending_input_error",
+                                     session=proj_sid, error=str(_pi_e))
+                        elif interrupt_action == "interrupt":
+                            _log("soft_completion_interrupt_allowed",
+                                 session=proj_sid,
+                                 interrupt_kind=getattr(
+                                     diag.result, "interrupt_kind", ""),
+                                 reason=diag.result.reason,
+                                 p=diag.result.p)
                         # Choice arbiter: when the classifier detects
                         # "asks user which option", run judge (local)
                         # → advisor (frontier) → store verdict. The
@@ -2499,7 +2649,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                         # on the next request. Runs before the noop
                         # continue injection so the next turn sees
                         # the advisor's decision as user input.
-                        if getattr(CFG, "choice_arbiter_enabled", True):
+                        if (interrupt_action == "choice"
+                                and getattr(CFG, "choice_arbiter_enabled", True)):
                             try:
                                 from . import choice_arbiter as _ca
                             except ImportError:
@@ -2530,7 +2681,8 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             from . import advisor_continuation as _ac
                         except ImportError:
                             _ac = None
-                        if _ac is not None:
+                        if (_sc.should_continue_after_interrupt(interrupt_action)
+                                and _ac is not None):
                             try:
                                 pending = await _ac.extract_pending_work_from_outgoing_sse(
                                     outgoing_capture.decode("utf-8", "replace"),
@@ -2550,44 +2702,46 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                             except Exception as _ac_e:  # noqa: BLE001
                                 _log("advisor_continuation_error",
                                      session=proj_sid, error=str(_ac_e))
-                        # Multi-strategy synthetic continue: rotate
-                        # through codex builtins (shell / local_shell /
-                        # update_plan) until codex actually dispatches
-                        # one. spawn_agent was tried first but binary
-                        # analysis confirmed codex silently drops it.
-                        from . import synthetic_continue as _syn
-                        inj_events, strategy = _syn.build_continue_injection(
-                            erg_key,
-                            max_injections=CFG.max_continue_injections_per_session,
-                        )
-                        if strategy["label"] == "budget_exhausted":
-                            from . import empty_response_guard as _erg_budget
-                            _erg_budget.force_next_to_frontier(
-                                erg_key, "injection_budget_exhausted")
-                            _log("soft_completion_stream_rewrite_budget_exhausted",
-                                 session=proj_sid,
-                                 p=diag.result.p,
-                                 injection_count=_syn.injection_count(erg_key),
-                                 max_injections=CFG.max_continue_injections_per_session)
-                        else:
-                            for evt in inj_events:
-                                yield _capture_outgoing(evt)
-                            # NOTE: This is a NOOP-continue injection
-                            # (shell true / local_shell / update_plan), NOT an
-                            # advisor sub-agent call. Real advisor calls only
-                            # happen when the executor itself emits
-                            # `model="tinyctx-frontier"`. See
-                            # `synthetic_continue.STRATEGIES` for what gets
-                            # injected here.
-                            _log("soft_completion_continue_injected",
-                                 session=proj_sid,
-                                 kind="noop_continue",
-                                 p=diag.result.p,
-                                 reason=diag.result.reason,
-                                 strategy=strategy["label"],
-                                 tool_name=strategy["tool_name"],
-                                 task_chars=len(task_body),
-                                 injection_count=_syn.injection_count(erg_key))
+                        if _sc.should_continue_after_interrupt(interrupt_action):
+                            # Multi-strategy synthetic continue: rotate
+                            # through codex builtins (shell / local_shell /
+                            # update_plan) until codex actually dispatches
+                            # one. spawn_agent was tried first but binary
+                            # analysis confirmed codex silently drops it.
+                            from . import synthetic_continue as _syn
+                            inj_events, strategy = _syn.build_continue_injection(
+                                erg_key,
+                                max_injections=CFG.max_continue_injections_per_session,
+                            )
+                            rewrite_strategy = strategy
+                            if strategy["label"] == "budget_exhausted":
+                                from . import empty_response_guard as _erg_budget
+                                _erg_budget.force_next_to_frontier(
+                                    erg_key, "injection_budget_exhausted")
+                                _log("soft_completion_stream_rewrite_budget_exhausted",
+                                     session=proj_sid,
+                                     p=diag.result.p,
+                                     injection_count=_syn.injection_count(erg_key),
+                                     max_injections=CFG.max_continue_injections_per_session)
+                            else:
+                                for evt in inj_events:
+                                    yield _capture_outgoing(evt)
+                                # NOTE: This is a NOOP-continue injection
+                                # (shell true / local_shell / update_plan), NOT an
+                                # advisor sub-agent call. Real advisor calls only
+                                # happen when the executor itself emits
+                                # `model="tinyctx-frontier"`. See
+                                # `synthetic_continue.STRATEGIES` for what gets
+                                # injected here.
+                                _log("soft_completion_continue_injected",
+                                     session=proj_sid,
+                                     kind="noop_continue",
+                                     p=diag.result.p,
+                                     reason=diag.result.reason,
+                                     strategy=strategy["label"],
+                                     tool_name=strategy["tool_name"],
+                                     task_chars=len(task_body),
+                                     injection_count=_syn.injection_count(erg_key))
                         if trace is not None:
                             trace.soft_completion_gate_injected = True
                             trace.soft_completion_gate_pattern = (
@@ -2617,14 +2771,10 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                         "raw_buffer_chars": diag.raw_buffer_chars,
                                         "finish_reason": diag.finish_reason,
                                     },
-                                    extra={
-                                        "strategy": strategy["label"],
-                                        "tool_name": strategy["tool_name"],
-                                        "outgoing_to_codex_chars": len(outgoing_capture),
-                                        "outgoing_to_codex_tail": (
-                                            bytes(outgoing_capture[-4000:]).decode("utf-8", "replace")
-                                            if outgoing_capture else ""),
-                                    },
+                                    extra=_stream_rewrite_forensics_extra(
+                                        strategy=rewrite_strategy,
+                                        outgoing_capture=outgoing_capture,
+                                    ),
                                     max_dumps=CFG.forensics_max_dumps,
                                 )
                                 if fpath:
@@ -2634,11 +2784,11 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                          path=str(fpath))
                             except Exception:  # noqa: BLE001 — forensics dump is best-effort
                                 pass
-                    else:
+                    elif not empty_visible_continue_handled:
                         skip_reason = "no_text" if diag is None else (
                             "not_punt" if diag.result is None
                             else f"p={diag.result.p:.2f}"
-                                 f"<{CFG.soft_completion_stream_rewrite_threshold}")
+                            f"<{CFG.soft_completion_stream_rewrite_threshold}")
                         _log("soft_completion_stream_rewrite_skipped",
                              session=proj_sid,
                              reason=skip_reason)
@@ -2682,6 +2832,14 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                                 try:
                                     from . import soft_completion as _sc
                                     _sc.accumulate_chunk(proj_sid, chunk)
+                                    text = chunk.decode(
+                                        "utf-8", errors="ignore")
+                                    if text:
+                                        max_chars = int(getattr(
+                                            _sc, "_BUFFER_MAX", 65536))
+                                        stream_buffer_snapshot = (
+                                            stream_buffer_snapshot + text
+                                        )[-max_chars:]
                                 except Exception:  # noqa: BLE001 — accumulator is observability
                                     # Why: soft-completion accumulator
                                     # failure must not drop the chunk
@@ -2782,6 +2940,7 @@ async def _stream_proxy(url: str, headers: dict[str, str], body: dict[str, Any],
                 started=started,
                 url=url,
                 route=decision.route,
+                response_buffer_snapshot=stream_buffer_snapshot,
             ))
         except Exception as _e:  # noqa: BLE001
             _log("post_stream_analyze_error",

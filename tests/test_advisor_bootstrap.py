@@ -117,6 +117,27 @@ def test_example_agent_config_has_codex_agent_name():
     assert "100-200 words" in agent_text
 
 
+def test_agent_file_template_forces_tinyctx_frontier():
+    assert 'model = "tinyctx-frontier"' in ab._ADVISOR_AGENT_FILE_TEMPLATE
+    assert 'model = "gpt-5.5"' not in ab._ADVISOR_AGENT_FILE_TEMPLATE
+
+
+def test_write_agent_file_migrates_public_alias_to_tinyctx_frontier(isolated_home):
+    _, codex = isolated_home
+    agent_path = codex.parent / "agents" / "advisor.toml"
+    agent_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_path.write_text('name = "advisor"\nmodel = "gpt-5.5"\n',
+                          encoding="utf-8")
+
+    ok, message = ab.write_agent_file(config_path=codex)
+
+    assert ok is True
+    assert "updated stale advisor agent file" in message
+    text = agent_path.read_text(encoding="utf-8")
+    assert 'model = "tinyctx-frontier"' in text
+    assert 'model = "gpt-5.5"' not in text
+
+
 def test_bootstrap_command_uses_per_machine_path(isolated_home, tmp_path,
                                                     monkeypatch):
     """Override TINYCTX_ADVISOR_PYTHON to a foreign path and confirm the

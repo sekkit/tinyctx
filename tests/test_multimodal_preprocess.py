@@ -160,3 +160,26 @@ def test_no_images_in_body_is_noop(monkeypatch, tmp_path):
     assert stats["images_seen"] == 0
     assert stats["images_captioned"] == 0
     assert out is body  # short-circuit returns the original
+
+
+def test_should_caption_images_locally_allows_low_risk_ocr():
+    body = _body_with_image()
+    body["input"][0]["content"][0]["text"] = "请提取图片中的文字并总结一下"
+
+    assert mmp.should_caption_images_locally(body) is True
+
+
+def test_should_caption_images_locally_keeps_accuracy_sensitive_screenshots_on_frontier():
+    body = _body_with_image()
+    body["input"][0]["content"][0]["text"] = (
+        "看这个 UI 截图，按钮布局和颜色哪里不对？"
+    )
+
+    assert mmp.should_caption_images_locally(body) is False
+
+
+def test_should_caption_images_locally_requires_explicit_low_risk_request():
+    body = _body_with_image()
+    body["input"][0]["content"][0]["text"] = "帮我看看这个图片"
+
+    assert mmp.should_caption_images_locally(body) is False

@@ -176,6 +176,9 @@ class RequestTrace:
     self_classify_reason: str = ""
     self_classify_cached: bool = False
     self_classify_overrode: bool = False
+    self_consistency_agreed: bool | None = None
+    self_consistency_reason: str = ""
+    self_consistency_samples: int = 0
 
     # Stuck-loop watchdog. True on the turn we injected the reminder.
     # `stuck_turn_count_at_inject` records the turn_count at injection

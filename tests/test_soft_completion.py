@@ -31,6 +31,72 @@ def test_parse_response_clean_json():
     assert r.soft_punt is True
     assert r.p == 0.9
     assert r.reason == "asks user"
+    assert r.interrupt_kind == "self_answerable"
+
+
+def test_parse_response_extracts_interrupt_kind():
+    from tinyctx.soft_completion import _parse_response
+    r = _parse_response(
+        '{"soft_punt": true, "p": 0.92, '
+        '"interrupt_kind": "secret_input", "reason": "needs api key"}'
+    )
+    assert r is not None
+    assert r.interrupt_kind == "secret_input"
+
+
+def test_parse_response_infers_choice_interrupt_for_legacy_verdict():
+    from tinyctx.soft_completion import _parse_response
+    r = _parse_response(
+        '{"soft_punt": true, "p": 0.88, "reason": "asks user which option"}'
+    )
+    assert r is not None
+    assert r.interrupt_kind == "choice"
+
+
+def test_parse_response_false_punt_interrupt_kind_is_none():
+    from tinyctx.soft_completion import _parse_response
+    r = _parse_response(
+        '{"soft_punt": false, "p": 0.93, "reason": "substantive answer"}'
+    )
+    assert r is not None
+    assert r.interrupt_kind == "none"
+
+
+def test_parse_response_secret_input_forces_soft_punt_true():
+    from tinyctx.soft_completion import _parse_response
+    r = _parse_response(
+        '{"soft_punt": false, "p": 0.91, '
+        '"interrupt_kind": "secret_input", "reason": "needs api key"}'
+    )
+    assert r is not None
+    assert r.soft_punt is True
+    assert r.interrupt_kind == "secret_input"
+
+
+def test_classifier_prompt_treats_credentials_as_secret_input():
+    from tinyctx.soft_completion import _CLASSIFIER_SYSTEM_PROMPT
+    prompt = _CLASSIFIER_SYSTEM_PROMPT.lower()
+    assert "secret_input" in prompt
+    assert "missing credential" not in prompt
+
+
+def test_interrupt_action_maps_classifier_kind_to_next_step():
+    from tinyctx.soft_completion import interrupt_action
+    assert interrupt_action("self_answerable") == "continue"
+    assert interrupt_action("choice") == "choice"
+    assert interrupt_action("secret_input") == "collect_input"
+    assert interrupt_action("external_action") == "interrupt"
+    assert interrupt_action("human_judgement") == "interrupt"
+    assert interrupt_action("unknown") == "continue"
+
+
+def test_should_continue_after_interrupt_action():
+    from tinyctx.soft_completion import should_continue_after_interrupt
+
+    assert should_continue_after_interrupt("continue") is True
+    assert should_continue_after_interrupt("choice") is True
+    assert should_continue_after_interrupt("collect_input") is False
+    assert should_continue_after_interrupt("interrupt") is False
 
 
 def test_parse_response_markdown_fenced():
@@ -156,6 +222,103 @@ def test_extract_text_function_call_only_stream_returns_empty_not_args():
     )
     text = _extract_text_from_buffer(buf)
     assert text == ""
+
+
+def test_reasoning_only_chat_stream_is_empty_visible_response():
+    from tinyctx.soft_completion import (
+        _extract_visible_text_from_buffer,
+        is_reasoning_only_empty_visible_response,
+    )
+    buf = (
+        "data: " + _json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "thinking"},
+            }],
+        }) + "\n\n"
+        "data: " + _json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+            "usage": {"completion_tokens": 42},
+        }) + "\n\n"
+        "data: [DONE]\n\n"
+    )
+    assert _extract_visible_text_from_buffer(buf) == ""
+    assert is_reasoning_only_empty_visible_response(buf) is True
+
+
+def test_reasoning_only_detector_rejects_tool_calls():
+    from tinyctx.soft_completion import is_reasoning_only_empty_visible_response
+    buf = (
+        "data: " + _json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "thinking"},
+            }],
+        }) + "\n\n"
+        "data: " + _json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0}]},
+                "finish_reason": "tool_calls",
+            }],
+        }) + "\n\n"
+    )
+    assert is_reasoning_only_empty_visible_response(buf) is False
+
+
+def test_reasoning_only_detector_rejects_visible_content():
+    from tinyctx.soft_completion import (
+        _extract_visible_text_from_buffer,
+        is_reasoning_only_empty_visible_response,
+    )
+    buf = (
+        "data: " + _json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "thinking"},
+            }],
+        }) + "\n\n"
+        "data: " + _json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "Done."},
+                "finish_reason": "stop",
+            }],
+        }) + "\n\n"
+    )
+    assert _extract_visible_text_from_buffer(buf) == "Done."
+    assert is_reasoning_only_empty_visible_response(buf) is False
+
+
+def test_responses_reasoning_only_stream_is_empty_visible_response():
+    from tinyctx.soft_completion import is_reasoning_only_empty_visible_response
+    buf = (
+        'event: response.reasoning_text.delta\n'
+        'data: {"type":"response.reasoning_text.delta","delta":"thinking"}\n\n'
+        'event: response.output_text.done\n'
+        'data: {"type":"response.output_text.done","text":""}\n\n'
+        'event: response.completed\n'
+        'data: {"type":"response.completed","response":{"status":"completed",'
+        '"output":[{"type":"reasoning","summary":[]},'
+        '{"type":"message","content":[{"type":"output_text","text":""}]}]}}\n\n'
+    )
+    assert is_reasoning_only_empty_visible_response(buf) is True
 
 
 # ─── accumulator ──────────────────────────────────────────────────────────

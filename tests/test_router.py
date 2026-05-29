@@ -344,6 +344,20 @@ def test_router_explicit_model_frontier():
     assert d.route == "frontier"
 
 
+def test_router_configured_frontier_model_is_not_explicit_override():
+    """Codex main threads may send the public model id as a routing alias.
+    Only tinyctx-frontier is an explicit in-band frontier override."""
+    from tinyctx.router import Router
+
+    cfg = _make_router_cfg()
+    cfg.frontier.model = "gpt-5.5"
+    r = Router(cfg)
+
+    d = r.decide(_ctx(requested_model="gpt-5.5"))
+
+    assert d.route == "local"
+
+
 def test_router_goal_control_routes_to_frontier():
     from tinyctx.router import Router
     r = Router(_make_router_cfg())
@@ -481,6 +495,45 @@ def test_router_capacity_rule_disabled_when_safe_fraction_zero():
     r = Router(cfg)
     d = r.decide(_ctx(est_tokens=2_000_000))
     assert d.route == "local"
+
+
+def test_router_self_consistency_agreement_keeps_boundary_local():
+    """Boundary-band local agreement beats the raw classify threshold."""
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg(
+        self_classify_threshold=0.7,
+        self_classify_escalates_to_frontier=True,
+    ))
+    d = r.decide(_ctx(
+        classify_p=0.8,
+        classify_reason="borderline architecture",
+        self_consistency_agreed=True,
+        self_consistency_reason="agree edit:tinyctx/router.py 2/3",
+    ))
+    assert d.route == "local"
+    assert "self-consistency agreed" in d.reason
+
+
+def test_router_self_consistency_disagreement_escalates():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(
+        classify_p=0.4,
+        self_consistency_agreed=False,
+        self_consistency_reason="disagree edit:a=1;run:pytest=1",
+    ))
+    assert d.route == "frontier"
+    assert "self-consistency disagreed" in d.reason
+
+
+def test_router_force_route_beats_self_consistency_agreement():
+    from tinyctx.router import Router
+    r = Router(_make_router_cfg())
+    d = r.decide(_ctx(
+        force_route="frontier",
+        self_consistency_agreed=True,
+    ))
+    assert d.route == "frontier"
 
 
 def test_router_classify_rule_is_advisor_only_by_default():

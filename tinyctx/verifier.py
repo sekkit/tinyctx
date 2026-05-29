@@ -56,6 +56,7 @@ _SHORT_TEXT_FLOOR = 100
 # ─── per-session flag ────────────────────────────────────────────────────────
 
 _VERIFIER_FLAG: dict[str, dict] = {}
+_VERIFIER_FAILURE_COUNT: dict[str, int] = {}
 
 
 def get_flag(proj_sid: str) -> dict | None:
@@ -87,6 +88,13 @@ class VerifyResult:
     criteria: VerdictCriteria
     passed: bool
     reason: str
+
+
+@dataclass
+class VerificationAction:
+    action: str
+    reason: str
+    criteria: VerdictCriteria
 
 
 @dataclass
@@ -234,6 +242,30 @@ def _extract_reason(text: str) -> str:
     return (m.group(1) if m else "[parse failed]")[:200]
 
 
+def decide_verification_action(
+    criteria: VerdictCriteria,
+    *,
+    previous_failures: int = 0,
+) -> VerificationAction:
+    if criteria.task_completion <= 2:
+        action = "frontier_next"
+        reason = "task_completion low"
+    elif criteria.execution_evidence <= 2:
+        action = "continue_verify"
+        reason = "execution_evidence low"
+    elif criteria.output_quality <= 2:
+        if previous_failures > 0:
+            action = "frontier_next"
+            reason = "output_quality repeated low"
+        else:
+            action = "local_rewrite"
+            reason = "output_quality low"
+    else:
+        action = "none"
+        reason = "verifier passed"
+    return VerificationAction(action=action, reason=reason, criteria=criteria)
+
+
 # ─── main classifier ─────────────────────────────────────────────────────────
 
 
@@ -345,12 +377,21 @@ async def verify_at_stream_end(
     passed = total >= threshold
 
     diag.result = VerifyResult(criteria=criteria, passed=passed, reason=reason)
+    failure_key = conv_sid or proj_sid
 
-    if not passed:
+    if passed:
+        _VERIFIER_FAILURE_COUNT.pop(failure_key, None)
+    else:
+        previous_failures = _VERIFIER_FAILURE_COUNT.get(failure_key, 0)
+        action = decide_verification_action(
+            criteria, previous_failures=previous_failures)
+        _VERIFIER_FAILURE_COUNT[failure_key] = previous_failures + 1
         _VERIFIER_FLAG[proj_sid] = {
             "active": True,
             "total": total,
             "reason": reason,
+            "action": action.action,
+            "action_reason": action.reason,
             "criteria": {
                 "task_completion": criteria.task_completion,
                 "output_quality": criteria.output_quality,
@@ -368,17 +409,27 @@ async def verify_at_stream_end(
 def reset_state(proj_sid: str | None = None) -> None:
     if proj_sid is None:
         _VERIFIER_FLAG.clear()
+        _VERIFIER_FAILURE_COUNT.clear()
         return
     _VERIFIER_FLAG.pop(proj_sid, None)
+    _VERIFIER_FAILURE_COUNT.pop(proj_sid, None)
 
 
 def _set_flag_for_test(proj_sid: str, total: int = 4, reason: str = "test",
                        task_completion: int = 2, output_quality: int = 1,
                        execution_evidence: int = 1) -> None:
+    criteria = VerdictCriteria(
+        task_completion=task_completion,
+        output_quality=output_quality,
+        execution_evidence=execution_evidence,
+    )
+    action = decide_verification_action(criteria)
     _VERIFIER_FLAG[proj_sid] = {
         "active": True,
         "total": total,
         "reason": reason,
+        "action": action.action,
+        "action_reason": action.reason,
         "criteria": {
             "task_completion": task_completion,
             "output_quality": output_quality,
@@ -390,4 +441,8 @@ def _set_flag_for_test(proj_sid: str, total: int = 4, reason: str = "test",
 
 def state_snapshot(proj_sid: str) -> dict:
     f = _VERIFIER_FLAG.get(proj_sid) or {}
-    return {"flag": dict(f), "flag_active": bool(f and f.get("active"))}
+    return {
+        "flag": dict(f),
+        "flag_active": bool(f and f.get("active")),
+        "failure_count": _VERIFIER_FAILURE_COUNT.get(proj_sid, 0),
+    }

@@ -250,7 +250,8 @@ def test_default_script_path_uses_bat_on_windows(monkeypatch, tmp_path):
     fake_file.parent.mkdir(parents=True)
     fake_file.touch()
     monkeypatch.setattr(shb, "__file__", str(fake_file))
-    monkeypatch.setattr(shb.os, "name", "nt")
+    monkeypatch.setattr(shb, "_default_script_name",
+                        lambda: "scout-session-start.bat")
     monkeypatch.delenv("TINYCTX_SCOUT_HOOK_SCRIPT", raising=False)
 
     out = shb._default_script_path()

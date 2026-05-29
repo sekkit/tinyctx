@@ -286,3 +286,52 @@ def test_guard_fires_with_stored_verdict():
     assert "option B" in last["content"][0]["text"]
 
     assert consume_verdict("test_guard_integration") is None
+
+
+def test_guard_fires_with_chat_messages_body():
+    reset_state("test_guard_messages")
+    store_verdict("test_guard_messages", Verdict(
+        advisor_choice="CHOSEN: option B\nREASON: safer approach",
+        question="A or B?",
+        options=["A", "B"],
+        ts=1234.0,
+    ))
+    ctx = GuardContext(
+        body={
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        proj_sid="test_guard_messages",
+        conv_sid="test_guard_messages",
+        turn_count=1,
+    )
+
+    result = ChoiceArbiterGuard().apply(ctx)
+
+    assert result.fired is True
+    assert result.body_mutated is True
+    assert "option B" in ctx.body["messages"][-1]["content"]
+    assert consume_verdict("test_guard_messages") is None
+
+
+def test_guard_preserves_verdict_when_injection_fails():
+    reset_state("test_guard_preserve")
+    store_verdict("test_guard_preserve", Verdict(
+        advisor_choice="CHOSEN: option B",
+        question="A or B?",
+        options=["A", "B"],
+        ts=1234.0,
+    ))
+    ctx = GuardContext(
+        body={"model": "test"},
+        proj_sid="test_guard_preserve",
+        conv_sid="test_guard_preserve",
+        turn_count=1,
+    )
+
+    result = ChoiceArbiterGuard().apply(ctx)
+
+    assert result.fired is False
+    preserved = consume_verdict("test_guard_preserve")
+    assert preserved is not None
+    assert "option B" in preserved.advisor_choice

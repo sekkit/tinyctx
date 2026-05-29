@@ -220,6 +220,114 @@ def _caption_for(
 
 
 _IMG_TYPES = {"input_image", "image_url", "image"}
+_LOW_RISK_IMAGE_TERMS = (
+    "describe",
+    "description",
+    "caption",
+    "alt text",
+    "summarize",
+    "summary",
+    "what is in",
+    "what's in",
+    "ocr",
+    "extract text",
+    "read the text",
+    "transcribe",
+    "识别文字",
+    "提取文字",
+    "读取文字",
+    "图片里有什么",
+    "描述",
+    "总结",
+    "概述",
+)
+_ACCURACY_SENSITIVE_IMAGE_TERMS = (
+    "screenshot",
+    "ui",
+    "button",
+    "layout",
+    "color",
+    "pixel",
+    "exact",
+    "precise",
+    "chart",
+    "graph",
+    "diagram",
+    "debug",
+    "bug",
+    "compare",
+    "count",
+    "where",
+    "截图",
+    "界面",
+    "按钮",
+    "布局",
+    "颜色",
+    "像素",
+    "精确",
+    "准确",
+    "图表",
+    "流程图",
+    "对比",
+    "比较",
+    "数一数",
+    "哪里",
+    "异常",
+    "错误",
+)
+
+
+def _iter_content_items(body: dict[str, Any]):
+    container = body.get("input")
+    if not isinstance(container, list):
+        container = body.get("messages")
+    if not isinstance(container, list):
+        return
+    for item in container:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            yield {"type": "input_text", "text": content}
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict):
+                    yield c
+
+
+def _request_text(body: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in _iter_content_items(body) or []:
+        if item.get("type") in ("text", "input_text"):
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).lower()
+
+
+def _has_image(body: dict[str, Any]) -> bool:
+    return any(
+        item.get("type") in _IMG_TYPES
+        for item in (_iter_content_items(body) or [])
+    )
+
+
+def should_caption_images_locally(body: dict[str, Any]) -> bool:
+    """Return True only for low-risk image-to-text tasks.
+
+    Ambiguous visual tasks stay image-bearing so the router's normal
+    image→frontier rule preserves accuracy. Caption-local is reserved
+    for explicit description/OCR/summary requests where a text caption is
+    the desired artifact rather than a lossy substitute for visual reasoning.
+    """
+    if not isinstance(body, dict) or not _has_image(body):
+        return False
+    text = _request_text(body)
+    if not text:
+        return False
+    if any(term in text for term in _ACCURACY_SENSITIVE_IMAGE_TERMS):
+        return False
+    return any(term in text for term in _LOW_RISK_IMAGE_TERMS)
 
 
 def preprocess(

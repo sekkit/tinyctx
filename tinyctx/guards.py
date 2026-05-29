@@ -235,6 +235,33 @@ class GuardContext:
     injected_reminders: list[str] = field(default_factory=list)
 
 
+def _append_synthetic_user_text(
+    body: dict[str, Any],
+    text: str,
+) -> tuple[dict[str, Any], bool]:
+    items = body.get("input")
+    if isinstance(items, list):
+        new_items = list(items)
+        new_items.append({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })
+        out = dict(body)
+        out["input"] = new_items
+        return out, True
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        new_messages = list(messages)
+        new_messages.append({"role": "user", "content": text})
+        out = dict(body)
+        out["messages"] = new_messages
+        return out, True
+
+    return body, False
+
+
 @runtime_checkable
 class Guard(Protocol):
     """Each guard exposes a name, a priority (lower runs first), and an
@@ -485,9 +512,39 @@ class VerifierGate:
                 guard_name=self.name, fired=False,
                 reason=f"skipped: force_route already={ctx.force_route}")
         from . import verifier
-        flag = verifier.consume_flag(ctx.proj_sid)
+        flag = verifier.get_flag(ctx.proj_sid)
         if flag is None:
             return GuardResult(guard_name=self.name, fired=False)
+        action = str(flag.get("action") or "frontier_next")
+        if action in ("continue_verify", "local_rewrite"):
+            prompt = (
+                "[tinyctx verifier — previous local response scored low. "
+                "Run verification now, gather concrete execution evidence, "
+                "and continue the task without asking the user.]"
+            )
+            if action == "local_rewrite":
+                prompt = (
+                    "[tinyctx verifier — previous local response quality scored low. "
+                    "Rewrite or correct the answer locally, then verify the result.]"
+                )
+            new_body, injected = _append_synthetic_user_text(ctx.body, prompt)
+            if not injected:
+                return GuardResult(guard_name=self.name, fired=False)
+            verifier.consume_flag(ctx.proj_sid)
+            ctx.body = new_body
+            ctx.injected_reminders.append(self.name)
+            return GuardResult(
+                guard_name=self.name,
+                fired=True,
+                body_mutated=True,
+                reason=f"verifier action={action}: {flag.get('action_reason', '')}",
+                additional_log={
+                    "total": flag.get("total"),
+                    "reason": flag.get("reason"),
+                    "action": action,
+                },
+            )
+        verifier.consume_flag(ctx.proj_sid)
         ctx.force_route = "frontier"
         return GuardResult(
             guard_name=self.name,
@@ -661,14 +718,17 @@ class ChoiceArbiterGuard:
             return GuardResult(
                 guard_name=self.name, fired=False,
                 reason="skipped: choice_arbiter module not available")
-        verdict = _ca.consume_verdict(ctx.conv_sid)
+        verdict_sid = ctx.conv_sid
+        verdict = _ca.consume_verdict(verdict_sid)
         if verdict is None and ctx.conv_sid != ctx.proj_sid:
-            verdict = _ca.consume_verdict(ctx.proj_sid)
+            verdict_sid = ctx.proj_sid
+            verdict = _ca.consume_verdict(verdict_sid)
         if verdict is None:
             return GuardResult(guard_name=self.name, fired=False)
 
         new_body, was_inj = _ca.inject_verdict_into_body(ctx.body, verdict)
         if not was_inj:
+            _ca.store_verdict(verdict_sid, verdict)
             return GuardResult(guard_name=self.name, fired=False)
 
         ctx.body = new_body
@@ -681,6 +741,47 @@ class ChoiceArbiterGuard:
             additional_log={
                 "question": verdict.question[:120],
                 "options": verdict.options,
+            },
+        )
+
+
+class PendingInputGuard:
+    """Inject submitted dashboard input into the next request."""
+
+    name = "pending_input"
+    priority = 47
+
+    def apply(self, ctx: GuardContext) -> GuardResult:
+        if ctx.is_compaction or ctx.forced_by_client_model:
+            return GuardResult(
+                guard_name=self.name, fired=False,
+                reason="skipped: compaction or forced model")
+
+        from . import pending_input
+        submitted_sid = ctx.conv_sid
+        submitted = pending_input.peek_submitted(submitted_sid)
+        if submitted is None and ctx.conv_sid != ctx.proj_sid:
+            submitted_sid = ctx.proj_sid
+            submitted = pending_input.peek_submitted(submitted_sid)
+        if submitted is None:
+            return GuardResult(guard_name=self.name, fired=False)
+
+        new_body, injected = pending_input.inject_submitted_values(
+            ctx.body, submitted)
+        if not injected:
+            return GuardResult(guard_name=self.name, fired=False)
+
+        pending_input.consume_submitted(submitted_sid)
+        ctx.body = new_body
+        ctx.injected_reminders.append(self.name)
+        return GuardResult(
+            guard_name=self.name,
+            fired=True,
+            body_mutated=True,
+            reason=f"pending input supplied: {submitted.get('request_id', '')}",
+            additional_log={
+                "request_id": submitted.get("request_id"),
+                "fields": list((submitted.get("values") or {}).keys()),
             },
         )
 

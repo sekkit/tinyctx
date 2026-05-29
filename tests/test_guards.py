@@ -273,6 +273,88 @@ def test_force_frontier_guard_no_op_when_flag_unset():
     assert ctx.force_route is None
 
 
+# ─── VerifierGate ────────────────────────────────────────────────────────
+
+
+def test_verifier_gate_low_task_completion_forces_frontier():
+    from tinyctx import verifier
+    from tinyctx.guards import GuardContext, VerifierGate
+
+    verifier.reset_state()
+    verifier._set_flag_for_test(
+        "p1", total=6, task_completion=1,
+        output_quality=4, execution_evidence=1)
+    ctx = GuardContext(
+        body={"input": [{"role": "user", "content": "continue"}]},
+        proj_sid="p1",
+        conv_sid="c1",
+    )
+    result = VerifierGate().apply(ctx)
+    assert result.fired is True
+    assert ctx.force_route == "frontier"
+    assert result.force_route == "frontier"
+
+
+def test_verifier_gate_low_execution_evidence_injects_verify_prompt():
+    from tinyctx import verifier
+    from tinyctx.guards import GuardContext, VerifierGate
+
+    verifier.reset_state()
+    verifier._set_flag_for_test(
+        "p1", total=9, task_completion=4,
+        output_quality=4, execution_evidence=1)
+    ctx = GuardContext(
+        body={"input": [{"role": "user", "content": "continue"}]},
+        proj_sid="p1",
+        conv_sid="c1",
+    )
+    result = VerifierGate().apply(ctx)
+    assert result.fired is True
+    assert result.body_mutated is True
+    assert ctx.force_route is None
+    text = ctx.body["input"][-1]["content"][0]["text"]
+    assert "run verification" in text.lower()
+    assert verifier.get_flag("p1") is None
+
+
+def test_verifier_gate_low_execution_evidence_injects_chat_messages():
+    from tinyctx import verifier
+    from tinyctx.guards import GuardContext, VerifierGate
+
+    verifier.reset_state()
+    verifier._set_flag_for_test(
+        "p1", total=9, task_completion=4,
+        output_quality=4, execution_evidence=1)
+    ctx = GuardContext(
+        body={"messages": [{"role": "user", "content": "continue"}]},
+        proj_sid="p1",
+        conv_sid="c1",
+    )
+
+    result = VerifierGate().apply(ctx)
+
+    assert result.fired is True
+    assert result.body_mutated is True
+    assert "run verification" in ctx.body["messages"][-1]["content"].lower()
+    assert verifier.get_flag("p1") is None
+
+
+def test_verifier_gate_preserves_flag_when_injection_fails():
+    from tinyctx import verifier
+    from tinyctx.guards import GuardContext, VerifierGate
+
+    verifier.reset_state()
+    verifier._set_flag_for_test(
+        "p1", total=9, task_completion=4,
+        output_quality=4, execution_evidence=1)
+    ctx = GuardContext(body={"model": "test"}, proj_sid="p1", conv_sid="c1")
+
+    result = VerifierGate().apply(ctx)
+
+    assert result.fired is False
+    assert verifier.get_flag("p1") is not None
+
+
 # ─── BudgetReminderGuard ─────────────────────────────────────────────────
 
 
@@ -451,6 +533,98 @@ def test_soft_completion_gate_no_op_when_flag_unset():
                        is_compaction=False, forced_by_client_model=False)
     r = g.apply(ctx)
     assert r.fired is False
+
+
+# ─── PendingInputGuard ───────────────────────────────────────────────────
+
+
+def test_pending_input_guard_injects_submitted_values():
+    from tinyctx import pending_input, session_state
+    from tinyctx.guards import GuardContext, PendingInputGuard
+
+    session_state.reset_all()
+    req = pending_input.create_request(
+        "c1",
+        fields=[{"name": "api_key", "type": "password"}],
+        prompt="Need API key",
+    )
+    pending_input.submit(req["request_id"], {"api_key": "sk-secret"})
+
+    body = {"input": [{"role": "user", "content": "continue"}]}
+    ctx = GuardContext(body=body, proj_sid="p1", conv_sid="c1", turn_count=3)
+    result = PendingInputGuard().apply(ctx)
+
+    assert result.fired is True
+    assert result.body_mutated is True
+    text = ctx.body["input"][-1]["content"][0]["text"]
+    assert "Need API key" in text
+    assert "api_key: sk-secret" in text
+    assert pending_input.consume_submitted("c1") is None
+
+
+def test_pending_input_guard_injects_submitted_values_into_chat_messages():
+    from tinyctx import pending_input, session_state
+    from tinyctx.guards import GuardContext, PendingInputGuard
+
+    session_state.reset_all()
+    req = pending_input.create_request(
+        "c1",
+        fields=[{"name": "api_key", "type": "password"}],
+        prompt="Need API key",
+    )
+    pending_input.submit(req["request_id"], {"api_key": "sk-secret"})
+
+    body = {"messages": [{"role": "user", "content": "continue"}]}
+    ctx = GuardContext(body=body, proj_sid="p1", conv_sid="c1", turn_count=3)
+    result = PendingInputGuard().apply(ctx)
+
+    assert result.fired is True
+    assert result.body_mutated is True
+    assert "api_key: sk-secret" in ctx.body["messages"][-1]["content"]
+    assert pending_input.consume_submitted("c1") is None
+
+
+def test_pending_input_guard_does_not_consume_when_injection_fails():
+    from tinyctx import pending_input, session_state
+    from tinyctx.guards import GuardContext, PendingInputGuard
+
+    session_state.reset_all()
+    req = pending_input.create_request(
+        "c1",
+        fields=[{"name": "api_key", "type": "password"}],
+        prompt="Need API key",
+    )
+    pending_input.submit(req["request_id"], {"api_key": "sk-secret"})
+
+    ctx = GuardContext(body={"model": "test"}, proj_sid="p1",
+                       conv_sid="c1", turn_count=3)
+    result = PendingInputGuard().apply(ctx)
+
+    assert result.fired is False
+    assert pending_input.status(req["request_id"]) is not None
+    assert pending_input.consume_submitted("c1")["values"] == {
+        "api_key": "sk-secret"
+    }
+
+
+def test_pending_input_guard_skips_compaction_and_forced_model():
+    from tinyctx import pending_input, session_state
+    from tinyctx.guards import GuardContext, PendingInputGuard
+
+    session_state.reset_all()
+    req = pending_input.create_request(
+        "c1", fields=[{"name": "api_key", "type": "password"}])
+    pending_input.submit(req["request_id"], {"api_key": "sk-secret"})
+
+    body = {"input": [{"role": "user", "content": "continue"}]}
+    guard = PendingInputGuard()
+    for is_compaction, forced in ((True, False), (False, True)):
+        ctx = GuardContext(
+            body=body, proj_sid="p1", conv_sid="c1", turn_count=3,
+            is_compaction=is_compaction, forced_by_client_model=forced,
+        )
+        result = guard.apply(ctx)
+        assert result.fired is False
 
 
 # ─── PlanPersistenceInjector ─────────────────────────────────────────────

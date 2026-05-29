@@ -49,6 +49,32 @@ def _today_log(log_dir: Path) -> Path:
     return log_dir / f"tinyctx-{time.strftime('%Y%m%d')}.jsonl"
 
 
+def _exec_resume_record_json(record: Any) -> dict[str, Any]:
+    return {
+        "status": str(getattr(record, "status", "") or ""),
+        "reason": str(getattr(record, "reason", "") or ""),
+        "pid": int(getattr(record, "pid", 0) or 0),
+        "session_id": str(getattr(record, "session_id", "") or ""),
+        "log_path": str(getattr(record, "log_path", "") or ""),
+    }
+
+
+async def _poke_pending_input_resume(submitted: dict[str, Any]) -> dict[str, Any]:
+    cwd = str(submitted.get("cwd") or "")
+    if not cwd:
+        return {"status": "skipped", "reason": "missing_cwd"}
+    try:
+        from . import exec_resume, pending_input
+        rec = await exec_resume.poke(
+            cwd,
+            prompt=pending_input.build_resume_prompt(submitted),
+            cooldown_s=0,
+        )
+        return _exec_resume_record_json(rec)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "reason": str(e)[:200]}
+
+
 # ─── interestingness filter ────────────────────────────────────────────────
 
 
@@ -390,6 +416,11 @@ def state_snapshot() -> dict[str, Any]:
         out["integrations"] = _integration_snapshot()
     except Exception as e:  # noqa: BLE001
         out["integrations"] = {"error": str(e)}
+    try:
+        from . import pending_input as _pi
+        out["pending_inputs"] = _pi.snapshot()
+    except Exception as e:  # noqa: BLE001
+        out["pending_inputs"] = {"error": str(e)}
     return out
 
 
@@ -817,6 +848,16 @@ _DASHBOARD_HTML = """<!doctype html>
   details summary { cursor: pointer; color: #6b7280; font-size: 11px; }
   .nav-link { display: inline-block; margin-left: 16px; font-size: 13px; font-weight: 500; color: #6366f1; text-decoration: none; padding: 4px 12px; border: 1px solid #c7d2fe; border-radius: 6px; }
   .nav-link:hover { background: #eef2ff; color: #4f46e5; }
+  .pending-list { display: grid; gap: 10px; }
+  .pending-item { border: 1px solid #e5e7eb; border-radius: 6px; padding: 10px; background: #f9fafb; }
+  .pending-prompt { margin-bottom: 8px; color: #374151; }
+  .pending-fields { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .pending-field label { display: block; font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+  .pending-field input { width: 100%; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 8px; font: inherit; }
+  .pending-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .pending-actions button { border: 1px solid #0f766e; background: #0f766e; color: white; border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
+  .pending-actions button:disabled { opacity: .6; cursor: wait; }
+  .pending-status, .pending-empty { color: #6b7280; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -846,6 +887,11 @@ _DASHBOARD_HTML = """<!doctype html>
         <thead><tr><th>session</th><th>request phase</th><th class="num">last reminder turn</th><th class="num">advisor age</th><th>soft-punt flag</th><th class="num">err streak</th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+
+    <div class="card full">
+      <h2>pending input</h2>
+      <div class="pending-list" id="pending-input-list"><span class="pending-empty">none</span></div>
     </div>
 
     <div class="card full">
@@ -1033,6 +1079,7 @@ _DASHBOARD_HTML = """<!doctype html>
       // Token stats
       const tt = s.token_tracker || {};
       document.getElementById("token-stats").innerHTML = tokenStatsHTML(tt);
+      renderPendingInputs(s.pending_inputs || {});
 
       // If a project is selected, overlay with project-specific data
       if (ACTIVE_PROJECT) {
@@ -1108,6 +1155,87 @@ _DASHBOARD_HTML = """<!doctype html>
       const hasMissing = Object.values(integrations).some(info => !info.ready);
       document.getElementById("install-bar").style.display = hasMissing ? "" : "none";
     }).catch(() => {});
+  }
+
+  function renderPendingInputs(requests) {
+    const list = document.getElementById("pending-input-list");
+    if (!list) return;
+    const entries = Object.values(requests || {})
+      .filter(r => r && !r.submitted)
+      .sort((a, b) => (a.created_ts || 0) - (b.created_ts || 0));
+    list.innerHTML = "";
+    if (!entries.length) {
+      const empty = document.createElement("span");
+      empty.className = "pending-empty";
+      empty.textContent = "none";
+      list.appendChild(empty);
+      return;
+    }
+    entries.forEach(req => {
+      const item = document.createElement("div");
+      item.className = "pending-item";
+      const prompt = document.createElement("div");
+      prompt.className = "pending-prompt";
+      prompt.textContent = req.prompt || req.request_id || "pending input";
+      item.appendChild(prompt);
+
+      const form = document.createElement("form");
+      form.dataset.requestId = req.request_id || "";
+      const fields = document.createElement("div");
+      fields.className = "pending-fields";
+      (req.fields || []).forEach(field => {
+        const wrap = document.createElement("div");
+        wrap.className = "pending-field";
+        const label = document.createElement("label");
+        label.textContent = field.label || field.name || "value";
+        const input = document.createElement("input");
+        input.name = field.name || "";
+        input.type = field.type === "password" ? "password" : "text";
+        input.autocomplete = "off";
+        input.required = field.required !== false;
+        wrap.appendChild(label);
+        wrap.appendChild(input);
+        fields.appendChild(wrap);
+      });
+      form.appendChild(fields);
+
+      const actions = document.createElement("div");
+      actions.className = "pending-actions";
+      const button = document.createElement("button");
+      button.type = "submit";
+      button.textContent = "submit";
+      const status = document.createElement("span");
+      status.className = "pending-status";
+      actions.appendChild(button);
+      actions.appendChild(status);
+      form.appendChild(actions);
+      form.onsubmit = ev => {
+        ev.preventDefault();
+        const values = {};
+        Array.from(form.elements).forEach(el => {
+          if (el instanceof HTMLInputElement && el.name) {
+            values[el.name] = el.value;
+          }
+        });
+        button.disabled = true;
+        status.textContent = "submitting...";
+        fetch("/api/v1/pending-input/" + encodeURIComponent(form.dataset.requestId || ""), {
+          method: "POST",
+          cache: "no-store",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({values}),
+        }).then(r => {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          status.textContent = "submitted";
+          setTimeout(pollState, 300);
+        }).catch(err => {
+          status.textContent = "failed: " + err.message;
+          button.disabled = false;
+        });
+      };
+      item.appendChild(form);
+      list.appendChild(item);
+    });
   }
 
   function installAllMissing() {
@@ -1901,6 +2029,7 @@ def register(app: Any, log_dir: Path) -> None:
         exec_resume_history: list[dict[str, Any]] = []
         exec_resume_state: dict[str, Any] = {}
         request_phase_snap: dict[str, Any] = {}
+        pending_inputs: dict[str, Any] = {}
 
         try:
             from . import request_phase as _rp
@@ -1941,12 +2070,18 @@ def register(app: Any, log_dir: Path) -> None:
         except Exception:  # noqa: BLE001
             exec_resume_history = []
             exec_resume_state = {}
+        try:
+            from . import pending_input as _pi
+            pending_inputs = _pi.snapshot()
+        except Exception:  # noqa: BLE001
+            pending_inputs = {}
 
         return JSONResponse({
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "counts": {
                 "active_sessions": len(active),
                 "force_frontier_flagged": len(force_frontier_flags),
+                "pending_inputs": len(pending_inputs),
             },
             "active": active,
             "force_frontier_flags": force_frontier_flags,
@@ -1955,6 +2090,7 @@ def register(app: Any, log_dir: Path) -> None:
             "synthetic_continue_state": synthetic_continue_state,
             "exec_resume_state": exec_resume_state,
             "integrations": _integration_snapshot(),
+            "pending_inputs": pending_inputs,
         })
 
     @app.post("/api/v1/escalate")
@@ -1980,3 +2116,43 @@ def register(app: Any, log_dir: Path) -> None:
         except Exception as e:  # noqa: BLE001
             return JSONResponse({"error": str(e)}, status_code=500)
         return JSONResponse({"escalated": proj_sid}, status_code=202)
+
+    @app.get("/api/v1/pending-input/{request_id}")
+    def _api_v1_pending_input_status(request_id: str) -> JSONResponse:
+        try:
+            from . import pending_input
+            status = pending_input.status(request_id)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+        if status is None:
+            return JSONResponse({"error": "pending input not found"}, status_code=404)
+        return JSONResponse(status)
+
+    @app.post("/api/v1/pending-input/{request_id}")
+    async def _api_v1_pending_input_submit(
+        request_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "missing or invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"error": "body must be a JSON object"}, status_code=400)
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            return JSONResponse(
+                {"error": "values must be a JSON object"}, status_code=400)
+        try:
+            from . import pending_input
+            submitted = pending_input.submit(request_id, values)
+        except (TypeError, ValueError) as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": str(e)}, status_code=500)
+        if submitted is None:
+            return JSONResponse({"error": "pending input not found"}, status_code=404)
+        resume = await _poke_pending_input_resume(submitted)
+        return JSONResponse({**submitted, "resume": resume}, status_code=202)

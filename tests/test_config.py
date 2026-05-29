@@ -126,6 +126,7 @@ def test_config_routing_thresholds_disabled_by_default() -> None:
     assert cfg.adaptive_model_min_calls == 3
     assert cfg.adaptive_model_failure_rate_threshold == 0.3
     assert cfg.adaptive_model_sample_size == 20
+    assert cfg.image_to_text_preprocess_enabled is True
 
 
 def test_config_compaction_redirect_defaults_on() -> None:
@@ -138,8 +139,8 @@ def test_config_compaction_redirect_defaults_on() -> None:
 
 def test_config_historian_defaults() -> None:
     cfg = Config()
-    assert cfg.historian_enabled is False
-    assert cfg.historian_substitute is False
+    assert cfg.historian_enabled is True
+    assert cfg.historian_substitute is True
     assert cfg.historian_min_new_turns == 5
     assert cfg.historian_recent_keep == 4
 
@@ -147,8 +148,8 @@ def test_config_historian_defaults() -> None:
 def test_config_sanitize_defaults() -> None:
     cfg = Config()
     assert cfg.sanitize_encrypted_content is True
-    assert cfg.dedup_tool_calls is False
-    assert cfg.purge_failed_tool_inputs is False
+    assert cfg.dedup_tool_calls is True
+    assert cfg.purge_failed_tool_inputs is True
     assert cfg.result_shrink_enabled is True
     assert cfg.result_shrink_after_turns == 1
     assert cfg.result_shrink_min_bytes == 12_000
@@ -175,10 +176,13 @@ def test_config_proactive_compact_defaults() -> None:
 
 
 def test_config_frontier_trim_tools_defaults() -> None:
-    """User directive 2026-05-10 flipped this to False. Locking it
-    here prevents accidental re-enable of rare-tool starvation bugs."""
+    """Unconfigured installs should auto-enable frontier tool trimming.
+
+    The essentials list below prevents the old advisor/sub-agent
+    starvation class of bugs.
+    """
     cfg = Config()
-    assert cfg.frontier_trim_tools is False
+    assert cfg.frontier_trim_tools is True
     assert cfg.frontier_tools_recent_window == 30
     assert cfg.frontier_skip_advisor_hint is True
 
@@ -213,6 +217,18 @@ def test_config_self_classify_defaults() -> None:
     assert cfg.self_classify_threshold == 0.7
     assert cfg.self_classify_escalates_to_frontier is True
     assert cfg.self_classify_timeout_s == 30.0
+    assert cfg.self_consistency_enabled is True
+    assert cfg.self_consistency_boundary_low == 0.55
+    assert cfg.self_consistency_boundary_high == 0.85
+    assert cfg.self_consistency_sample_count == 3
+    assert cfg.self_consistency_timeout_s == 20.0
+
+
+def test_config_self_improvement_defaults() -> None:
+    cfg = Config()
+    assert cfg.self_improvement_enabled is True
+    assert cfg.self_improvement_eval_interval == 50
+    assert cfg.self_improvement_stats_window == 50
 
 
 def test_config_stuck_loop_defaults() -> None:
@@ -338,6 +354,13 @@ def test_config_auto_register_mcp_servers_default() -> None:
     assert cfg.auto_register_mcp_servers is True
 
 
+def test_config_caveman_compression_defaults() -> None:
+    cfg = Config()
+    assert cfg.caveman_compress_enabled is True
+    assert cfg.caveman_compress_tool_descriptions is True
+    assert cfg.caveman_compress_instructions is True
+
+
 def test_config_auto_scout_defaults() -> None:
     cfg = Config()
     assert cfg.auto_scout is True
@@ -346,7 +369,7 @@ def test_config_auto_scout_defaults() -> None:
 
 def test_config_frontier_lingua_defaults() -> None:
     cfg = Config()
-    assert cfg.frontier_lingua_enabled is False
+    assert cfg.frontier_lingua_enabled is True
     assert cfg.frontier_lingua_ratio == 0.5
     assert cfg.frontier_lingua_min_bytes == 800
 
@@ -751,6 +774,11 @@ def test_routing_namespace_reads_top_level_defaults() -> None:
     assert cfg.routing.adaptive_model_enabled is cfg.adaptive_model_enabled
     assert cfg.routing.adaptive_model_min_calls == cfg.adaptive_model_min_calls
     assert cfg.routing.self_classify_threshold == cfg.self_classify_threshold
+    assert cfg.routing.self_consistency_enabled is cfg.self_consistency_enabled
+    assert (
+        cfg.routing.self_consistency_boundary_low
+        == cfg.self_consistency_boundary_low
+    )
     assert (
         cfg.routing.self_classify_escalates_to_frontier
         is cfg.self_classify_escalates_to_frontier
@@ -769,6 +797,8 @@ def test_routing_namespace_write_propagates_to_top_level() -> None:
     assert cfg.adaptive_model_enabled is False
     cfg.routing.self_classify_escalates_to_frontier = True
     assert cfg.self_classify_escalates_to_frontier is True
+    cfg.routing.self_consistency_boundary_low = 0.6
+    assert cfg.self_consistency_boundary_low == 0.6
 
 
 def test_routing_top_level_write_visible_via_namespace() -> None:
@@ -784,6 +814,8 @@ def test_routing_top_level_write_visible_via_namespace() -> None:
     assert cfg.routing.adaptive_model_min_calls == 9
     cfg.self_classify_escalates_to_frontier = True
     assert cfg.routing.self_classify_escalates_to_frontier is True
+    cfg.self_consistency_sample_count = 5
+    assert cfg.routing.self_consistency_sample_count == 5
 
 
 def test_stall_namespace_reads_and_writes() -> None:

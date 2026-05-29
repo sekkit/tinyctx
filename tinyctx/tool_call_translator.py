@@ -1263,6 +1263,17 @@ class ChatToResponsesTranslator:
     # tool not in the set are rewritten to a synthetic `shell echo` call.
     valid_tool_names: set[str] | None = None
     flattened_tool_args: dict[str, set[str]] | None = None
+    # Session key for clearing force_frontier after advisor auto-pick.
+    erg_key: str = ""
+
+    def _clear_force_frontier(self) -> None:
+        if not self.erg_key:
+            return
+        try:
+            from . import empty_response_guard as _erg
+            _erg.consume_force_frontier(self.erg_key)
+        except Exception:
+            pass
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         self._partial += chunk.decode("utf-8", errors="replace")

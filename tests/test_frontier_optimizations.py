@@ -148,18 +148,12 @@ def test_trim_tools_recent_window_respected():
 
 # --- end-to-end: confirm the trim accomplishes a meaningful byte savings ---
 
-def test_frontier_trim_tools_disabled_by_default():
-    """User directive 2026-05-10: trim disabled by default. Even after
-    fixing essentials list, trimming creates a class of rare-tool-
-    starvation bugs (any tool not in essentials AND not in recent window
-    is silently invisible). Cost: ~10k extra tokens per frontier
-    request — user accepts this for full tool availability."""
+def test_frontier_trim_tools_enabled_by_default():
+    """Unconfigured installs auto-enable trimming; essentials keep rare
+    control tools available even before first use."""
     from tinyctx.config import Config
     cfg = Config()
-    assert cfg.frontier_trim_tools is False, (
-        "frontier_trim_tools must default to False — re-enabling without "
-        "the user's directive risks the spawn_agent / advisor-trim class "
-        "of bugs (live trace 2026-05-10).")
+    assert cfg.frontier_trim_tools is True
 
 
 def test_trim_tools_default_essentials_keep_spawn_agent():
@@ -245,3 +239,20 @@ def test_trim_tools_bytes_savings_realistic():
         f"trim should shrink by >5x for 50→1 tools "
         f"(before={before}, after={after})"
     )
+
+
+def test_lingua_requires_cache_aware_gate_to_fire():
+    from tinyctx.proxy import _should_run_lingua
+
+    assert _should_run_lingua(
+        route="frontier",
+        enabled=True,
+        available=True,
+        mutation_fired=False,
+    ) is False
+    assert _should_run_lingua(
+        route="frontier",
+        enabled=True,
+        available=True,
+        mutation_fired=True,
+    ) is True

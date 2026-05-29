@@ -19,8 +19,9 @@ and gracefully no-op when the dep is missing — `pip install
 
 Cache-aware: like dedup/purge/read_delta, LLMLingua mutates wire bytes,
 so it MUST run under `CacheAwareMutator`. The proxy gates it on the
-same TTL/threshold. Default off — opt-in via
-`frontier_lingua_enabled = true` in config.
+same TTL/threshold. Default on, but gracefully no-ops unless the optional
+`llmlingua` dependency is installed. Set `frontier_lingua_enabled = false`
+in config to disable.
 
 CLI:
     python -m tinyctx.lingua status        # show whether llmlingua importable + model state

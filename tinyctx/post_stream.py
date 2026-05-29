@@ -174,6 +174,7 @@ class PostStreamContext:
     route: str = ""
     user_goal: str = ""  # extracted from original body before preprocessing
     tool_summary: str = ""  # extracted from original body before preprocessing
+    response_buffer_snapshot: str = ""
 
 
 class PostStreamAnalyzer:
@@ -243,7 +244,9 @@ class PostStreamAnalyzer:
         try:
             api_key = (os.environ.get(cfg.local.api_key_env)
                        if cfg.local.api_key_env else None)
-            buffer_snapshot = _sc._OUTPUT_BUFFER.get(ctx.proj_sid, "")
+            buffer_snapshot = (
+                ctx.response_buffer_snapshot
+                or _sc._OUTPUT_BUFFER.get(ctx.proj_sid, ""))
             body_input = (ctx.body.get("input")
                           if isinstance(ctx.body, dict) else None)
             user_goal_snapshot = _sc.extract_user_goal(body_input)
@@ -397,7 +400,9 @@ class PostStreamAnalyzer:
         try:
             api_key = (os.environ.get(cfg.local.api_key_env)
                        if cfg.local.api_key_env else None)
-            buffer_snapshot = _sc._OUTPUT_BUFFER.get(ctx.proj_sid, "")
+            buffer_snapshot = (
+                ctx.response_buffer_snapshot
+                or _sc._OUTPUT_BUFFER.get(ctx.proj_sid, ""))
             # Body may have been translated from Responses-API "input" to
             # Chat-Completions "messages" by the preprocessing pipeline.
             # Check both shapes so context extraction works regardless.
@@ -482,7 +487,9 @@ class PostStreamAnalyzer:
         if ctx.status != 200 or ctx.upstream_failed:
             return
         try:
-            buf_for_check = _sc._OUTPUT_BUFFER.get(ctx.proj_sid, "")
+            buf_for_check = (
+                ctx.response_buffer_snapshot
+                or _sc._OUTPUT_BUFFER.get(ctx.proj_sid, ""))
             info = _erg.maybe_flag_empty_response(
                 ctx.erg_key, buf_for_check,
                 min_completion_tokens=cfg.empty_response_min_completion_tokens)

@@ -479,6 +479,7 @@ class StreamConsumer:
         self.keepalives_emitted = 0
         self.upstream_failed = False
         self.upstream_failure_msg = ""
+        self.raw_buffer_snapshot = ""
 
     async def yield_to_client(self) -> AsyncIterator[bytes]:
         """Yield SSE bytes to codex, with idle keepalives. Initial
@@ -541,6 +542,11 @@ class StreamConsumer:
             try:
                 from . import soft_completion as _sc
                 _sc.accumulate_chunk(self._proj_sid, payload)
+                text = payload.decode("utf-8", errors="ignore")
+                if text:
+                    max_chars = int(getattr(_sc, "_BUFFER_MAX", 65536))
+                    self.raw_buffer_snapshot = (
+                        self.raw_buffer_snapshot + text)[-max_chars:]
             except Exception:  # noqa: BLE001 — accumulator is observability
                 # Why: soft-completion accumulator failure must not
                 # drop the chunk from the downstream client.

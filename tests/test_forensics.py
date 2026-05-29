@@ -56,6 +56,67 @@ def test_summarize_body_keeps_first_last_of_lists():
     assert summary["first_3"][0]["content"] == "msg 0"
 
 
+def test_summarize_body_redacts_pending_input_values():
+    from tinyctx.forensics import _summarize_body
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "[tinyctx pending input supplied by the user. Continue "
+                    "the task using these values; do not ask again.]\n\n"
+                    "Request: Need API key\n\n"
+                    "Values:\napi_key: sk-live-secret"
+                ),
+            }
+        ]
+    }
+
+    out = _summarize_body(body)
+
+    assert "sk-live-secret" not in repr(out)
+    assert "<redacted" in repr(out)
+
+
+def test_forensics_dump_does_not_persist_pending_input_secret(tmp_path: Path):
+    from tinyctx import forensics
+    from tinyctx import pending_input
+    from tinyctx import session_state
+
+    session_state.reset_all()
+    forensics.reset_state()
+    req = pending_input.create_request(
+        "conv-secret",
+        fields=[{"name": "api_key", "type": "password"}],
+        prompt="Need API key",
+    )
+    pending_input.submit(req["request_id"], {"api_key": "sk-live-secret"})
+    submitted = pending_input.consume_submitted("conv-secret")
+    body = {"input": [{"role": "user", "content": "continue"}]}
+    body, injected = pending_input.inject_submitted_values(body, submitted)
+    assert injected is True
+
+    forensics.capture_request_snapshot(
+        proj_sid="p1",
+        request_id="rq_secret",
+        url="https://api.local/v1/responses",
+        body=body,
+        headers={},
+        request_started_at=time.time(),
+    )
+    path = forensics.write_forensics_dump(
+        forensics_dir=tmp_path,
+        proj_sid="p1",
+        trigger="empty_response",
+        response_buffer="",
+    )
+
+    assert path is not None
+    dump_text = path.read_text(encoding="utf-8")
+    assert "sk-live-secret" not in dump_text
+    assert "<redacted" in dump_text
+
+
 def test_write_dump_creates_file_with_request_response_pair(tmp_path: Path):
     from tinyctx import forensics
     forensics.reset_state()

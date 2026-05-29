@@ -11,11 +11,12 @@ know which option was picked, so it asks again. Loop.
 
 The choice arbiter closes the loop:
   1. Judge (local model): "is this a choice-ask? extract the options."
-  2. Debate (3 local model personas in parallel): each role advocates for
-     one option from a different angle (pragmatist / analyst / skeptic).
-  3. Synthesis judge (local model): reads all 3 drafts, picks the winner.
-  4. Store verdict in session_state.
-  5. Next request: ChoiceArbiterGuard injects the chosen option as a
+  2. Debate (3 local model personas in parallel): proposer / critic /
+     verifier each pick one option.
+  3. Majority vote picks an option only when 2+ roles agree.
+  4. Frontier advisor is called only when the local parliament stalls.
+  5. Store verdict in session_state.
+  6. Next request: ChoiceArbiterGuard injects the chosen option as a
      synthetic user message at the tail of body.input.
 
 The model sees the user "reply" with the consensus decision and continues
@@ -26,9 +27,9 @@ Cost
 ────
 Judge: one local call (~300 tokens, ~200ms).
 Debate: 3 parallel local calls (~80 tokens each, ~250ms total).
-Synthesis: one local call (~100 tokens, ~150ms).
-Total: ~600ms — much faster than the former single-frontier path.
-Falls back to single frontier advisor_decide if all local calls fail.
+Majority: deterministic local vote.
+Total: ~500ms on the local-only path.
+Falls back to single frontier advisor_decide if the parliament has no majority.
 """
 
 from __future__ import annotations
@@ -288,40 +289,50 @@ async def advisor_decide(
         return None
 
 
-# ─── Multi-agent debate: 3 personas + synthesis judge ───────────────────
+# ─── Multi-agent debate: fixed local parliament + majority vote ─────────
 
 _DEBATE_PERSONAS: list[tuple[str, str]] = [
     (
-        "pragmatist",
-        "You are the Pragmatist in a quick 3-way option debate. "
-        "Pick the option that moves the current task forward the fastest. "
-        "Bias: action over deliberation, fewest steps to goal. "
+        "proposer",
+        "You are the Proposer in a quick 3-way local parliament. "
+        "Pick the option that most directly advances the task. "
+        "Bias: concrete next action and forward progress. "
         "Reply in EXACTLY this format:\nPICK: <option verbatim>\nREASON: <≤10 words>",
     ),
     (
-        "analyst",
-        "You are the Analyst in a quick 3-way option debate. "
-        "Pick the option that best matches the user's stated goal and task context. "
-        "Bias: intent alignment, what the user actually wanted when they started. "
+        "critic",
+        "You are the Critic in a quick 3-way local parliament. "
+        "Pick the option that avoids the biggest correctness or scope risk. "
+        "Bias: identify what could go wrong and avoid it. "
         "Reply in EXACTLY this format:\nPICK: <option verbatim>\nREASON: <≤10 words>",
     ),
     (
-        "skeptic",
-        "You are the Skeptic in a quick 3-way option debate. "
-        "Pick the safest and most reversible option. "
-        "Bias: caution, prefer options that preserve future choices. "
+        "verifier",
+        "You are the Verifier in a quick 3-way local parliament. "
+        "Pick the option that is easiest to verify with concrete evidence. "
+        "Bias: testability, observability, and reversible proof. "
         "Reply in EXACTLY this format:\nPICK: <option verbatim>\nREASON: <≤10 words>",
     ),
 ]
 
-_SYNTHESIS_SYSTEM = (
-    "You are the final judge in a 3-persona debate about which option to choose. "
-    "Rules: if 2+ agree → pick that option. If all disagree → pick Analyst's pick. "
-    "Output ONLY one line: CHOSEN: <option verbatim from the options list>"
-)
-
 _PICK_RE = re.compile(r"PICK:\s*(.+)", re.IGNORECASE)
-_CHOSEN_RE = re.compile(r"CHOSEN:\s*(.+)", re.IGNORECASE)
+
+
+def _majority_pick(picks: dict[str, str], options: list[str]) -> str | None:
+    votes: dict[str, int] = {}
+    valid = set(options)
+    for text in picks.values():
+        m = _PICK_RE.search(text or "")
+        if not m:
+            continue
+        pick = m.group(1).strip()
+        if pick not in valid:
+            continue
+        votes[pick] = votes.get(pick, 0) + 1
+    for pick, count in votes.items():
+        if count >= 2:
+            return pick
+    return None
 
 
 async def _local_role_call(
@@ -375,8 +386,8 @@ async def debate_decide(
     debate_timeout_s: float = 15.0,
     synthesis_timeout_s: float = 10.0,
 ) -> str | None:
-    """Run 3 local-model personas in parallel, then a synthesis judge.
-    Returns the chosen option text, or None if all calls fail."""
+    """Run 3 local-model personas in parallel, then return a majority pick.
+    Returns None when no valid 2-role majority exists."""
     if not judge_result.options:
         return None
     question = judge_result.question or "Which option should be chosen?"
@@ -406,58 +417,7 @@ async def debate_decide(
     if not picks:
         return None
 
-    # Phase 2: synthesis judge reads all 3 picks
-    options_text = "\n".join(f"  {i+1}. {o}" for i, o in enumerate(options))
-    debate_summary = "".join(
-        f"[{n.upper()}]\n{t}\n\n" for n, t in picks.items()
-    )
-    synthesis_user = (
-        f"Original question: {question}\n"
-        f"Options:\n{options_text}\n\n"
-        f"Debate:\n{debate_summary}"
-    )
-    payload = {
-        "model": local_model,
-        "messages": [
-            {"role": "system", "content": _SYNTHESIS_SYSTEM},
-            {"role": "user", "content": synthesis_user},
-        ],
-        "temperature": 0.0,
-        "max_tokens": 60,
-        "stream": False,
-    }
-    headers = {"Content-Type": "application/json"}
-    if local_api_key:
-        headers["Authorization"] = f"Bearer {local_api_key}"
-    url = local_base_url.rstrip("/") + "/chat/completions"
-    try:
-        async with httpx.AsyncClient(
-                timeout=httpx.Timeout(synthesis_timeout_s)) as client:
-            r = await client.post(url, json=payload, headers=headers)
-        r.raise_for_status()
-        text = (r.json().get("choices", [{}])[0]
-                .get("message", {}).get("content", "") or "")
-        m = _CHOSEN_RE.search(text)
-        if m:
-            return m.group(1).strip()
-        return text.strip() or None
-    except Exception:
-        # Synthesis failed — fall back to majority vote from persona picks
-        option_votes: dict[str, int] = {}
-        for text in picks.values():
-            m = _PICK_RE.search(text)
-            if m:
-                pick = m.group(1).strip()
-                option_votes[pick] = option_votes.get(pick, 0) + 1
-        if option_votes:
-            return max(option_votes, key=lambda k: option_votes[k])
-        # Last resort: return analyst's pick or first option
-        for preferred in ("analyst", "pragmatist", "skeptic"):
-            if preferred in picks:
-                m = _PICK_RE.search(picks[preferred])
-                if m:
-                    return m.group(1).strip()
-        return options[0] if options else None
+    return _majority_pick(picks, options)
 
 
 # ─── Verdict storage (session_state) ────────────────────────────────────
@@ -497,12 +457,8 @@ def inject_verdict_into_body(
     body: dict[str, Any], verdict: Verdict
 ) -> tuple[dict[str, Any], bool]:
     """Inject the advisor's choice as a synthetic user message at the tail
-    of body.input. Returns (new_body, was_injected). The original body is
-    not mutated."""
-    items = body.get("input")
-    if not isinstance(items, list):
-        return body, False
-
+    of body.input or body.messages. Returns (new_body, was_injected). The
+    original body is not mutated."""
     text = (
         f"[tinyctx choice arbiter — the advisor picked an option on your "
         f"behalf. Treat this as the user's decision and act on it "
@@ -510,14 +466,25 @@ def inject_verdict_into_body(
         f"Question: {verdict.question}\n"
         f"Advisor's choice: {verdict.advisor_choice}"
     )
-    new_items = list(items)
-    new_items.append({
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": text}],
-    })
+    items = body.get("input")
+    if isinstance(items, list):
+        new_items = list(items)
+        new_items.append({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })
+        out = dict(body)
+        out["input"] = new_items
+        return out, True
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body, False
+    new_messages = list(messages)
+    new_messages.append({"role": "user", "content": text})
     out = dict(body)
-    out["input"] = new_items
+    out["messages"] = new_messages
     return out, True
 
 

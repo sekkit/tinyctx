@@ -239,6 +239,19 @@ def _make_mock_post(responses: list):
     return _post, state
 
 
+def test_stream_rewrite_forensics_extra_handles_missing_strategy():
+    from tinyctx.proxy import _stream_rewrite_forensics_extra
+
+    extra = _stream_rewrite_forensics_extra(
+        strategy=None,
+        outgoing_capture=bytearray(b"event: response.completed\n\n"),
+    )
+
+    assert extra["strategy"] == ""
+    assert extra["tool_name"] == ""
+    assert extra["outgoing_to_codex_chars"] > 0
+
+
 def _transport_proxy_url(transport: httpx.AsyncBaseTransport) -> str | None:
     pool = getattr(transport, "_pool", None)
     proxy_url = getattr(pool, "_proxy_url", None)
@@ -659,6 +672,75 @@ async def _drain_stream(streaming_response):
 
 
 class TestStreamProxyRetry:
+
+    @pytest.mark.asyncio
+    async def test_stream_rewrite_continues_reasoning_only_chat_stream(
+            self, proxy_module, monkeypatch):
+        monkeypatch.setattr(proxy_module.CFG, "stream_keepalive_interval_s", 1.0)
+        monkeypatch.setattr(proxy_module.CFG, "soft_completion_gate_enabled", True)
+        monkeypatch.setattr(
+            proxy_module.CFG, "soft_completion_stream_rewrite_enabled", True)
+        monkeypatch.setattr(
+            proxy_module.CFG, "max_continue_injections_per_session", 10)
+        monkeypatch.setattr(proxy_module.CFG, "forensics_enabled", False)
+
+        async def _skip_post_stream(self, ctx):
+            return None
+
+        monkeypatch.setattr(
+            proxy_module._post.PostStreamAnalyzer, "analyze", _skip_post_stream)
+
+        chunks = [
+            ("data: " + json.dumps({
+                "id": "x",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-flash",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant",
+                              "content": None,
+                              "reasoning_content": "thinking"},
+                    "finish_reason": None,
+                }],
+            }) + "\n\n").encode(),
+            ("data: " + json.dumps({
+                "id": "x",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-flash",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1,
+                          "completion_tokens": 42,
+                          "total_tokens": 43},
+            }) + "\n\ndata: [DONE]\n\n").encode(),
+        ]
+        stream_fn, _state = _make_mock_stream([("ok", chunks)])
+        from tinyctx.router import Decision
+        from tinyctx.trace import RequestTrace
+
+        with patch.object(httpx.AsyncClient, "stream", stream_fn):
+            out = []
+            async for chunk in proxy_module._stream_proxy(
+                    "http://local.test/v1/chat/completions",
+                    {"Content-Type": "application/json"},
+                    {"model": "qwen-test", "messages": [], "stream": True},
+                    "s-reasoning-only",
+                    Decision("local", "test", is_compaction=False),
+                    httpx.Timeout(10.0),
+                    chat_to_responses=True,
+                    trace=RequestTrace(session_id="s-reasoning-only"),
+                    conv_sid="conv-reasoning-only"):
+                out.append(chunk)
+
+        body = b"".join(out)
+        assert b"response.reasoning_text.delta" in body
+        assert b'"type": "function_call"' in body
+        assert b"response.completed" in body
+        assert body.index(b'"type": "function_call"') < body.index(
+            b"response.completed")
 
     @pytest.mark.asyncio
     async def test_stream_local_400_escalates_to_frontier(self, proxy_module,
