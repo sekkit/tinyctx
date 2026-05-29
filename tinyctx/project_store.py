@@ -34,10 +34,16 @@ _locks: dict[str, threading.Lock] = {}
 _global_lock = threading.Lock()  # for _locks and _cache dict access
 
 
-def _get_lock(cwd_hash: str) -> threading.Lock:
+def _get_lock(cwd_hash: str) -> "threading.RLock":
     with _global_lock:
         if cwd_hash not in _locks:
-            _locks[cwd_hash] = threading.Lock()
+            # RLock (reentrant): record() holds this lock and then calls
+            # _init_project() on a cache miss, which re-acquires the SAME
+            # per-hash lock. A plain Lock self-deadlocks there — and because
+            # record() runs synchronously on the proxy's event-loop thread
+            # (proxy._record_token_tracker at stream end), that froze the
+            # entire proxy. RLock lets the same thread re-enter safely.
+            _locks[cwd_hash] = threading.RLock()
         return _locks[cwd_hash]
 
 

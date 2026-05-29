@@ -51,6 +51,7 @@ file is added.
 - **Prompt cache extraction** — provider-specific prompt-cache token field extraction across DeepSeek, OpenAI Responses, OpenAI Chat, and Anthropic wire shapes. Covered by `tests/test_prompt_cache_extract.py`.
 - **Trace and stats** — JSONL trace emission, filters, compact/verbose rendering, quality scoring, route aggregates, and no-data behavior. Covered by `tests/test_trace.py`, `tests/test_stats.py`.
 - **Dashboard surfaces** — HTML dashboard, JSON state, aggregate rollups, recent events, manual escalation API, request-phase state, and visual configuration center APIs. Covered by `tests/test_dashboard.py`, `tests/test_dashboard_api.py`, `tests/test_dashboard_config_api.py`.
+- **Per-project stats store** — per-cwd token/route accounting that backs the dashboard rollups, with reentrant-lock safety so the first request for a new project never self-deadlocks the proxy event loop. Covered by `tests/test_project_store.py`.
 - **Forensics capture** — request/response dumps for empty responses, punts, upstream errors, retention limits, and redaction/shape guarantees. Covered by `tests/test_forensics.py`.
 - **Operational hygiene** — hardcoded-path guards and platform/path coverage. Covered by `tests/test_no_hardcoded_paths.py`, `tests/test_path_coverage_e2e.py`.
 
