@@ -1638,6 +1638,70 @@ def test_stream_translator_emits_function_call_for_hermes_xml_variant():
     assert "echo" in out
 
 
+# ──────────────────────── event-loop guard (regression: proxy wedge)
+# The inline classifier/advisor helpers make BLOCKING httpx calls. They run
+# inside the proxy's async stream relay (on the event-loop thread), and they
+# target the proxy itself — so a blocking call there froze the whole proxy and
+# self-deadlocked (the classifier's JSON verdict is itself a zero-tool-call
+# text reply that re-triggers the same gate -> unbounded recursion). These
+# tests lock in: on a running event loop the helpers no-op without touching
+# the network; off-loop callers (the rest of this file) are unchanged.
+
+
+def test_running_in_event_loop_detection():
+    import asyncio
+
+    from tinyctx.tool_call_translator import _running_in_event_loop
+
+    assert _running_in_event_loop() is False
+
+    async def _inside():
+        return _running_in_event_loop()
+
+    assert asyncio.run(_inside()) is True
+
+
+def test_inline_network_helpers_skip_on_event_loop():
+    import asyncio
+
+    import httpx
+
+    import tinyctx.advisor as _adv
+    import tinyctx.tool_call_translator as tct
+
+    calls = {"n": 0}
+
+    def _boom_client(*a, **k):
+        calls["n"] += 1
+        raise AssertionError("blocking httpx.Client invoked on event loop")
+
+    def _boom_advisor(*a, **k):
+        calls["n"] += 1
+        raise AssertionError("blocking call_advisor invoked on event loop")
+
+    orig_client = httpx.Client
+    orig_advisor = getattr(_adv, "call_advisor", None)
+    httpx.Client = _boom_client
+    _adv.call_advisor = _boom_advisor
+    try:
+        async def _inside():
+            return (
+                tct._classify_final_answer("Should I proceed with A or B?"),
+                tct._ask_advisor_for_continuation("what next?", ["A", "B"]),
+                tct._try_auto_answer_text_choice("Pick one:\n- A\n- B"),
+                tct._try_auto_answer_user_input(
+                    '{"questions":[{"header":"x","options":["A","B"]}]}'),
+            )
+
+        results = asyncio.run(_inside())
+        assert results == (None, None, None, None)
+        assert calls["n"] == 0  # no network attempt on the event loop
+    finally:
+        httpx.Client = orig_client
+        if orig_advisor is not None:
+            _adv.call_advisor = orig_advisor
+
+
 if __name__ == "__main__":
     import sys
     failed = 0

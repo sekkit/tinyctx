@@ -948,6 +948,30 @@ def _resolve_codex_auth() -> str:
         return ""
 
 
+def _running_in_event_loop() -> bool:
+    """True when called on a thread that has a running asyncio event loop.
+
+    The streaming translators run synchronously *inside* the proxy's async
+    stream relay (StreamConsumer.yield_to_client -> translator.feed/_finish),
+    i.e. on the event-loop thread. A blocking httpx call from there freezes
+    the entire proxy; worse, the classifier/advisor calls target the proxy
+    itself, so the loop can't service its own request — a permanent
+    self-deadlock (the classifier's JSON verdict is itself a zero-tool-call
+    text reply, which re-triggers the same gate -> unbounded recursion).
+
+    The async guard pipeline (soft_completion + choice_arbiter +
+    advisor_continuation) already handles await-user / choice / continuation
+    off the hot path, so on the event loop we skip these legacy inline
+    network calls. Off-loop callers (unit tests, sync tooling) are unchanged.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
 def _classify_final_answer(text: str) -> dict | None:
     """Synchronously ask the local model (tinyctx-local → DeepSeek) whether
     `text` is awaiting user input. Returns:
@@ -960,6 +984,8 @@ def _classify_final_answer(text: str) -> dict | None:
     """
     if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
         return None
+    if _running_in_event_loop():
+        return None  # never block the proxy event loop — see _running_in_event_loop
     if not text or not text.strip():
         return None  # nothing to classify
 
@@ -1059,6 +1085,8 @@ def _ask_advisor_for_continuation(text: str, options: list[str]) -> str | None:
     suffix to append to _text_buf, or None on failure."""
     if not text:
         return None
+    if _running_in_event_loop():
+        return None  # never block the proxy event loop — see _running_in_event_loop
     if options:
         opts_str = "\n".join(f"  - {o}" for o in options)
         question = (
@@ -1106,6 +1134,8 @@ def _try_auto_answer_text_choice(text: str) -> str | None:
     """
     if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
         return None
+    if _running_in_event_loop():
+        return None  # never block the proxy event loop — see _running_in_event_loop
     detected = _detect_text_choice_prompt(text)
     if not detected:
         return None
@@ -1158,6 +1188,8 @@ def _try_auto_answer_user_input(arguments_json: str) -> str | None:
     """
     if os.environ.get("TINYCTX_AUTO_USER_INPUT", "1") == "0":
         return None
+    if _running_in_event_loop():
+        return None  # never block the proxy event loop — see _running_in_event_loop
     try:
         args = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError:
