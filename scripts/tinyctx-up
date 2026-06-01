@@ -15,8 +15,30 @@ set -uo pipefail
 LABEL="com.tinyctx.proxy"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PROXY_URL="http://127.0.0.1:4141"
-LMSTUDIO_URL="http://127.0.0.1:1234"
 LOG_DIR="$HOME/.tinyctx/logs"
+
+VENV_PY="$HOME/dev/tinyctx/.venv/bin/python"
+[ -x "$VENV_PY" ] || VENV_PY="$(command -v python3 || true)"
+
+# Resolve the *configured* local backend so the health gate reflects reality
+# (DeepSeek cloud / LMStudio / Ollama / …) instead of a hardcoded LMStudio
+# assumption. Falls back to the legacy LMStudio URL if config can't be read.
+_local_backend_url() {
+  [ -n "$VENV_PY" ] || { echo ""; return; }
+  "$VENV_PY" - <<'PY' 2>/dev/null
+try:
+    from tinyctx.config import load_config
+    print((load_config().local.base_url or "").rstrip("/"))
+except Exception:
+    print("")
+PY
+}
+LOCAL_URL="$(_local_backend_url)"
+[ -n "$LOCAL_URL" ] || LOCAL_URL="http://127.0.0.1:1234/v1"
+case "$LOCAL_URL" in
+  *127.0.0.1*|*localhost*|*0.0.0.0*) LOCAL_IS_LOCAL=1 ;;
+  *)                                 LOCAL_IS_LOCAL=0 ;;
+esac
 
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
 red()   { printf "\033[31m%s\033[0m\n" "$*"; }
@@ -27,8 +49,10 @@ check_alive() {
 }
 
 cmd_status() {
-  printf "  LMStudio       (%s)  " "$LMSTUDIO_URL"
-  if check_alive "$LMSTUDIO_URL/v1/models"; then green "alive"; else red "DEAD — open LMStudio + load a model"; fi
+  printf "  local backend  (%s)  " "$LOCAL_URL"
+  if check_alive "$LOCAL_URL/models"; then green "alive"
+  elif [ "$LOCAL_IS_LOCAL" = "1" ]; then red "DEAD — start your local model server + load a model"
+  else red "unreachable"; fi
 
   printf "  tinyctx-proxy  (%s)  " "$PROXY_URL"
   if check_alive "$PROXY_URL/"; then green "alive"; else red "DEAD"; fi
@@ -105,10 +129,13 @@ _scout_hook_bootstrap_async() {
 }
 
 cmd_start() {
-  if ! check_alive "$LMSTUDIO_URL/v1/models"; then
-    red "LMStudio is not responding at $LMSTUDIO_URL."
-    echo "  Open LM Studio.app → load a model → make sure the local server is on."
-    echo "  Then re-run: tinyctx-up"
+  # Only hard-fail when the configured local backend is a localhost server
+  # that's down (a real blocker). Cloud backends (DeepSeek etc.) are assumed
+  # reachable; the proxy-up check below is the real gate for those.
+  if [ "$LOCAL_IS_LOCAL" = "1" ] && ! check_alive "$LOCAL_URL/models"; then
+    red "Local model backend is not responding at $LOCAL_URL."
+    echo "  Start your local model server (LM Studio / Ollama / …) and load a model,"
+    echo "  then re-run: tinyctx-up"
     return 1
   fi
   if [ ! -f "$PLIST" ]; then
