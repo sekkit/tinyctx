@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -489,7 +490,11 @@ def watch(log_dir: Path, *, verbose: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="tinyctx.trace")
-    p.add_argument("--log-dir", default=str(Path.home() / ".tinyctx" / "logs"))
+    # Honor TINYCTX_LOG_DIR (where the proxy writes) so the viewer reads the
+    # same logs the proxy produced; --log-dir still overrides.
+    p.add_argument("--log-dir",
+                   default=os.environ.get("TINYCTX_LOG_DIR")
+                   or str(Path.home() / ".tinyctx" / "logs"))
     p.add_argument("--last", type=int, default=10,
                    help="show the last N traces (default: 10)")
     p.add_argument("--all", action="store_true", help="show all traces")

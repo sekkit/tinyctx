@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -385,7 +386,11 @@ def render_quality(q: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="tinyctx.stats")
-    p.add_argument("--log-dir", default=str(Path.home() / ".tinyctx" / "logs"))
+    # Honor TINYCTX_LOG_DIR (the proxy writes there via load_config) so the CLI
+    # reads the same logs the proxy produced; --log-dir still overrides.
+    p.add_argument("--log-dir",
+                   default=os.environ.get("TINYCTX_LOG_DIR")
+                   or str(Path.home() / ".tinyctx" / "logs"))
     p.add_argument("--since", default=None, help="YYYY-MM-DD, inclusive")
     p.add_argument("--json", action="store_true")
     p.add_argument("--quality", action="store_true",
