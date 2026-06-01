@@ -271,6 +271,76 @@ async def stream_events(log_dir: Path,
 # ─── state snapshot ────────────────────────────────────────────────────────
 
 
+_AR_CACHE: dict[str, Any] = {"ts": 0.0, "runs": {}}
+_AR_TTL_S = 30.0
+_AR_MAX_DIRS = 20000
+# Subtrees that never contain an autoresearch-results/ dir but are huge —
+# pruned so the home-dir walk stays cheap. (Do NOT prune all dotfiles: runs
+# can live under ~/.tinyctx etc.)
+_AR_PRUNE = {
+    "node_modules", "Library", "Caches", ".cache", ".Trash", ".git", ".hg",
+    ".svn", "site-packages", ".venv", "venv", "env", ".npm", ".cargo",
+    ".rustup", ".gradle", ".m2", "go", "dist", "build", "__pycache__",
+}
+
+
+def reset_autoresearch_cache() -> None:
+    """Test/dev helper to clear the autoresearch scan cache."""
+    _AR_CACHE["ts"] = 0.0
+    _AR_CACHE["runs"] = {}
+
+
+def _scan_autoresearch_runs() -> dict[str, Any]:
+    """Find autoresearch-results/state.json under ~ and /tmp.
+
+    Cached for _AR_TTL_S so frequent dashboard polls don't re-walk the home
+    tree (an unbounded walk froze /dashboard/state on large homes). The walk
+    prunes large irrelevant subtrees and is hard-capped at _AR_MAX_DIRS dirs
+    visited, so latency stays bounded on any filesystem.
+    """
+    now = time.time()
+    if now - _AR_CACHE["ts"] < _AR_TTL_S:
+        return _AR_CACHE["runs"]
+    runs: dict[str, Any] = {}
+    visited = 0
+    for base in (os.path.expanduser("~"), "/tmp"):
+        base_depth = base.count(os.sep)
+        for root, dirs, _files in os.walk(base):
+            visited += 1
+            if visited > _AR_MAX_DIRS:
+                break
+            dirs[:] = [d for d in dirs if d not in _AR_PRUNE]
+            if root.count(os.sep) - base_depth > 4:
+                dirs.clear()
+                continue
+            if "autoresearch-results" in dirs:
+                state_path = os.path.join(
+                    root, "autoresearch-results", "state.json")
+                try:
+                    with open(state_path, "r", encoding="utf-8") as fh:
+                        st = json.loads(fh.read())
+                    cfg = st.get("config", {})
+                    s = st.get("state", {})
+                    runs[root] = {
+                        "goal": cfg.get("goal", "")[:120],
+                        "mode": cfg.get("session_mode", "?"),
+                        "metric": cfg.get("metric", "?"),
+                        "direction": cfg.get("direction", "?"),
+                        "iteration": s.get("iteration", 0),
+                        "keep_count": s.get("keep_count", 0),
+                        "discard_count": s.get("discard_count", 0),
+                        "best_metric": s.get("best_metric"),
+                        "current_metric": s.get("current_metric"),
+                    }
+                except Exception:  # noqa: BLE001
+                    runs[root] = {"error": "unreadable state.json"}
+        if visited > _AR_MAX_DIRS:
+            break
+    _AR_CACHE["ts"] = now
+    _AR_CACHE["runs"] = runs
+    return runs
+
+
 def state_snapshot() -> dict[str, Any]:
     """Read all per-session state from in-memory module dicts. Safe for
     concurrent access (Python dict.copy() is atomic; values are tuples
@@ -337,36 +407,11 @@ def state_snapshot() -> dict[str, Any]:
         }
     except Exception as e:  # noqa: BLE001
         out["request_phase"] = {"error": str(e)}
-    # Autoresearch run status — scan workspace for autoresearch-results/
+    # Autoresearch run status (cached + pruned + bounded; see
+    # _scan_autoresearch_runs — an unbounded ~ walk used to freeze
+    # /dashboard/state on large home trees).
     try:
-        import os as _os2
-        ar_runs: dict[str, Any] = {}
-        for candidate in (_os2.path.expanduser("~"), "/tmp"):
-            for root, dirs, _files in _os2.walk(candidate):
-                depth = root.count(_os2.sep) - candidate.count(_os2.sep)
-                if depth > 4:
-                    dirs.clear()
-                    continue
-                if "autoresearch-results" in dirs:
-                    state_path = _os2.path.join(root, "autoresearch-results", "state.json")
-                    try:
-                        with open(state_path, "r", encoding="utf-8") as fh:
-                            st = json.loads(fh.read())
-                        cfg = st.get("config", {})
-                        s = st.get("state", {})
-                        ar_runs[root] = {
-                            "goal": cfg.get("goal", "")[:120],
-                            "mode": cfg.get("session_mode", "?"),
-                            "metric": cfg.get("metric", "?"),
-                            "direction": cfg.get("direction", "?"),
-                            "iteration": s.get("iteration", 0),
-                            "keep_count": s.get("keep_count", 0),
-                            "discard_count": s.get("discard_count", 0),
-                            "best_metric": s.get("best_metric"),
-                            "current_metric": s.get("current_metric"),
-                        }
-                    except Exception:
-                        ar_runs[root] = {"error": "unreadable state.json"}
+        ar_runs = _scan_autoresearch_runs()
         if ar_runs:
             out["autoresearch_runs"] = ar_runs
     except Exception:  # noqa: BLE001

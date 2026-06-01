@@ -352,3 +352,38 @@ def test_state_includes_in_memory_dicts(tmp_path: Path):
     body = client.get("/dashboard/state").json()
     assert body["stuck_loop"]["last_reminder_turn"]["test:abc"] == 99
     assert "test:abc" in body["soft_completion"]["active_flags"]
+
+
+def test_autoresearch_scan_is_cached(monkeypatch):
+    """Regression: state_snapshot's autoresearch scan must not os.walk the
+    home tree on every call — repeated polls used to freeze /dashboard/state."""
+    import os as _os
+
+    from tinyctx import dashboard
+
+    calls = {"n": 0}
+
+    def counting_walk(base, *a, **k):
+        calls["n"] += 1
+        return iter([(base, [], [])])
+
+    monkeypatch.setattr(_os, "walk", counting_walk)
+    dashboard.reset_autoresearch_cache()
+    dashboard._scan_autoresearch_runs()          # cold: walks ~ and /tmp
+    cold = calls["n"]
+    assert cold == 2
+    dashboard._scan_autoresearch_runs()          # warm: cached, no new walk
+    assert calls["n"] == cold
+    dashboard.reset_autoresearch_cache()
+    dashboard._scan_autoresearch_runs()          # reset: walks again
+    assert calls["n"] == cold + 2
+
+
+def test_autoresearch_scan_prunes_and_caps():
+    """The walk prunes known-huge subtrees and is hard-capped."""
+    from tinyctx import dashboard
+
+    assert {"node_modules", "Library", "site-packages"} <= dashboard._AR_PRUNE
+    assert dashboard._AR_MAX_DIRS > 0
+    dashboard.reset_autoresearch_cache()
+    assert dashboard._AR_CACHE["runs"] == {}
