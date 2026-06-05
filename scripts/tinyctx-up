@@ -128,6 +128,19 @@ _scout_hook_bootstrap_async() {
         >> "$LOG_DIR/scout-hook-bootstrap.log" 2>&1 &)
 }
 
+_scout_trigger_bootstrap_async() {
+  # PostToolUse trigger hook: keeps scout fresh between sessions. The hook
+  # self-gates on scout-cache existence, so it is inert for repos tinyctx
+  # has never scouted (and never touches a provider API).
+  local venv_py="$HOME/dev/tinyctx/.venv/bin/python"
+  [ -x "$venv_py" ] || venv_py="$(command -v python3)"
+  [ -n "$venv_py" ] || return 0
+  (cd "$HOME/dev/tinyctx" 2>/dev/null \
+   && PATH="$(_bootstrap_path)" nohup "$venv_py" \
+        -m tinyctx.scout_trigger install --quiet \
+        >> "$LOG_DIR/scout-trigger-bootstrap.log" 2>&1 &)
+}
+
 cmd_start() {
   # Only hard-fail when the configured local backend is a localhost server
   # that's down (a real blocker). Cloud backends (DeepSeek etc.) are assumed
@@ -158,6 +171,7 @@ cmd_start() {
   _serena_bootstrap_async
   _caveman_bootstrap_async
   _scout_hook_bootstrap_async
+  _scout_trigger_bootstrap_async
 
   cmd_status
   echo
@@ -197,6 +211,7 @@ cmd_restart() {
   _serena_bootstrap_async
   _caveman_bootstrap_async
   _scout_hook_bootstrap_async
+  _scout_trigger_bootstrap_async
   cmd_status
   green "tinyctx restarted."
 }

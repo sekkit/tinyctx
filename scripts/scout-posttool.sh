@@ -42,10 +42,11 @@ if [ -z "$VENV_PY" ]; then
   exit 0
 fi
 
-# Best-effort touch: if scout never ran here, the cache dir doesn't exist
-# yet — that's fine, scout_trigger.touch_trigger will create it. Any error
-# is swallowed so we never fail the tool call.
-"$VENV_PY" -m tinyctx.scout_trigger touch --root "$ROOT" --quiet \
+# Best-effort touch, gated by --require-scout: if this repo has no scout cache
+# (e.g. it was only ever used with a non-tinyctx codex provider), the trigger
+# is a no-op — nothing is created or touched, so non-tinyctx sessions are
+# unaffected. Any error is swallowed so we never fail the tool call.
+"$VENV_PY" -m tinyctx.scout_trigger touch --root "$ROOT" --quiet --require-scout \
     >/dev/null 2>&1 || true
 
 emit_empty

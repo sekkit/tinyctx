@@ -295,6 +295,13 @@ def unregister_hook(hooks_path: Path = CODEX_HOOKS_PATH, *,
 
 def _cmd_touch(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
+    # Provider scoping: when invoked from the PostToolUse hook (--require-scout),
+    # do nothing unless a scout cache already exists for this repo. A repo that
+    # tinyctx has never scouted (e.g. one only ever used with a non-tinyctx
+    # codex provider) gets no trigger file and no side effects.
+    if getattr(args, "require_scout", False) and \
+            not scout_mod.manifest_path(root).is_file():
+        return 0
     p = touch_trigger(root)
     if not args.quiet:
         print(p)
@@ -373,6 +380,10 @@ def main(argv: list[str] | None = None) -> int:
     pt = sub.add_parser("touch", help="bump trigger mtime for a repo")
     pt.add_argument("--root", default=".")
     pt.add_argument("--quiet", action="store_true")
+    pt.add_argument("--require-scout", action="store_true",
+                    help="no-op unless a scout cache already exists for the "
+                         "repo (used by the PostToolUse hook so repos tinyctx "
+                         "never scouted are never touched)")
     pt.set_defaults(func=_cmd_touch)
 
     ps = sub.add_parser("status", help="show trigger + scout mtimes + hook state")
