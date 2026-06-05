@@ -58,6 +58,13 @@ echo "  - registering scout SessionStart hook in ~/.codex/hooks.json"
 "$ROOT/.venv/bin/python" -m tinyctx.scout_hook_bootstrap install --quiet \
   || echo "    (scout-hook registration had warnings — run tinyctx-scout-hook status)"
 
+# --- 3f2. scout PostToolUse trigger: bump the trigger sentinel after every
+# Edit/Write so the next SessionStart treats scout as stale and refreshes in
+# the background. Idea borrowed from zilliztech/claude-context's .sync-trigger.
+echo "  - registering scout PostToolUse trigger hook in ~/.codex/hooks.json"
+"$ROOT/.venv/bin/python" -m tinyctx.scout_trigger install --quiet \
+  || echo "    (scout-trigger registration had warnings — run tinyctx-trigger status)"
+
 # --- 3a. gitnexus: tree-sitter codebase knowledge-graph MCP server.
 echo "  - bootstrapping gitnexus (tree-sitter knowledge-graph MCP)"
 "$ROOT/.venv/bin/python" -m tinyctx.gitnexus_bootstrap install --quiet \
@@ -134,6 +141,7 @@ Disable any of the auto-wiring at install time:
     TINYCTX_GITNEXUS_DISABLE=1        # don't install/register gitnexus
     TINYCTX_PYDOC_MCP_DISABLE=1       # don't register pydoc-mcp
     TINYCTX_SCOUT_HOOK_DISABLE=1      # don't register scout SessionStart hook
+    TINYCTX_TRIGGER_HOOK_DISABLE=1    # don't register scout PostToolUse trigger hook
     (see each tinyctx/*_bootstrap.py for the full list)
 
 EOF

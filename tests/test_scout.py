@@ -327,7 +327,7 @@ def test_build_scout_manifest_shape_and_file_hashes():
         # Top-level keys
         assert set(mf) == {
             "version", "project_root", "graph_path", "model", "base_url",
-            "top_k", "ranked", "file_hashes", "built_at",
+            "top_k", "ranked", "file_hashes", "merkle", "built_at",
         }
         assert mf["version"] == scout.CACHE_VERSION
         assert mf["model"] == "m1"
@@ -340,6 +340,10 @@ def test_build_scout_manifest_shape_and_file_hashes():
         for path_str, sha in mf["file_hashes"].items():
             assert Path(path_str).is_absolute()
             assert len(sha) == 16
+        # Merkle DAG: root digest + per-directory hash map over file_hashes.
+        assert set(mf["merkle"]) == {"root", "dirs"}
+        assert isinstance(mf["merkle"]["root"], str) and mf["merkle"]["root"]
+        assert isinstance(mf["merkle"]["dirs"], dict)
 
 
 def test_is_stale_version_mismatch():

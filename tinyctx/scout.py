@@ -49,9 +49,12 @@ from typing import Any
 import httpx
 
 from .interest import compression_pagerank, load_graph
+from . import scout_merkle
 
 
 CACHE_VERSION = 1
+# v1 manifests carry an optional `merkle` field as of the trigger/Merkle
+# refactor. Caches predating it simply lack the field; they stay readable.
 DEFAULT_TOP_K = int(os.environ.get("TINYCTX_SCOUT_TOP_K", "40"))
 DEFAULT_MAX_FILE_CHARS = int(os.environ.get("TINYCTX_SCOUT_MAX_FILE_CHARS", "4000"))
 DEFAULT_BASE_URL = os.environ.get("TINYCTX_LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -253,6 +256,8 @@ def build_scout(graph_path: Path, project_root: Path, *,
         import sys as _sys
         _sys.stderr.write(
             f"[scout] auto-register failed: {type(e).__name__}: {e}\n")
+    file_hashes = {t.file: t.sha for t in targets if t.file}
+    tree = scout_merkle.compute(file_hashes)
     manifest = {
         "version": CACHE_VERSION,
         "project_root": str(project_root.resolve()),
@@ -262,7 +267,10 @@ def build_scout(graph_path: Path, project_root: Path, *,
         "top_k": top_k,
         "ranked": [{"id": t.nid, "score": t.score, "file": t.file, "sha": t.sha}
                    for t in targets],
-        "file_hashes": {t.file: t.sha for t in targets if t.file},
+        "file_hashes": file_hashes,
+        # Merkle DAG: root for fast "anything changed?" checks; dirs for
+        # forward-compatible per-subtree diffing.
+        "merkle": {"root": tree.root, "dirs": tree.dirs},
         "built_at": time.time(),
     }
     manifest_path(project_root).write_text(json.dumps(manifest, indent=2))
@@ -270,8 +278,14 @@ def build_scout(graph_path: Path, project_root: Path, *,
 
 
 def is_stale(project_root: Path) -> tuple[bool, str]:
-    """Return (stale, reason). Stale if no manifest, version mismatch, or any
-    tracked file's hash changed."""
+    """Return (stale, reason). Stale if no manifest, version mismatch, the
+    PostToolUse trigger has been bumped since the last build, or any tracked
+    file's content hash changed.
+
+    The trigger is consulted before the per-file walk so codex sessions that
+    ran the PostToolUse hook get a fast stale signal without re-hashing every
+    tracked file. It is opportunistic — absence never implies fresh, so we
+    still fall through to the byte-content check."""
     mf = manifest_path(project_root)
     if not mf.is_file():
         return True, "no manifest"
@@ -281,6 +295,10 @@ def is_stale(project_root: Path) -> tuple[bool, str]:
         return True, "manifest unreadable"
     if data.get("version") != CACHE_VERSION:
         return True, "version mismatch"
+    # Lazy import to avoid a scout_trigger -> scout circular at module load.
+    from . import scout_trigger
+    if scout_trigger.is_trigger_newer_than_scout(project_root):
+        return True, "trigger fired"
     for path_str, old_hash in (data.get("file_hashes") or {}).items():
         p = Path(path_str)
         if not p.is_file():
@@ -313,6 +331,9 @@ def status(project_root: Path) -> dict[str, Any]:
     out["model"] = data.get("model")
     out["top_k"] = data.get("top_k")
     out["nodes"] = len(data.get("ranked") or [])
+    # Surface the stored Merkle root so external tools can compare two caches
+    # without parsing the full manifest. None on legacy caches.
+    out["merkle_root"] = (data.get("merkle") or {}).get("root")
     return out
 
 
