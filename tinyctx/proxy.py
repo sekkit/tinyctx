@@ -876,17 +876,42 @@ def root() -> dict[str, Any]:
 @APP.get("/v1/models")
 def list_models() -> dict[str, Any]:
     ctx = CFG.default_context_window
-    return {
-        "object": "list",
-        "data": [
-            {"id": "tinyctx-auto", "object": "model", "owned_by": "tinyctx",
-             "context_window": ctx},
-            {"id": "tinyctx-local", "object": "model", "owned_by": "tinyctx",
-             "context_window": ctx},
-            {"id": "tinyctx-frontier", "object": "model", "owned_by": "tinyctx",
-             "context_window": ctx},
-        ],
-    }
+    aliases = [
+        ("tinyctx-auto", "tinyctx (auto-route)"),
+        ("tinyctx-local", "tinyctx (local)"),
+        ("tinyctx-frontier", "tinyctx (frontier)"),
+    ]
+    data = [{"id": mid, "object": "model", "owned_by": "tinyctx",
+             "context_window": ctx} for mid, _ in aliases]
+    resp: dict[str, Any] = {"object": "list", "data": data}
+    # codex's model manager (>=0.125) parses a `models` array shaped like its
+    # own private, version-coupled ModelInfo (~28 required fields incl.
+    # base_instructions/model_messages/...). Rather than fabricate that schema
+    # (it drifts every codex release), clone codex's OWN cached ModelInfo as a
+    # template and re-slug it for the tinyctx aliases, so the refresh parses
+    # cleanly on whatever codex version wrote the cache. Cache absent/garbled
+    # -> omit `models` (codex logs a non-fatal refresh warning, as before).
+    try:
+        cache_path = os.path.join(os.path.expanduser("~"),
+                                  ".codex", "models_cache.json")
+        with open(cache_path, encoding="utf-8") as fh:
+            templates = (json.load(fh) or {}).get("models") or []
+        tmpl = min(templates, key=lambda m: len(json.dumps(m))) if templates else None
+        if isinstance(tmpl, dict):
+            models = []
+            for mid, label in aliases:
+                e = dict(tmpl)
+                e["slug"] = mid
+                e["display_name"] = label
+                e["description"] = "tinyctx local-first routing alias"
+                e["context_window"] = ctx
+                e["max_context_window"] = ctx
+                e["visibility"] = "list"
+                models.append(e)
+            resp["models"] = models
+    except Exception:  # noqa: BLE001 — models list is best-effort, never fatal
+        pass
+    return resp
 
 
 @APP.post("/v1/responses")

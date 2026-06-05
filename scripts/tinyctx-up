@@ -45,12 +45,17 @@ red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 dim()   { printf "\033[90m%s\033[0m\n" "$*"; }
 
 check_alive() {
-  curl -s --max-time 2 "$1" > /dev/null 2>&1
+  # $2 = optional timeout secs (default 2). A cloud local backend (DeepSeek)
+  # answers /models slower than a localhost server, so its status probe passes
+  # a longer budget to avoid a flaky false "unreachable". `curl -s` (no -f)
+  # already counts any HTTP reply — incl. 401 from an unauthenticated probe —
+  # as reachable; only a connect/timeout failure means down.
+  curl -s --max-time "${2:-2}" "$1" > /dev/null 2>&1
 }
 
 cmd_status() {
   printf "  local backend  (%s)  " "$LOCAL_URL"
-  if check_alive "$LOCAL_URL/models"; then green "alive"
+  if check_alive "$LOCAL_URL/models" 6; then green "alive"
   elif [ "$LOCAL_IS_LOCAL" = "1" ]; then red "DEAD — start your local model server + load a model"
   else red "unreachable"; fi
 
