@@ -303,13 +303,20 @@ def inject_for_disagreement(
     root: str | Path,
     top_k: int = 5,
     max_chars: int = 6000,
+    extra_providers: "list[Provider] | None" = None,
 ) -> tuple[dict[str, Any], bool]:
     query = extract_query_text(body)
     if not query:
         return body, False
+    providers = default_providers(root)
+    if extra_providers:
+        # Additive: external knowledge-source providers (knowledge_sources)
+        # are appended only when the caller passes them. Default behaviour
+        # (local-only fan-out) is unchanged.
+        providers = providers + list(extra_providers)
     hits = run_fanout(
         query,
-        default_providers(root),
+        providers,
         top_k=top_k,
         max_chars=max_chars,
     )

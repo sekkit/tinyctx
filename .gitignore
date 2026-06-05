@@ -60,3 +60,4 @@ graphify-out/
 # every clone should start fresh; serena auto-bootstraps them on first
 # session. Do NOT commit anyone's local memories/ into the repo.
 .serena/
+.codegraph/

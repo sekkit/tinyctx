@@ -1149,6 +1149,27 @@ class Config:
     # unconfigured installs get the shorter byte-stable prompt by default.
     caveman_compress_instructions: bool = True
 
+    # Headroom-aware tool output compression (optional, needs `headroom-ai`
+    # installed: `pip install tinyctx[headroom]`). Applies content-type-
+    # aware compression (SmartCrusher for JSON arrays, AST-aware for code,
+    # pattern-aware for search/log output) to tool_result /
+    # function_call_output items in the request body. Runs AFTER caveman
+    # compress (which handles tool descriptions) and lingua (which handles
+    # text compression). Default ON when headroom is installed; silent
+    # no-op when headroom is not importable.
+    # Typical token savings: 47-92% on tool outputs (headroom benchmarks).
+    headroom_compress_enabled: bool = True
+    # Model hint for headroom's tokenizer selection. "auto" lets headroom
+    # auto-detect from the request. Override to a specific model (e.g.
+    # "gpt-4o") to pin token counting.
+    headroom_model_hint: str = "auto"
+    # Skip tool outputs shorter than this many characters. Below ~200
+    # chars the compression overhead exceeds the savings.
+    headroom_min_chars: int = 200
+    # Max characters per chunk for very large outputs. Outputs larger
+    # than this are split and compressed in chunks to avoid OOM.
+    headroom_max_chunk_chars: int = 128_000
+
     # When frontier is unreachable, the proxy auto-falls-back to local
     # and injects a <system-reminder> so the model tells the user.
     # After cooldown expires, the next request retries frontier.
@@ -1180,6 +1201,20 @@ class Config:
     # context from turn 0.  Complements the richer but async scout/ctx-pack
     # pipeline.  Set false to disable.
     snapshot_enabled: bool = True
+
+    # External knowledge sources (tinyctx.knowledge_sources) for retrieval
+    # fan-out. All OFF unless enabled here or via TINYCTX_KB_* env. A None
+    # default means "fall back to env"; setting true/false in config.toml
+    # (or via the dashboard Config Center) takes precedence over env.
+    kb_devdocs_enabled: "bool | None" = None
+    kb_devdocs_url: str = ""
+    kb_devdocs_slugs: str = ""
+    kb_kiwix_enabled: "bool | None" = None
+    kb_kiwix_url: str = ""
+    kb_kiwix_books: str = ""
+    kb_wikidata_enabled: "bool | None" = None
+    kb_wikidata_url: str = ""
+    kb_wikidata_language: str = "en"
 
     # Task Orchestrator: local-model task typing + Skill/MCP recommendation
     # injection. Keeps the actual Codex tool execution unchanged; tinyctx
@@ -1321,6 +1356,9 @@ def load_config() -> Config:
             attr = orch_map.get(k)
             if attr and hasattr(cfg, attr):
                 setattr(cfg, attr, v)
+        for k, v in (data.get("knowledge_sources") or {}).items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
 
     # Step 2.5 — optimized policy overlay (from policy_search)
     # Loads ~/.tinyctx/policies/optimized.toml if it exists.  These values

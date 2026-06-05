@@ -18,7 +18,7 @@ file is added.
 - **Session continuity** — persisted compaction summaries, `latest.md`, structured JSON sidecars, recall CLI modes, per-session ordering, and empty-repo behavior. Covered by `tests/test_continuity.py`.
 - **Rolling history management** — historian update/substitution, proactive compact cache behavior, read-delta collapse, key file detection, and compression-biased ranking. Covered by `tests/test_historian.py`, `tests/test_proactive_compact.py`, `tests/test_read_delta.py`, `tests/test_keypin.py`, `tests/test_interest.py`.
 - **Project/session isolation** — project-scoped session keys, per-project proactive cache isolation, error-streak isolation, conversation fingerprints, and stable prompt-cache identity. Covered by `tests/test_project_isolation.py`, `tests/test_conv_id.py`.
-- **Scout and memory context** — auto-scout bootstrap/injection, scout cache/status CLI, retrieval fan-out context injection, graph ranking, mem0 ingestion, and registry-backed dreamer runs. Covered by `tests/test_auto_scout.py`, `tests/test_scout.py`, `tests/test_retrieval_fanout.py`, `tests/test_memory.py`, `tests/test_dreamer.py`, `tests/test_skill_catalog.py`.
+- **Scout and memory context** — auto-scout bootstrap/injection, scout cache/status CLI, retrieval fan-out context injection, scoped knowledge-base ingest/search/provider, external knowledge sources (DevDocs/Kiwix/Wikidata) with offline degradation, graph ranking, mem0 ingestion, and registry-backed dreamer runs. Covered by `tests/test_auto_scout.py`, `tests/test_scout.py`, `tests/test_retrieval_fanout.py`, `tests/test_knowledge_base.py`, `tests/test_knowledge_sources.py`, `tests/test_memory.py`, `tests/test_dreamer.py`, `tests/test_skill_catalog.py`.
 - **Plan persistence** — saving and injecting cross-thread plans with TTL and repo scoping. Covered by `tests/test_plan_persistence.py`.
 
 ## Stream Reliability and Recovery
@@ -44,6 +44,7 @@ file is added.
 - **Tool metrics and integration workflow** — tool-call frequency snapshots, call-id deduping, path coverage, and end-to-end integration workflow shape. Covered by `tests/test_tool_metrics.py`, `tests/test_path_coverage_e2e.py`, `tests/test_integration_workflow.py`.
 - **Task orchestration and dynamic skills** — orchestrator config, task supervision, orchestration runtime/injection, dynamic skill loading, and skill catalog discovery. Covered by `tests/test_orchestrator_config.py`, `tests/test_task_orchestrator.py`, `tests/test_task_supervisor.py`, `tests/test_orchestration_runtime.py`, `tests/test_orchestration_injector.py`, `tests/test_dynamic_skill.py`, `tests/test_skill_catalog.py`.
 - **Lingua compression** — optional token compression policy, input filtering, and frontier compression hooks. Covered by `tests/test_lingua.py`.
+- **Headroom tool output compression** — content-type-aware compression of tool outputs via headroom-ai ContentRouter (SmartCrusher, CodeCompressor, SearchCompressor, LogCompressor). Safe no-op when not installed. Covered by `tests/test_headroom_compress.py`.
 - **Registry helpers** — project registration and lookup for recurring maintenance flows. Covered by `tests/test_registry.py`.
 
 ## Observability and Operations
@@ -59,10 +60,13 @@ file is added.
 
 - **Configuration model** — `Config`/`BackendCfg` defaults, TOML and environment overrides, namespaced views, fresh-instance isolation, context-window thresholds, retry/stall/forensics/guard defaults, visual config schema/presets, atomic TOML persistence, and verbose/log-dir behavior. Covered by `tests/test_config.py`, `tests/test_config_io.py`, `tests/test_config_schema.py`.
 - **Sanitization and history hygiene** — unsupported request fields/tools, Responses defaults/caps, encrypted content stripping, chat normalization, deduping repeated tool calls, failed-input purging, cache-aware mutation gates, and orphan tool-output handling. Covered by `tests/test_sanitize.py`, `tests/test_sanitize_dedup.py`.
+- **Headroom tool output compression** — content-type-aware compression of function_call_output / tool_result items via headroom-ai ContentRouter (SmartCrusher for JSON arrays, CodeCompressor, SearchCompressor, LogCompressor). Safe no-op when headroom is not installed. Covered by `tests/test_headroom_compress.py`.
 - **Guard rails** — policy guards, malformed request handling, and safety defaults. Covered by `tests/test_guards.py`.
 - **Escalation ladder** — graduated REFINE→PIVOT→SEARCH→BLOCKER escalation with per-session failure/pivot counters, strategy-change reminders, and frontier force-routing at PIVOT level. Covered by `tests/test_escalation.py`.
 - **Unified session state** — counters, flags, timestamps, bounded history, namespace isolation, snapshots, compaction resets, and falsy-session no-ops. Covered by `tests/test_session_state.py`.
 - **Self-improvement primitives** — filesystem session workspaces, context profiles, replayable trajectory ledgers, eval aggregation, candidate frontier scoring, and staged guardrail registries. Covered by `tests/test_self_improvement_primitives.py`.
+- **ReflACT skill optimization** — trajectory-driven skill optimization loop (rollout→reflect→merge→select→update→evaluate). Optimizer LLM analyzes failure/success trajectories to propose bounded add/delete/replace edits on AGENTS.md. Covered by `tests/test_reflact.py`.
+- **ReflACT agent harness** — real Codex CLI task execution + compliance signal detection (read_before_edit, run_tests, minimal_change, speculation, language, completion). Generates scored trajectories for ReflACT training. Covered by `tests/reflact_harness/run_harness.py`.
 
 ## Documentation Coverage Guard
 

@@ -1302,9 +1302,11 @@ async def responses(request: Request) -> Any:
                         if consistency.agreed is False:
                             try:
                                 from . import retrieval_fanout as _rf
+                                from . import knowledge_sources as _ks
                                 root = Path(cwd_hdr) if cwd_hdr else Path.cwd()
                                 body, retrieval_injected = _rf.inject_for_disagreement(
-                                    body, root=root)
+                                    body, root=root,
+                                    extra_providers=_ks.external_providers(CFG))
                                 if retrieval_injected:
                                     _log("retrieval_fanout_injected",
                                          session=sid,
@@ -1795,6 +1797,53 @@ async def responses(request: Request) -> Any:
             body = _cc.compress_tool_descriptions(body)
         if CFG.caveman_compress_instructions:
             body = _cc.compress_instructions(body)
+
+    # Headroom-aware tool output compression: apply content-type-aware
+    # compression to tool_result / function_call_output items. Headroom
+    # detects JSON arrays, code, search results, logs, diffs and applies
+    # the right algorithm per type. This handles the 10x-100x larger
+    # payload that caveman_compress and lingua don't specialize for.
+    # Silent no-op when headroom-ai is not installed.
+    if CFG.headroom_compress_enabled:
+        try:
+            from . import headroom_compress as _hc
+            model_hint = (
+                body.get("model") or ""
+                if CFG.headroom_model_hint == "auto"
+                else CFG.headroom_model_hint
+            )
+            # Capture before/after for trace logging
+            tool_items = [
+                it for it in (body.get("input") or [])
+                if isinstance(it, dict) and it.get("type") in ("function_call_output", "tool_result", "mcp_result")
+            ]
+            chars_before = sum(len(str(it.get("output") or it.get("content") or "")) for it in tool_items)
+            body = _hc.compress_tool_outputs(
+                body,
+                model=model_hint or "gpt-4o",
+                enabled=True,
+                min_chars=CFG.headroom_min_chars,
+                max_chunk_chars=CFG.headroom_max_chunk_chars,
+            )
+            chars_after = sum(len(str(it.get("output") or it.get("content") or "")) for it in tool_items)
+            if chars_before != chars_after:
+                trace.headroom_compress_applied = True
+                trace.headroom_compress_chars_before = chars_before
+                trace.headroom_compress_chars_after = chars_after
+                _log("headroom_compress_done",
+                     session=sid,
+                     tool_outputs=len(tool_items),
+                     chars_before=chars_before,
+                     chars_after=chars_after,
+                     pct_saved=round(100*(1-chars_after/max(chars_before,1))) if chars_before else 0)
+            # Log capability status once per proxy lifetime (first request).
+            # Subsequent requests skip because _logged_caps is set to True.
+            if not getattr(_hc, "_logged_caps", False):
+                _hc._logged_caps = True
+                cap = _hc.capability_report()
+                _log("headroom_capability", session=sid, **cap)
+        except Exception as _hc_err:  # noqa: BLE001 — never block routing
+            _log("headroom_compress_error", session=sid, error=str(_hc_err))
 
     # Frontier-only: LLMLingua-2 pre-escalation compression of bulky
     # tool-result payloads. Default on; no-op unless llmlingua is installed.

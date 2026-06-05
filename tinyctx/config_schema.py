@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 
-ALLOWED_SECTIONS = {"server", "routing", "local", "frontier"}
+ALLOWED_SECTIONS = {"server", "routing", "local", "frontier", "knowledge_sources"}
 
 
 def config_schema() -> dict[str, Any]:
@@ -32,6 +32,17 @@ def config_schema() -> dict[str, Any]:
             ],
             "local": _backend_fields(local=True),
             "frontier": _backend_fields(local=False),
+            "knowledge_sources": [
+                _field("kb_devdocs_enabled", "DevDocs — enable (offline, self-hosted)", "boolean"),
+                _field("kb_devdocs_url", "DevDocs base URL (e.g. http://localhost:9292)", "string"),
+                _field("kb_devdocs_slugs", "DevDocs docset slugs (comma-separated)", "string"),
+                _field("kb_kiwix_enabled", "Kiwix — enable (offline ZIM, self-hosted)", "boolean"),
+                _field("kb_kiwix_url", "Kiwix base URL (e.g. http://localhost:8080)", "string"),
+                _field("kb_kiwix_books", "Kiwix book names (comma-separated, optional)", "string"),
+                _field("kb_wikidata_enabled", "Wikidata — enable (public CC0, no key)", "boolean"),
+                _field("kb_wikidata_url", "Wikidata API URL (blank = public wikidata.org)", "string"),
+                _field("kb_wikidata_language", "Wikidata language code", "string"),
+            ],
         }
     }
 
@@ -149,13 +160,13 @@ def _validate_field(
                 or isinstance(value, bool)
                 or not 0 <= float(value) <= 1):
             errors.append(_err(section, key, "adaptive_model_failure_rate_threshold must be between 0 and 1"))
-    elif key in {"verbose", "redirect_compaction_to_local", "goal_control_frontier_enabled", "sanitize_encrypted_content", "strip_tools", "lmcache_passthrough", "forward_authorization", "self_classify_escalates_to_frontier", "adaptive_model_enabled"}:
+    elif key in {"verbose", "redirect_compaction_to_local", "goal_control_frontier_enabled", "sanitize_encrypted_content", "strip_tools", "lmcache_passthrough", "forward_authorization", "self_classify_escalates_to_frontier", "adaptive_model_enabled", "kb_devdocs_enabled", "kb_kiwix_enabled", "kb_wikidata_enabled"}:
         if not isinstance(value, bool):
             errors.append(_err(section, key, f"{key} must be true or false"))
     elif key == "headers":
         if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
             errors.append(_err(section, key, "headers must be a string-to-string object"))
-    elif key in {"host", "model", "api_key_env"}:
+    elif key in {"host", "model", "api_key_env", "kb_devdocs_url", "kb_devdocs_slugs", "kb_kiwix_url", "kb_kiwix_books", "kb_wikidata_url", "kb_wikidata_language"}:
         if value is not None and not isinstance(value, str):
             errors.append(_err(section, key, f"{key} must be a string"))
     else:

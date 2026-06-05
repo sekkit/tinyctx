@@ -2,7 +2,7 @@
 name = "tinyctx"
 version = "0.7.0"
 description = "Codex CLI Responses-API context-routing proxy: local cheap by default, frontier on demand"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "tinyctx" }]
 dependencies = [
@@ -14,7 +14,15 @@ dependencies = [
 
 [project.optional-dependencies]
 compress = ["llmlingua>=0.2"]
+headroom = ["headroom-ai"]
 mem = ["mem0ai"]
+# Scoped knowledge base (tinyctx.knowledge_base). The DEFAULT path —
+# bag-of-words retrieval over .md/.txt — needs nothing extra. `kb` adds
+# markitdown so PDF/docx/pptx can be ingested; `kb-graph` is the opt-in
+# MiniRAG/LightRAG graph backend (heavy; unverified on a 27B local model —
+# read docs/knowledge-base-design.md "Phase 2" before enabling).
+kb = ["markitdown[pdf,docx,pptx]"]
+kb-graph = ["lightrag-hku[api]"]
 
 [project.scripts]
 tinyctx = "tinyctx.installer:main"
@@ -39,6 +47,8 @@ tinyctx-context-mode = "tinyctx.context_mode_bootstrap:main"
 tinyctx-pydoc-mcp = "tinyctx.pydoc_mcp_bootstrap:main"
 tinyctx-codex-profile = "tinyctx.codex_profile_bootstrap:main"
 tinyctx-advisor-bootstrap = "tinyctx.advisor_bootstrap:main"
+tinyctx-kb = "tinyctx.knowledge_base:main"
+tinyctx-kb-sources = "tinyctx.knowledge_sources:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -53,3 +63,6 @@ include = ["tinyctx*"]
 # injection. Without this entry, `tinyctx/templates/*.md` would be left
 # out of distribution builds.
 "tinyctx" = ["templates/*.md"]
+
+[tool.pytest.ini_options]
+norecursedirs = ["tests/reflact_harness"]

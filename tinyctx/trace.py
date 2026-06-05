@@ -226,6 +226,14 @@ class RequestTrace:
     lingua_chars_before: int = 0
     lingua_chars_after: int = 0
 
+    # Headroom content-type-aware tool output compression. Applies
+    # SmartCrusher (JSON arrays), CodeCompressor, SearchCompressor,
+    # LogCompressor to function_call_output / tool_result items.
+    # Silent no-op when headroom-ai is not installed.
+    headroom_compress_applied: bool = False
+    headroom_compress_chars_before: int = 0
+    headroom_compress_chars_after: int = 0
+
     # Forge-inspired guardrail observability. `guard_results` records the
     # existing preflight GuardPipeline wrappers. `guardrail_decisions`
     # records protocol-neutral policy decisions such as failure-signal
