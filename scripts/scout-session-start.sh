@@ -28,20 +28,26 @@ for cand in "$TINYCTX_HOME/.venv/bin/python" \
   if [ -x "$cand" ]; then VENV_PY="$cand"; break; fi
 done
 [ -z "$VENV_PY" ] && VENV_PY="$(command -v python3 || true)"
-[ -z "$VENV_PY" ] && exit 0   # nothing we can do; emit nothing.
+# Always emit valid JSON; empty stdout makes codex mark the hook "Failed".
+[ -z "$VENV_PY" ] && { printf '{}\n'; exit 0; }
 
 # Status check (cheap).
 STATE=$("$VENV_PY" -m tinyctx.scout status --root "$ROOT" --json 2>/dev/null \
         | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state",""))' \
         2>/dev/null)
 
+# Always emit a single valid JSON object on stdout. Empty stdout makes codex
+# mark the SessionStart hook "Failed"; `{}` is the "no additional context"
+# sentinel. OUT is only overridden when there is a real scout summary to inject.
+OUT='{}'
+
 case "$STATE" in
   fresh)
     SCOUT_MD=$("$VENV_PY" -m tinyctx.scout path --root "$ROOT" 2>/dev/null)
     if [ -n "$SCOUT_MD" ] && [ -f "$SCOUT_MD" ]; then
       ADDL=$(cat "$SCOUT_MD")
-      "$VENV_PY" -c "import json,sys;print(json.dumps({'additionalContext': sys.argv[1]}))" \
-                 "$ADDL"
+      OUT=$("$VENV_PY" -c "import json,sys;print(json.dumps({'additionalContext': sys.argv[1]}))" \
+                 "$ADDL")
     fi
     ;;
   stale)
@@ -51,11 +57,13 @@ case "$STATE" in
     SCOUT_MD=$("$VENV_PY" -m tinyctx.scout path --root "$ROOT" 2>/dev/null)
     if [ -n "$SCOUT_MD" ] && [ -f "$SCOUT_MD" ]; then
       ADDL="$(cat "$SCOUT_MD")"$'\n\n[tinyctx: refreshing scout in background]'
-      "$VENV_PY" -c "import json,sys;print(json.dumps({'additionalContext': sys.argv[1]}))" \
-                 "$ADDL"
+      OUT=$("$VENV_PY" -c "import json,sys;print(json.dumps({'additionalContext': sys.argv[1]}))" \
+                 "$ADDL")
     fi
     ;;
   *)
-    # absent/corrupt — say nothing so codex's first prompt isn't polluted.
+    # absent/corrupt — leave OUT as the `{}` sentinel.
     ;;
 esac
+
+printf '%s\n' "$OUT"
